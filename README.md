@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
-    <img src="assets/logo-light.svg" alt="Usage Pulse: the live usage status line for Claude Code" width="640">
-  </picture>
+  <img src="assets/brand/hero.png" alt="Usage Pulse: the live usage status bar for Claude Code" width="800">
 </p>
 
 <p align="center">

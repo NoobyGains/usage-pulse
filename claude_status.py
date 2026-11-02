@@ -7967,7 +7967,9 @@ def _is_plugin_cache_path(path):
     or a checkout of the repo (``.../usage-pulse/claude_status.py``) has no
     version folder.
     """
-    parts = [p.lower() for p in Path(str(path)).parts]
+    # Split on both separators: Path() only knows the host's own, so on
+    # Linux or macOS a Windows path (C:\Users\...\claude_status.py) would be one part.
+    parts = [p.lower() for p in re.split(r"[\\/]+", str(path)) if p]
     return (len(parts) >= 3 and parts[-1] == "claude_status.py"
             and parts[-3] in ("usage-pulse", "claude-pulse"))
 

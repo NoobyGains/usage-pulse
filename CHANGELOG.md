@@ -19,6 +19,7 @@ Ideas, not promises:
 
 - **Arrow keys no longer cancel `--setup` on Linux, macOS and WSL** ([#56](https://github.com/NoobyGains/usage-pulse/issues/56), reported by [@MarcusSnowTaxConnex](https://github.com/MarcusSnowTaxConnex)). The key reader took its first byte from the buffered `sys.stdin`, which swallowed the rest of the `ESC [ B` sequence, so the check for a following byte found nothing and every arrow came back as Esc. Keys are now read as raw bytes from the terminal. `ESC O` arrows (application-cursor mode) and accented letters typed into text fields work too.
 - Keys pressed while a wizard screen was being redrawn are no longer thrown away. Switching the terminal to raw mode used to flush pending input, which dropped fast typing and held-down arrows.
+- Plugin-cache path detection (used by `--sync-install-path`) now splits on both `/` and `\`, so a Windows path is recognised wherever the check runs. Before, `tests/test_sync_install_path.py` failed on Linux and macOS.
 
 ## [3.6.0] - 2026-10-21
 

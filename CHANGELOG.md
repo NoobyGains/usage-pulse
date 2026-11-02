@@ -13,6 +13,13 @@ Ideas, not promises:
 - Live Codex limits through its app-server instead of the last session file.
 - A `skills/` layout for the plugin.
 
+## [3.6.1] - 2026-11-02
+
+### Fixed
+
+- **Arrow keys no longer cancel `--setup` on Linux, macOS and WSL** ([#56](https://github.com/NoobyGains/usage-pulse/issues/56), reported by [@MarcusSnowTaxConnex](https://github.com/MarcusSnowTaxConnex)). The key reader took its first byte from the buffered `sys.stdin`, which swallowed the rest of the `ESC [ B` sequence, so the check for a following byte found nothing and every arrow came back as Esc. Keys are now read as raw bytes from the terminal. `ESC O` arrows (application-cursor mode) and accented letters typed into text fields work too.
+- Keys pressed while a wizard screen was being redrawn are no longer thrown away. Switching the terminal to raw mode used to flush pending input, which dropped fast typing and held-down arrows.
+
 ## [3.6.0] - 2026-10-21
 
 ### Added

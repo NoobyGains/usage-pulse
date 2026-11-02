@@ -11,7 +11,7 @@
       "name": "usage-pulse",
       "source": "./",
       "description": "Session and weekly limits, your other accounts and tools on their own rows, cost, context, live agents, 10 themes and animations. Zero API calls for the main bars",
-      "version": "3.6.0",
+      "version": "3.6.1",
       "homepage": "https://github.com/NoobyGains/usage-pulse"
     }
   ]

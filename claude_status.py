@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 
 import hashlib
 import json
@@ -8204,18 +8204,41 @@ def _read_key():
     import select
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+
+    # Read raw bytes straight from the descriptor. sys.stdin is a buffered
+    # text stream: sys.stdin.read(1) would slurp a whole "\x1b[B" sequence
+    # into Python's buffer, leaving the fd empty so the select() below would
+    # wrongly report a lone ESC and arrows would cancel the wizard.
+    def _byte():
+        return os.read(fd, 1)
+
+    def _ready(timeout):
+        return bool(select.select([fd], [], [], timeout)[0])
+
     try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
+        # TCSANOW, not setraw's default TCSAFLUSH: a flush would throw away
+        # any key pressed while the previous screen was being drawn.
+        tty.setraw(fd, termios.TCSANOW)
+        b = _byte()
+        if b == b"\x1b":
             # Could be a lone ESC or the start of an arrow sequence — peek briefly.
-            ready, _, _ = select.select([sys.stdin], [], [], 0.03)
-            if not ready:
+            if not _ready(0.05):
                 return "esc"
-            if sys.stdin.read(1) == "[":
-                code = sys.stdin.read(1)
-                return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(code, "")
+            # "ESC [ x" is the usual form; "ESC O x" is sent in
+            # application-cursor mode by some terminals.
+            if _byte() in (b"[", b"O"):
+                code = _byte()
+                return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(code, "")
             return "esc"
+        # Multi-byte UTF-8 character (e.g. an accented letter typed into a
+        # text field): pull the continuation bytes the lead byte promises.
+        if b and b[0] >= 0xC0:
+            extra = 3 if b[0] >= 0xF0 else 2 if b[0] >= 0xE0 else 1
+            for _ in range(extra):
+                if not _ready(0.05):
+                    break
+                b += _byte()
+        ch = b.decode("utf-8", errors="replace")
         if ch in ("\r", "\n"):
             return "enter"
         if ch == "\x03":

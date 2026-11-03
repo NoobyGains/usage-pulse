@@ -5461,6 +5461,108 @@ def _format_pace(pct, pace, style=DEFAULT_PACE_STYLE):
     return f" {colour}{glyph}{RESET}"
 
 
+def _roll_over_expired_windows(usage):
+    """Copy of *usage* where every usage window whose reset has passed reads 0 %.
+
+    Claude Code drops a window from ``rate_limits`` the moment its ``resets_at``
+    passes, so a window that is still carried (persisted stdin context, an old
+    cache.json) describes a period that is over. Drawn as it was, it showed the
+    old percentage next to "now" (F01). The same rule as ``_provider_window``:
+    0 % and no reset ("starts on next use"). Covers ``five_hour``, ``seven_day``
+    and the model-scoped ``seven_day_*`` caps; anything else, and anything not
+    a well-formed window, is returned untouched. *usage* is never mutated.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    now = time.time()
+    out = dict(usage)
+    for key, win in usage.items():
+        if not isinstance(key, str) or not isinstance(win, dict):
+            continue
+        if key not in ("five_hour", "seven_day") and not key.startswith("seven_day_"):
+            continue
+        reset = _parse_reset(win.get("resets_at"))
+        if reset is None:
+            continue
+        try:
+            expired = reset.timestamp() <= now
+        except (OverflowError, OSError, ValueError):
+            continue
+        if expired:
+            out[key] = dict(win, utilization=0.0, resets_at=None)
+    return out
+
+
+def _extra_usage_view(extra):
+    """The numbers of an ``extra_usage`` block, or None when it is off or unusable.
+
+    The block comes from the usage API or from cache.json, both untrusted, so
+    a wrong type reads as 0 instead of raising (a raise is a blank bar).
+    Amounts are minor units (cents, pence) in the API; the view holds major
+    units. ``currency`` is the ISO-4217 code the API reports, "" when it does
+    not (older payloads, always USD).
+    """
+    if not isinstance(extra, dict) or not extra.get("is_enabled"):
+        return None
+
+    def num(value):
+        n = _stdin_number(value)
+        return max(n, 0.0) if n is not None else 0.0
+
+    code = extra.get("currency")
+    code = code.strip().upper() if isinstance(code, str) else ""
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        code = ""
+    return {"pct": min(num(extra.get("utilization")), 100.0),
+            "used": num(extra.get("used_credits")) / 100,
+            "limit": num(extra.get("monthly_limit")) / 100,
+            "currency": code}
+
+
+def _extra_money(view, symbol):
+    """``(symbol, used, limit)`` to draw for an extra-usage view (F17).
+
+    A USD amount (or one with no currency) is converted into the user's
+    currency exactly like the session cost beside it. An amount the API
+    already states in another currency is never converted: it keeps the
+    user's own symbol when that is the same currency, else its ISO code.
+    """
+    code = view["currency"]
+    if code and code != "USD":
+        if _CURRENCY_TO_CODE.get(symbol) == code:
+            return symbol, view["used"], view["limit"]
+        return code + " ", view["used"], view["limit"]
+    rate, rate_code = _get_exchange_rate(symbol)
+    return ("$" if rate_code == "USD" else symbol), view["used"] * rate, view["limit"] * rate
+
+
+def _extra_age_tag(stdin_ctx, config):
+    """A dim " (3d ago)" when the extra-usage figure is overdue for a refresh.
+
+    The figure is refetched every ``model_caps_refresh_seconds``; it is old
+    only when that did not happen (offline, rate limited). main() stamps the
+    time of the last good fetch on ``stdin_ctx`` under ``_extra_fetched_at``
+    (None when none was ever recorded). Without the key nothing is known, so
+    nothing is claimed.
+    """
+    if not isinstance(stdin_ctx, dict) or "_extra_fetched_at" not in stdin_ctx:
+        return ""
+    fetched = _cache_seconds(stdin_ctx.get("_extra_fetched_at")) or None
+    if fetched is None:
+        return f" {YELLOW}(stale){RESET}"
+    age = time.time() - fetched
+    if age <= 2 * _model_caps_ttl(config):
+        return ""
+    if age < 3600:
+        label = f"{int(age // 60)}m"
+    elif age < 172800:
+        label = f"{int(age // 3600)}h"
+    else:
+        label = f"{int(age // 86400)}d"
+    colour = RED if age >= 86400 else YELLOW
+    return f" {colour}({label} ago){RESET}"
+
+
 def format_reset_time(resets_at_str):
     if not resets_at_str:
         return None
@@ -6732,15 +6834,32 @@ def _parse_stdin_context(raw_stdin):
     try:
         ctx = data.get("data", data).get("context_window", {})
         used_pct = ctx.get("used_percentage")
-        if used_pct is not None:
-            result["context_pct"] = float(used_pct)
         # Raw token counts for tokens display mode
         input_tok = ctx.get("total_input_tokens")
-        output_tok = ctx.get("total_output_tokens")
         ctx_size = ctx.get("context_window_size")
-        if input_tok is not None and ctx_size is not None:
-            result["context_used"] = int(input_tok) + int(output_tok or 0)
-            result["context_limit"] = int(ctx_size)
+        # Right after /compact Claude Code repaints in the same session with no
+        # percentage, `current_usage: null` and zero totals: nothing of the
+        # old context is left. The merge in main() keeps a field a payload
+        # leaves out, so the old percentage would stay on the bar (and tokens
+        # mode would read "0/1M" next to it). On a full payload that shows the
+        # context emptied, the three fields are cleared until the next API
+        # response sends real numbers (F12). A bare null percentage with no
+        # such sign still means "unchanged".
+        if (_full and used_pct is None and isinstance(ctx, dict)
+                and (("current_usage" in ctx and ctx["current_usage"] is None)
+                     or _stdin_number(input_tok) == 0)):
+            result["context_pct"] = None
+            result["context_used"] = None
+            result["context_limit"] = None
+        else:
+            if used_pct is not None:
+                result["context_pct"] = float(used_pct)
+            # used_percentage counts input tokens only (input + cache reads and
+            # writes), so the token total does too; output tokens are the last
+            # reply, not context.
+            if input_tok is not None and ctx_size is not None:
+                result["context_used"] = int(input_tok)
+                result["context_limit"] = int(ctx_size)
     except (AttributeError, KeyError, ValueError, TypeError):
         pass
 
@@ -7822,37 +7941,39 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
             parts.append((_p, f"{_label} {bar} {pct:.0f}%{pace_str}"))
 
     # Extra usage (bonus/gifted credits)
-    extra = usage.get("extra_usage")
+    extra = _extra_usage_view(usage.get("extra_usage"))
     extra_enabled_by_user = show.get("extra", False)
     extra_explicitly_hidden = config.get("extra_hidden", False)
-    extra_has_credits = extra and extra.get("is_enabled") and (extra.get("monthly_limit") or 0) > 0
+    extra_has_credits = extra is not None and extra["limit"] > 0
     if extra_enabled_by_user or (extra_has_credits and not extra_explicitly_hidden):
         _e = _pri("extra")
         currency = _sanitize(config.get("currency", "$"))[:5]
-        if extra and extra.get("is_enabled"):
-            pct = min(extra.get("utilization") or 0, 100)
-            used = (extra.get("used_credits") or 0) / 100
-            limit = (extra.get("monthly_limit") or 0) / 100
+        if extra is not None:
+            pct = extra["pct"]
+            # Converted like the session cost beside it, and marked when the
+            # figure is overdue for a refresh (F17).
+            currency, used, limit = _extra_money(extra, currency)
+            age_tag = _extra_age_tag(stdin_ctx, config)
             extra_display = config.get("extra_display", "auto")
             if extra_display == "auto":
                 extra_display = "amount" if limit == 0 else "full"
             if extra_display == "amount":
                 if layout == "compact":
-                    parts.append((_e, f"E {currency}{used:.2f}"))
+                    parts.append((_e, f"E {currency}{used:.2f}{age_tag}"))
                 elif layout == "minimal":
-                    parts.append((_e, f"{currency}{used:.2f}"))
+                    parts.append((_e, f"{currency}{used:.2f}{age_tag}"))
                 else:
-                    parts.append((_e, f"Extra {currency}{used:.2f}"))
+                    parts.append((_e, f"Extra {currency}{used:.2f}{age_tag}"))
             else:
                 bar = make_bar(pct, theme, plain=bar_plain, width=bw, bar_style=bstyle)
                 if layout == "compact":
-                    parts.append((_e, f"E {bar} {currency}{used:.2f}/{currency}{limit:.2f}"))
+                    parts.append((_e, f"E {bar} {currency}{used:.2f}/{currency}{limit:.2f}{age_tag}"))
                 elif layout == "minimal":
-                    parts.append((_e, f"{bar} {currency}{used:.2f}"))
+                    parts.append((_e, f"{bar} {currency}{used:.2f}{age_tag}"))
                 elif layout == "percent-first":
-                    parts.append((_e, f"{currency}{used:.2f} {bar}"))
+                    parts.append((_e, f"{currency}{used:.2f} {bar}{age_tag}"))
                 else:
-                    parts.append((_e, f"Extra {bar} {currency}{used:.2f}/{currency}{limit:.2f}"))
+                    parts.append((_e, f"Extra {bar} {currency}{used:.2f}/{currency}{limit:.2f}{age_tag}"))
         elif extra_enabled_by_user:
             if layout == "minimal":
                 parts.append((_e, "n/a"))
@@ -11895,6 +12016,54 @@ def _unknown_cli_flags(args):
             and not a.lstrip("-").replace(".", "").isdigit()]
 
 
+def _spend_limit_live(spend):
+    """True for a stdin ``spend_limit`` block whose period is still running.
+
+    Claude Code drops the block once its ``resets_at`` passes, so one carried
+    in the persisted context past that time is old news, not a gateway.
+    """
+    if not isinstance(spend, dict) or spend.get("used_percentage") is None:
+        return False
+    reset = _parse_reset(spend.get("resets_at"))
+    if reset is None:
+        return True
+    try:
+        return reset.timestamp() > time.time()
+    except (OverflowError, OSError, ValueError):
+        return True
+
+
+def _stdin_has_session_data(stdin_ctx):
+    """Does stdin give anything to draw without a usage window (F08)?"""
+    if not isinstance(stdin_ctx, dict):
+        return False
+    return (any(stdin_ctx.get(k) is not None for k in ("model_name", "context_pct", "cost_usd"))
+            or _spend_limit_live(stdin_ctx.get("spend_limit")))
+
+
+def _stdin_only_line(config, stdin_ctx):
+    """The status line for a window with session data but no usage windows.
+
+    A Claude apps gateway sends only ``spend_limit``; Bedrock, Vertex, Foundry
+    and API-key sessions send model, context and cost and no ``rate_limits``
+    at all. Nothing of theirs is a Session or Weekly reading, so those two
+    bars are left out instead of drawn as a made-up 0 %. Never reads
+    credentials and never calls the usage API (F08).
+    """
+    cfg = dict(config)
+    show = dict(config.get("show", DEFAULT_SHOW))
+    show["session"] = False
+    show["weekly"] = False
+    cfg["show"] = show
+    line = build_status_line({}, "", cfg, stdin_ctx, cache_age=None)
+    _update_session_state({}, stdin_ctx)
+    if stdin_ctx.get("context_pct") is not None:
+        _append_context_history(stdin_ctx["context_pct"])
+    line = append_update_indicator(line, config)
+    line = append_claude_update_indicator(line, config, stdin_ctx)
+    return _fit_line(_append_provider_rows(line, config), config)
+
+
 def main():
     # Handle SIGPIPE gracefully on Unix (e.g. when piped to head)
     if hasattr(signal, "SIGPIPE"):
@@ -12667,6 +12836,12 @@ def main():
             persisted = {k: _sanitize(str(v)) if isinstance(v, str) else v for k, v in raw_persisted.items() if k in _STDIN_CTX_KEYS}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
+    # The carried rate limits can be hours or days old (they are an account
+    # key, so a new session inherits them before its first reply). A window
+    # whose reset has passed is over: it reads 0 %, not its old percentage
+    # next to "now" (F01).
+    if isinstance(persisted.get("_rate_limits"), dict):
+        persisted["_rate_limits"] = _roll_over_expired_windows(persisted["_rate_limits"])
     if stdin_ctx:
         sid = str(stdin_ctx.get("session_id") or "") or None
         if sid and persisted_sid and sid != persisted_sid:
@@ -12686,11 +12861,24 @@ def main():
 
     cache_path = get_cache_path()
     cached = read_cache(cache_path, cache_ttl)
+    # A cached window can have run out since it was written (F01): it reads
+    # 0 %, in the stdin branch below and in the cached branch after it alike.
+    if isinstance(cached, dict) and isinstance(cached.get("usage"), dict):
+        cached = dict(cached, usage=_roll_over_expired_windows(cached["usage"]))
 
     # --- Stdin rate limits (v2.1.80+): use data from Claude Code directly ---
     # This avoids calling the OAuth API entirely for basic session/weekly bars.
     # The API is only needed for extra credits and per-model caps (opus/sonnet).
     stdin_rl = stdin_ctx.get("_rate_limits")
+    # Behind a Claude apps gateway rate_limits carries only spend_limit, so
+    # there is no window above and no claude.ai login to fetch one with. The
+    # spend bar and the session widgets are drawn from stdin alone, without
+    # ever asking for credentials (F08).
+    _gateway_run = _spend_limit_live(stdin_ctx.get("spend_limit"))
+    if not stdin_rl and _gateway_run:
+        line = _stdin_only_line(config, stdin_ctx)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        return
     if stdin_rl:
         # Build a synthetic usage dict from stdin rate limits. Take *every*
         # window stdin offers, including the model-scoped weekly caps
@@ -12707,6 +12895,11 @@ def main():
         if cached and "usage" in cached:
             plan_from_cache = cached.get("plan", "")
             for key, value in cached["usage"].items():
+                # five_hour and seven_day always come fresh from stdin. Claude
+                # Code drops one once it resets, so refilling it from the
+                # cache brought back the old percentage next to "now" (F01).
+                if key in ("five_hour", "seven_day"):
+                    continue
                 if key not in usage_from_stdin:
                     usage_from_stdin[key] = value
                     if key.startswith("seven_day_"):
@@ -12722,9 +12915,11 @@ def main():
         # few minutes old is honest; the five-hour and weekly windows always
         # come fresh from stdin and are never overwritten here.
         _stale = _read_stale_cache(cache_path)
-        _stale_usage = (_stale or {}).get("usage")
+        _stale_usage = _roll_over_expired_windows((_stale or {}).get("usage"))
         if isinstance(_stale_usage, dict):
             for key, value in _stale_usage.items():
+                if key in ("five_hour", "seven_day"):
+                    continue   # stdin only, see above
                 if key in _USAGE_CACHE_KEYS and key not in usage_from_stdin:
                     usage_from_stdin[key] = value
                     if key.startswith("seven_day_") or key == "extra_usage":
@@ -12759,6 +12954,13 @@ def main():
         _caps_show = config.get("show", {})
         _caps_wanted = any(_caps_show.get(k, DEFAULT_SHOW.get(k, False))
                            for k in ("opus", "sonnet", "fable", "extra"))
+        # Extra usage also draws itself without being switched on, as soon as
+        # the account has credits (and unless --hide extra). Left out of this
+        # test, its figure was never refetched: the first one fetched stayed
+        # on the bar for months (F17).
+        if not _caps_wanted and not config.get("extra_hidden", False):
+            _extra_seen = _extra_usage_view(usage_from_stdin.get("extra_usage"))
+            _caps_wanted = _extra_seen is not None and _extra_seen["limit"] > 0
         # Preserve across the end-of-branch write_cache below. Without this the
         # final write drops the field, the age reads as 0 on the next repaint,
         # and the "stale" test fires every single draw — a fetch per repaint,
@@ -12780,8 +12982,10 @@ def main():
         _blocked_until = _cache_seconds(_rl_until) or 0
         _backoff_active = time.time() < _blocked_until
         _recent_attempt = (time.time() - (_cache_seconds(_caps_attempted) or 0)) < _MODEL_CAPS_RETRY
-        if (not has_core and not has_model_caps and "extra_usage" not in usage_from_stdin) or \
-                (_caps_wanted and _caps_stale and not _backoff_active and not _recent_attempt):
+        # A spend limit on stdin means a Claude apps gateway: no claude.ai
+        # login, so the usage API is never asked (F08).
+        if not _gateway_run and ((not has_core and not has_model_caps and "extra_usage" not in usage_from_stdin) or \
+                (_caps_wanted and _caps_stale and not _backoff_active and not _recent_attempt)):
             try:
                 # The kill guard is asked first. When it says no (this
                 # account's last fetch was cut short, or another window of it
@@ -12852,8 +13056,15 @@ def main():
             except Exception:
                 pass
 
+        # Whatever was carried or fetched above can have run out since (F01);
+        # nothing past its reset is drawn, recorded or written back to disk.
+        usage_from_stdin = _roll_over_expired_windows(usage_from_stdin)
+        # When the extra-usage figure was last fetched, for its age marker. Set
+        # after stdin_ctx was persisted, so it only reaches the renderer (F17).
+        stdin_ctx["_extra_fetched_at"] = _cache_seconds(_caps_ts) or None
+
         # Get plan from credentials (lightweight, no API call)
-        if not plan_from_cache:
+        if not plan_from_cache and not _gateway_run:
             _, plan_from_cache = get_credentials()
             plan_from_cache = plan_from_cache or ""
 
@@ -12902,6 +13113,15 @@ def main():
     # --- API fallback (first call or no stdin rate limits) ---
     token, plan = get_credentials()
     if not token:
+        # No claude.ai login, but stdin has a model, context or cost to draw
+        # (Bedrock, Vertex, Foundry, API key): draw them rather than tell a
+        # working session to log in. The message stays for when stdin gave
+        # nothing. Not cached: a cached line would be served to every window.
+        if _stdin_has_session_data(stdin_ctx):
+            line = _stdin_only_line(config, stdin_ctx)
+            if _strip_ansi(line).strip():
+                sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+                return
         if os.environ.get("ANTHROPIC_API_KEY"):
             line = "API key detected \u2014 usage-pulse requires a Pro/Max subscription"
         else:

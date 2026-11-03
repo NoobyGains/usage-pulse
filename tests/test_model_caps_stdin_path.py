@@ -47,7 +47,7 @@ FABLE_PAYLOAD = {
     "limits": [{
         "kind": "weekly_scoped",
         "percent": 81,
-        "resets_at": "2026-09-14T18:00:00+00:00",
+        "resets_at": "2099-09-14T18:00:00+00:00",
         "scope": {"model": {"display_name": "Fable"}},
     }],
 }

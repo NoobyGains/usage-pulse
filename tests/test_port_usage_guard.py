@@ -46,13 +46,13 @@ FABLE_PAYLOAD = {
     "limits": [{
         "kind": "weekly_scoped",
         "percent": 81,
-        "resets_at": "2026-09-14T18:00:00+00:00",
+        "resets_at": "2099-09-14T18:00:00+00:00",
         "scope": {"model": {"display_name": "Fable"}},
     }],
 }
-STALE_FABLE = {"utilization": 37.0, "resets_at": "2026-09-14T18:00:00+00:00"}
-STALE_CORE = {"five_hour": {"utilization": 42.0, "resets_at": "2026-09-08T18:00:00+00:00"},
-              "seven_day": {"utilization": 23.0, "resets_at": "2026-09-14T18:00:00+00:00"}}
+STALE_FABLE = {"utilization": 37.0, "resets_at": "2099-09-14T18:00:00+00:00"}
+STALE_CORE = {"five_hour": {"utilization": 42.0, "resets_at": "2099-09-08T18:00:00+00:00"},
+              "seven_day": {"utilization": 23.0, "resets_at": "2099-09-14T18:00:00+00:00"}}
 PROVIDER_ROW = "PROVIDER-ROW-SENTINEL"
 
 

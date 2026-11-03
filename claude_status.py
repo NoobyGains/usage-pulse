@@ -2578,6 +2578,43 @@ def _cache_age(cached):
     return float("inf") if timestamp is None else time.time() - timestamp
 
 
+def _is_plugin_install():
+    """True when this script runs from a marketplace plugin's version folder.
+
+    Claude Code updates those itself, and the folder has no ``.git``, so
+    asking git there finds nothing or, worse, finds a repo further up (a
+    dotfiles-managed ``~/.claude``). A developer's checkout that merely sits in
+    a folder named like the plugin has a ``.git`` beside the script and is not
+    a plugin install.
+    """
+    try:
+        here = Path(__file__).resolve()
+    except (OSError, RuntimeError):
+        here = Path(__file__)
+    return _is_plugin_cache_path(here) and not (here.parent / ".git").exists()
+
+
+def _cache_quiet_update_verdict(update_cache, script_mtime, reason, local=None):
+    """Remember "nothing to nag about" so the next repaints don't ask git again.
+
+    Written like the positive verdicts, keyed on the script's mtime and the
+    hour's TTL, with the *reason* beside it ("no_git", "fork").
+    """
+    entry = {
+        "timestamp": time.time(),
+        "update_available": False,
+        "reason": reason,
+        "script_mtime": script_mtime,
+    }
+    if local:
+        entry["local"] = local[:8]
+    try:
+        with _secure_open_write(update_cache) as f:
+            json.dump(entry, f)
+    except OSError:
+        pass
+
+
 def check_for_update(*, interactive=False):
     """Check if a newer version is available on GitHub. Returns True/False/None.
 
@@ -2589,6 +2626,8 @@ def check_for_update(*, interactive=False):
     lands in the same cache. Keyword-only, so a stray positional True can't
     skip the status line's gates.
     """
+    if _is_plugin_install():
+        return None  # Claude Code updates plugins; nothing here to compare
     state_dir = get_state_dir()
     update_cache = state_dir / "update_check.json"
 
@@ -2676,7 +2715,11 @@ def check_for_update(*, interactive=False):
 
     local = get_local_commit(deadline=_deadline)
     if not local:
-        return None  # not a git install, skip silently
+        # Not a git install (the curl / Invoke-WebRequest installs have no
+        # .git), or git is unusable. Remember it for the TTL: left uncached,
+        # every repaint spawned `git rev-parse` again for the same answer.
+        _cache_quiet_update_verdict(update_cache, script_mtime, "no_git")
+        return None  # skip silently
 
     if fresh and cached.get("local") == local[:8]:
         return cached["update_available"]
@@ -2712,7 +2755,10 @@ def check_for_update(*, interactive=False):
     if time.time() > _deadline:
         return None
     if _tracks_upstream(deadline=_deadline) is False:
-        return None
+        # Cached like the branch check above: a fork re-ran three git
+        # processes per repaint to learn the same thing every time.
+        _cache_quiet_update_verdict(update_cache, script_mtime, "fork", local)
+        return False
 
     # Perform the check
     if time.time() > _deadline:
@@ -2780,10 +2826,209 @@ def append_update_indicator(line, config=None):
     return line
 
 
+# --- Claude Code versions: comparing, the release channel, what is installed --
+
+_CLAUDE_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
+_CLAUDE_UPDATE_TEXT = "↑ Claude Update"
+_CLAUDE_RESTART_TEXT = "↻ Restart Claude"
+_VERSION_PREFIX_RE = re.compile(r"v?(\d+(?:\.\d+)*)")
+# A native install keeps one file per version, named for it ("2.1.317"; some
+# builds add ".exe").
+_VERSION_ENTRY_RE = re.compile(r"(\d+(?:\.\d+)+)(?:\.exe)?", re.IGNORECASE)
+
+
+def _version_tuple(text):
+    """The dotted numeric prefix of a version as a tuple of ints, or None.
+
+    "2.1.317" is (2, 1, 317); a suffix is ignored ("2.1.317-rc.1" is the same
+    tuple); text with no such prefix ("nightly", "") is None. The text is
+    capped first, so a hostile run of digits can't reach int()'s size limit.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _VERSION_PREFIX_RE.match(text.strip()[:64])
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def _version_cmp(a, b):
+    """1, 0 or -1 as version *a* is newer than, equal to or older than *b*.
+
+    None when either side is unparseable. A short version is padded with
+    zeros, so "2.1" equals "2.1.0".
+    """
+    ta, tb = _version_tuple(a), _version_tuple(b)
+    if ta is None or tb is None:
+        return None
+    width = max(len(ta), len(tb))
+    ta += (0,) * (width - len(ta))
+    tb += (0,) * (width - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
+def _claude_update_channel():
+    """The release channel Claude Code follows: "stable", or "latest".
+
+    Read from ``autoUpdatesChannel`` in the user's Claude ``settings.json``
+    (``$CLAUDE_CONFIG_DIR`` when set). A missing file or key, unreadable or
+    invalid JSON, or any value but "stable" means "latest", the default.
+    """
+    try:
+        with open(_claude_config_dir() / "settings.json", "r", encoding="utf-8") as f:
+            settings = json.loads(f.read(1_000_000))
+    except Exception:  # noqa: BLE001 - a settings problem must never break the check
+        return "latest"
+    value = settings.get("autoUpdatesChannel") if isinstance(settings, dict) else None
+    return "stable" if value == "stable" else "latest"
+
+
+def _parse_claude_dist_tags(body):
+    """``{tag: version}`` from the registry's dist-tags document, or None.
+
+    Unusable unless it is a JSON object with a parseable "latest": that tag is
+    the default channel, so a document without it is a bad answer, not data.
+    """
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tags = {}
+    for name, version in data.items():
+        if isinstance(name, str) and isinstance(version, str) and len(tags) < 32:
+            tags[_sanitize(name)[:32]] = _sanitize(version)[:64]
+    return tags if _version_tuple(tags.get("latest")) is not None else None
+
+
+def _cached_claude_tags(cached):
+    """The tags stored in a cache entry, or None when absent or malformed."""
+    tags = cached.get("tags")
+    if not (isinstance(tags, dict) and len(tags) <= 32
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items())):
+        return None
+    return tags if _version_tuple(tags.get("latest")) is not None else None
+
+
+def _claude_channel_verdict(tags, channel, local_version):
+    """``(channel version, update available)`` for the running *local_version*.
+
+    An update is available only when the channel's version is strictly newer.
+    A channel missing from the tags offers nothing.
+    """
+    remote_version = tags.get(channel) or ""
+    return remote_version, _version_cmp(remote_version, local_version) == 1
+
+
+def _write_claude_update_cache(path, timestamp, local, remote, update_available,
+                               channel, tags):
+    try:
+        with _secure_open_write(path) as f:
+            json.dump({
+                "timestamp": timestamp,
+                "update_available": update_available,
+                "local": local,
+                "remote": remote,
+                "channel": channel,
+                "tags": tags,
+            }, f)
+    except OSError:
+        pass
+
+
+def _claude_data_dir():
+    """Claude Code's data dir: ``$XDG_DATA_HOME/claude``, else ``~/.local/share/claude``."""
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".local" / "share"
+    return base / "claude"
+
+
+def _newest_native_version(versions_dir):
+    """The highest version-named entry of a native install's versions dir, or None."""
+    try:
+        names = os.listdir(versions_dir)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        match = _VERSION_ENTRY_RE.fullmatch(name)
+        if match and (best is None or _version_cmp(match.group(1), best) == 1):
+            best = match.group(1)
+    return best
+
+
+def _npm_package_version(package_dir):
+    """The ``version`` in an installed @anthropic-ai/claude-code package.json, or None."""
+    try:
+        with open(Path(package_dir) / "package.json", "r", encoding="utf-8") as f:
+            data = json.loads(f.read(262_144))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("name") != "@anthropic-ai/claude-code":
+        return None
+    version = data.get("version")
+    if isinstance(version, str) and _version_tuple(version) is not None:
+        return _sanitize(version).strip()
+    return None
+
+
+def _installed_version_for_launcher(launcher):
+    """The Claude Code version the launcher at *launcher* leads to, or None."""
+    real = Path(os.path.realpath(launcher))
+    # Native on macOS, Linux and WSL: the launcher is a symlink into
+    # <data>/claude/versions/<VERSION>, so the target's name is the version.
+    if real.parent.name == "versions":
+        match = _VERSION_ENTRY_RE.fullmatch(real.name)
+        if match:
+            return match.group(1)
+    # npm: the package sits above the resolved launcher (POSIX symlink), or
+    # beside the shim in node_modules (Windows).
+    for folder in list(real.parents)[:6]:
+        if folder.name == "claude-code" and folder.parent.name == "@anthropic-ai":
+            version = _npm_package_version(folder)
+            if version:
+                return version
+            break
+    version = _npm_package_version(
+        Path(launcher).parent / "node_modules" / "@anthropic-ai" / "claude-code")
+    if version:
+        return version
+    # Native on Windows: the launcher is a real file, a copy of the newest
+    # version, and the versions dir holds one file per version.
+    if sys.platform == "win32" and real.suffix.lower() == ".exe":
+        return _newest_native_version(_claude_data_dir() / "versions")
+    return None
+
+
+def _installed_claude_version():
+    """The newest Claude Code version installed on disk, or None when unknown.
+
+    Claude Code updates itself in the background; the new version runs only
+    after a restart. Reads files only (a link, a directory listing, a
+    package.json), never ``claude --version``: this runs on the render path.
+    """
+    try:
+        if _CLAUDE_PATH:
+            launchers = [str(_CLAUDE_PATH)]
+        else:
+            name = "claude.exe" if sys.platform == "win32" else "claude"
+            launchers = [str(Path.home() / ".local" / "bin" / name)]
+        for launcher in launchers:
+            version = _installed_version_for_launcher(launcher)
+            if version:
+                return version
+    except Exception:  # noqa: BLE001 - never break the bar over a file we can't read
+        pass
+    return None
+
+
 def check_claude_code_update(local_version=None, *, interactive=False):
     """Check if a newer Claude Code version is available on npm. Returns True/False/None.
 
-    Cached for 1 hour. Fully silent on any error — never blocks the status line.
+    True only when the version on the user's release channel ("latest", or
+    "stable" per ``autoUpdatesChannel``) is strictly newer than the running
+    one. Cached for 1 hour, as the registry's dist-tags (so a channel switch
+    needs no new request). Fully silent on any error — never blocks the status
+    line.
 
     *interactive* is for a command the user runs (``--config``): it skips the
     status line's turn-taking and backoff, may use the whole
@@ -2831,53 +3076,95 @@ def check_claude_code_update(local_version=None, *, interactive=False):
         cached = None
     fresh = cached is not None and _cache_age(cached) < UPDATE_CHECK_TTL
     if fresh and cached.get("local") == _sanitize(local_version):
-        return cached["update_available"]
+        # The cache holds the registry's tags, not a verdict for one channel:
+        # the verdict is worked out here, for the channel the user follows now.
+        tags = _cached_claude_tags(cached)
+        if tags is not None:
+            channel = _claude_update_channel()
+            remote_version, update_available = _claude_channel_verdict(
+                tags, channel, _sanitize(local_version))
+            if (cached["update_available"] != update_available
+                    or cached.get("remote") != remote_version
+                    or cached.get("channel") != channel):
+                # The channel changed: keep the file in step (--config reads
+                # "remote"), under the original timestamp so the hour isn't extended.
+                _write_claude_update_cache(
+                    update_cache, cached.get("timestamp"), _sanitize(local_version),
+                    remote_version, update_available, channel, tags)
+            return update_available
+        # No tags (written before 3.6.3), or damaged ones: a miss.
 
-    # Get latest version from npm registry
+    # Get the dist-tags from the npm registry: one request serves both channels.
     if not interactive and not _begin_net_attempt("claude_code_update"):
         return None  # a check just failed or was cut short — don't pile on
     try:
         req = urllib.request.Request(
-            "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
+            _CLAUDE_DIST_TAGS_URL,
             headers={"User-Agent": "usage-pulse-update-checker"},
         )
         body = _fetch_bounded(req, 100_000,
                               budget=_UPDATE_CHECK_BUDGET if interactive else None)
         if body is None:
             return None
-        data = json.loads(body.decode("utf-8"))
-        remote_version = _sanitize(str(data.get("version", "")))
-        if not remote_version:
+        tags = _parse_claude_dist_tags(body)
+        if tags is None:
             return None
     except Exception:
         return None
 
-    update_available = _sanitize(local_version) != remote_version
+    channel = _claude_update_channel()
+    remote_version, update_available = _claude_channel_verdict(
+        tags, channel, _sanitize(local_version))
 
     # Cache the result
-    try:
-        with _secure_open_write(update_cache) as f:
-            json.dump({
-                "timestamp": time.time(),
-                "update_available": update_available,
-                "local": _sanitize(local_version),
-                "remote": remote_version,
-            }, f)
-    except OSError:
-        pass
+    _write_claude_update_cache(
+        update_cache, time.time(), _sanitize(local_version),
+        remote_version, update_available, channel, tags)
 
     return update_available
 
 
+def _claude_update_text(running=None):
+    """The indicator's words: restart when the offered version is already installed.
+
+    Claude Code updates itself in the background and applies the new version
+    on the next start, so a channel version that is already on disk needs a
+    restart, not an update. Anything not known for sure keeps "Update".
+    """
+    try:
+        with open(get_state_dir() / "claude_code_update.json", "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict):
+            return _CLAUDE_UPDATE_TEXT
+        if running and cached.get("local") != _sanitize(str(running)).strip():
+            return _CLAUDE_UPDATE_TEXT  # the cache is for another version
+        tags = _cached_claude_tags(cached)
+        if tags is None:
+            return _CLAUDE_UPDATE_TEXT
+        remote_version = tags.get(_claude_update_channel())
+        installed = _installed_claude_version()
+        if installed is not None and _version_cmp(installed, remote_version) in (0, 1):
+            return _CLAUDE_RESTART_TEXT
+    except Exception:  # noqa: BLE001 - the wording must never break the bar
+        pass
+    return _CLAUDE_UPDATE_TEXT
+
+
 def append_claude_update_indicator(line, config=None, stdin_ctx=None):
-    """Append a visible Claude Code update indicator if a newer version is available."""
+    """Append a visible Claude Code update indicator if a newer version is available.
+
+    The text is "Claude Update" (up arrow) when the channel's version still
+    has to be installed, and "Restart Claude" (cycle arrow) when it is already
+    installed and only a restart applies it. Both use the flag ``claude_update``.
+    """
     try:
         if config:
             show = config.get("show", DEFAULT_SHOW)
             if not show.get("claude_update", True):
                 return line
-        if check_claude_code_update((stdin_ctx or {}).get("cc_version")):
-            return line + f" {BRIGHT_YELLOW}\u2191 Claude Update{RESET}"
+        running = (stdin_ctx or {}).get("cc_version")
+        if check_claude_code_update(running):
+            return line + f" {BRIGHT_YELLOW}{_claude_update_text(running)}{RESET}"
     except Exception:
         pass  # never break the status line for an update check
     return line

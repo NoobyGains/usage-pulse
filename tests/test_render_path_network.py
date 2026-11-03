@@ -206,7 +206,8 @@ def _new_process():
     getattr(cs, "_own_stamps", {}).clear()
 
 
-NPM_LATEST = json.dumps({"version": "9.9.9"}).encode()
+# The registry's dist-tags document (what the Claude Code check now fetches).
+NPM_LATEST = json.dumps({"stable": "9.9.0", "next": "9.9.9", "latest": "9.9.9"}).encode()
 FX_LATEST = json.dumps({"rates": {"GBP": 0.5}}).encode()
 
 

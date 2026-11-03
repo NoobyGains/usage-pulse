@@ -278,7 +278,7 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `pomodoro` | on | The focus timer, while one is running (`--focus start 25`) |
 | `staleness` | on | `(5m ago)` when the data on screen is old |
 | `update` | on | `↑ Pulse Update` when a new Usage Pulse release exists |
-| `claude_update` | on | `↑ Claude Update` when a new Claude Code release exists |
+| `claude_update` | on | `↑ Claude Update` when a newer Claude Code is out on your release channel (`latest`, or `stable` if your `autoUpdatesChannel` says so); `↻ Restart Claude` when that version is already installed and only a restart applies it |
 | `opus`, `sonnet`, `fable` | off | Per-model weekly cap bars. These call the usage API, see [below](#per-model-weekly-caps) |
 | `plan` | off | Your plan name |
 | `extra` | off | Extra-usage (bonus) credits. Appears by itself if you have any (`--extra-display`) |

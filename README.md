@@ -375,6 +375,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 --stats                    # usage statistics and streaks
 --heatmap                  # activity heatmap
 --update                   # update a git install
+--uninstall                # remove the status line, hooks and /pulse from Claude Code's settings
 ```
 
 <details>
@@ -420,6 +421,7 @@ Setup
   --setup [--non-interactive]         Guided setup: status line, hooks, providers, theme, widgets
   --install                           Install the status line, agent-panel rows and /pulse (no questions)
   --update                            Update a git install to the latest release
+  --uninstall                         Remove the status line, hooks and /pulse from Claude Code's settings
   --help                              Show this list (also -h)
 
 Look

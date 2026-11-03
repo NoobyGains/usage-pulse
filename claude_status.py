@@ -1019,6 +1019,45 @@ def _secure_open_write(filepath):
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
+# Pauses (seconds) between attempts to swap a file into place on Windows,
+# about half a second in all. See _replace_with_retry.
+_REPLACE_RETRY_PAUSES = (0.01, 0.02, 0.05, 0.1, 0.1, 0.1, 0.1)
+
+
+def _replace_with_retry(src, dst):
+    """``os.replace(src, dst)``, retried briefly on Windows when it is refused.
+
+    Windows will not replace a file another process has open without delete
+    sharing, and answers PermissionError (WinError 5 or 32). The holder is
+    usually passing through: an on-access virus scanner, the search indexer, a
+    repaint reading the same config. A few short pauses ride that out. Any
+    other error, and PermissionError elsewhere, is raised at once.
+    """
+    for pause in _REPLACE_RETRY_PAUSES:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if sys.platform != "win32":
+                raise
+            time.sleep(pause)
+    os.replace(src, dst)
+
+
+def _json_text(data, indent):
+    """``data`` as JSON text, keeping non-ASCII characters readable.
+
+    A lone surrogate cannot be written as UTF-8, so text that holds one falls
+    back to ``\\uXXXX`` escapes, which json.load reads straight back.
+    """
+    text = json.dumps(data, indent=indent, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(data, indent=indent)
+    return text
+
+
 def _atomic_json_write(filepath, data, indent=2):
     """Atomically write JSON with 0o600 permissions on Unix.
 
@@ -1026,14 +1065,27 @@ def _atomic_json_write(filepath, data, indent=2):
     The sibling's name is unique per writer: two windows that write the same
     cache at the same moment must not truncate, rename or delete each other's
     file. Cleans up its own temp file on failure.
+
+    A symlinked destination (a dotfile manager's settings.json) is written
+    through: the swap happens at the link's target, so the link survives
+    instead of being replaced by a plain file. Non-ASCII text is written as
+    is, not as ``\\uXXXX`` escapes.
     """
     filepath = Path(filepath)
+    if os.path.islink(filepath):
+        try:
+            target = Path(os.path.realpath(filepath))
+        except (OSError, ValueError):
+            target = filepath
+        if target.parent.is_dir():
+            filepath = target
     tmp_path = filepath.with_name(
         f"{filepath.name}.{os.getpid()}-{random.randrange(1 << 32):08x}.tmp")
     try:
+        text = _json_text(data, indent)
         with _secure_open_write(tmp_path) as f:
-            json.dump(data, f, indent=indent)
-        os.replace(str(tmp_path), str(filepath))
+            f.write(text)
+        _replace_with_retry(str(tmp_path), str(filepath))
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -1266,6 +1318,21 @@ def _cleanup_hooks():
 
     changed = False
     script_name = "claude_status.py"
+    # The hooks installed today share this script name and one of these events
+    # (the heartbeat's PostToolUse), so the name alone cannot tell a legacy
+    # hook from a current one: this cleanup ran on the first draw after setup
+    # and deleted the heartbeat hook it had just installed. A command that
+    # carries one of today's flags for its event is current, and stays.
+    current_flags = {}
+    for events in _HOOK_GROUPS.values():
+        for event, flag, _blocking in events:
+            current_flags.setdefault(event, []).append(flag)
+
+    def is_legacy(command, event):
+        command = str(command or "")
+        return script_name in command and not any(
+            flag in command for flag in current_flags.get(event, ()))
+
     for hook_type in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
         hooks = settings.get("hooks", {}).get(hook_type, [])
         if hooks:
@@ -1273,11 +1340,11 @@ def _cleanup_hooks():
             for h in hooks:
                 is_pulse = False
                 # Old format: {"command": "...claude_status.py..."}
-                if script_name in h.get("command", ""):
+                if is_legacy(h.get("command", ""), hook_type):
                     is_pulse = True
                 # New nested format: {"hooks": [{"command": "...claude_status.py..."}]}
                 for inner in h.get("hooks", []):
-                    if script_name in inner.get("command", ""):
+                    if is_legacy(inner.get("command", ""), hook_type):
                         is_pulse = True
                 if not is_pulse:
                     filtered.append(h)
@@ -1523,6 +1590,38 @@ def _beat_start(record, now):
     return started if started and started <= now else now
 
 
+def _read_stdin_text(limit):
+    """Read up to ``limit`` bytes of stdin and decode them as UTF-8.
+
+    Claude Code pipes UTF-8 JSON. A text-mode stdin on Windows decodes a pipe
+    with the ANSI code page instead and keeps the bytes that page leaves
+    undefined as lone surrogates: an accented name comes out garbled, and a
+    Cyrillic, CJK or emoji one later raises UnicodeEncodeError and blanks the
+    bar. So read the raw bytes and decode them here, replacing anything
+    invalid. A leading byte-order mark is dropped. A stdin without a byte
+    stream (or one that does not return bytes) falls back to the text read.
+    """
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is not None:
+        data = stream.read(limit)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data).decode("utf-8-sig", "replace")
+    return sys.stdin.read(limit)
+
+
+def _strip_surrogates(text):
+    """``text`` with any lone surrogate replaced by ``?``.
+
+    Versions up to 3.6.2 saved those in stdin_ctx.json; one of them kept in
+    the line makes the final UTF-8 encode raise and blanks the bar.
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def hook_refresh(tool_name_arg):
     """Handle --hook-refresh: update hook state silently (no stdout).
 
@@ -1535,7 +1634,7 @@ def hook_refresh(tool_name_arg):
     session_id = None
     if not sys.stdin.isatty():
         try:
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
             if raw.strip():
                 data = json.loads(raw)
                 if isinstance(data, dict):
@@ -3262,6 +3361,30 @@ def cmd_update():
         utf8_print(f"  {GREEN}No update found — you're on the latest version (v{VERSION}).{RESET}")
         return
 
+    # A checkout that already contains upstream's latest commit has local
+    # commits on top of it: nothing to pull, and nothing to roll back.
+    if _remote_is_ancestor(remote) is True:
+        utf8_print(f"  {GREEN}No update found — this checkout is ahead of main with your own commits (v{VERSION}).{RESET}")
+        return
+
+    # Only a clean checkout of main is updated. A side branch would take a
+    # merge, and uncommitted edits are exactly what a failed update must never
+    # touch. Untracked files are ignored: git refuses to overwrite one.
+    if _on_default_branch() is False:
+        branch = _git("symbolic-ref", "--short", "-q", "HEAD")
+        where = f"on branch '{_sanitize(branch)}'" if branch else "on a detached HEAD"
+        utf8_print(f"  {RED}This checkout is {where}, not main, so it was not updated.{RESET}")
+        utf8_print(f"  Switch to main (git checkout main) and run --update again.")
+        return
+    dirty = _git("status", "--porcelain", "--untracked-files=no", timeout=10)
+    if dirty is None:
+        utf8_print(f"  {RED}Could not read the git status of {_sanitize(str(repo_dir))}; not updating.{RESET}")
+        return
+    if dirty:
+        utf8_print(f"  {RED}You have uncommitted changes in {_sanitize(str(repo_dir))}, so it was not updated.{RESET}")
+        utf8_print(f"  Commit or stash them (git stash), then run --update again.")
+        return
+
     # Fetch remote version to show what's available
     remote_version = _fetch_remote_version()
     if remote_version and remote_version != VERSION:
@@ -3291,7 +3414,7 @@ def cmd_update():
     utf8_print(f"  Pulling latest from GitHub...")
     try:
         result = subprocess.run(
-            [_GIT_PATH, "pull", "origin", "main"],
+            [_GIT_PATH, "pull", "--ff-only", "origin", "main"],
             capture_output=True, text=True, timeout=30,
             cwd=str(repo_dir),
         )
@@ -3302,14 +3425,20 @@ def cmd_update():
                 utf8_print(f"  {RED}Integrity check failed: HEAD after pull ({post_pull_head[:8]}) does not match expected remote ({remote[:8]}).{RESET}")
                 if pre_pull_commit:
                     utf8_print(f"  Rolling back to previous commit ({pre_pull_commit[:8]})...")
+                    # --keep, not --hard: it refuses to overwrite a file that
+                    # has local changes instead of silently discarding them.
+                    rolled_back = False
                     try:
-                        subprocess.run(
-                            [_GIT_PATH, "reset", "--hard", pre_pull_commit],
+                        reset = subprocess.run(
+                            [_GIT_PATH, "reset", "--keep", pre_pull_commit],
                             capture_output=True, text=True, timeout=10,
                             cwd=str(repo_dir),
                         )
+                        rolled_back = reset.returncode == 0
                     except Exception:
                         pass
+                    if not rolled_back:
+                        utf8_print(f"  {YELLOW}Could not roll back automatically. To go back by hand run: git -C \"{_sanitize(str(repo_dir))}\" reset --keep {pre_pull_commit[:12]}{RESET}")
                 utf8_print(f"  {YELLOW}Update aborted. Please try again or re-clone the repository.{RESET}")
                 return
             # Read the new version from the updated file on disk
@@ -3342,6 +3471,10 @@ def cmd_update():
                     cache_file.unlink()
                 except OSError:
                     pass
+            # The release may have changed commands/pulse.md (the /pulse
+            # command lists the options this version understands); copy the
+            # new one in, or /pulse keeps advertising the old version.
+            install_pulse_command()
             utf8_print(f"\n  Restart Claude Code to use v{new_version or 'latest'}.")
         else:
             utf8_print(f"  {RED}Update failed:{RESET}")
@@ -8616,7 +8749,7 @@ def hook_subagent(event):
     raw = ""
     try:
         if not sys.stdin.isatty():
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
     except (OSError, ValueError):
         pass
     data = {}
@@ -9546,7 +9679,7 @@ def cmd_subagent_status_line():
     panel — which is why the whole body is defensive.
     """
     try:
-        raw = sys.stdin.read(1_000_000) if not sys.stdin.isatty() else ""
+        raw = _read_stdin_text(1_000_000) if not sys.stdin.isatty() else ""
     except (OSError, ValueError):
         return
     if not raw or not raw.strip():
@@ -9941,6 +10074,97 @@ def install_pulse_command():
         return
 
     utf8_print(f"Installed /pulse command to {dest}")
+
+
+def _without_pulse_entries(entries):
+    """A settings hook-event list minus every entry that runs claude_status.py.
+
+    Covers today's hooks and the flat ``{"command": ...}`` shape of old
+    versions. Other tools' entries, and their commands inside a shared entry,
+    stay.
+    """
+    kept = []
+    for entry in entries:
+        if isinstance(entry, dict) and "claude_status.py" in str(entry.get("command", "")):
+            continue
+        entry = _without_pulse_command(entry, "")   # "" is in every command: any of ours
+        if entry is not None:
+            kept.append(entry)
+    return kept
+
+
+def cmd_uninstall():
+    """``--uninstall``: take usage-pulse out of Claude Code's configuration.
+
+    Removes, from the active config dir (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``),
+    our ``statusLine`` and ``subagentStatusLine``, every hook that runs this
+    script, and the ``/pulse`` command. Another tool's status line, hooks and
+    command are left alone. A copy of settings.json is kept first. Without
+    this, deleting the install folder leaves hooks that fail after every tool
+    call. The install folder itself, and usage-pulse's own config and cache,
+    are not deleted. Returns a process exit code.
+    """
+    config_dir = _claude_config_dir()
+    settings_path = config_dir / "settings.json"
+    settings, error = _load_settings_for_write(settings_path)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    removed = []
+    for key, label in (("statusLine", "status line"),
+                       ("subagentStatusLine", "agent-panel rows")):
+        block = settings.get(key)
+        if isinstance(block, dict) and "claude_status.py" in str(block.get("command", "")):
+            del settings[key]
+            removed.append(label)
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict):
+        hook_events = []
+        for event, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = _without_pulse_entries(entries)
+            if len(kept) == len(entries) and kept == entries:
+                continue
+            hook_events.append(event)
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+        if hook_events:
+            if not hooks:
+                del settings["hooks"]
+            removed.append("hooks (" + ", ".join(sorted(hook_events)) + ")")
+
+    if removed:
+        try:
+            _backup_settings(settings_path)
+            _atomic_json_write(settings_path, settings)
+        except OSError as e:
+            print(f"Error: could not write {settings_path}: {e}", file=sys.stderr)
+            return 1
+
+    command_file = config_dir / "commands" / "pulse.md"
+    try:
+        if command_file.is_file() and "claude_status.py" in command_file.read_text(encoding="utf-8", errors="replace"):
+            command_file.unlink()
+            removed.append("/pulse command")
+    except OSError as e:
+        utf8_print(f"Note: could not remove {command_file}: {e}")
+
+    if not removed:
+        utf8_print(f"Nothing to remove: usage-pulse is not installed in {config_dir}.")
+        return 0
+    utf8_print(f"Removed from {config_dir}: " + "; ".join(removed))
+    utf8_print("usage-pulse's own settings and cache folders (\"claude-status\") were left in place.")
+    here = Path(__file__).resolve()
+    if _is_plugin_cache_path(here):
+        utf8_print("This copy is a plugin install: run /plugin uninstall usage-pulse to remove the files.")
+    else:
+        utf8_print(f"The files are still in {here.parent}; delete that folder to finish.")
+    utf8_print("Restart Claude Code for this to take effect.")
+    return 0
 
 
 def _pulse_script_in_command(command):
@@ -11931,6 +12155,7 @@ CLI_FLAGS = [
     ("--setup", "[--non-interactive]", "Setup", "Guided setup: status line, hooks, providers, theme, widgets"),
     ("--install", "", "Setup", "Install the status line, agent-panel rows and /pulse (no questions)"),
     ("--update", "", "Setup", "Update a git install to the latest release"),
+    ("--uninstall", "", "Setup", "Remove the status line, hooks and /pulse from Claude Code's settings"),
     ("--help", "", "Setup", "Show this list (also -h)"),
     ("-h", "", "Setup", "Same as --help"),
     ("--theme", "<name>", "Look", "Set the colour theme (see --themes)"),
@@ -12099,6 +12324,12 @@ def main():
 
     if "--sync-install-path" in args:
         code = cmd_sync_install_path()
+        if code:
+            sys.exit(code)
+        return
+
+    if "--uninstall" in args:
+        code = cmd_uninstall()
         if code:
             sys.exit(code)
         return
@@ -12565,7 +12796,7 @@ def main():
             utf8_print("No stdin data (interactive terminal). Pipe data or use from Claude Code.")
             return
         try:
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
         except Exception:
             pass
         debug_path = get_state_dir() / "stdin_debug.json"
@@ -12795,7 +13026,7 @@ def main():
     raw_stdin = ""
     if not sys.stdin.isatty():
         try:
-            raw_stdin = sys.stdin.read(65536)
+            raw_stdin = _read_stdin_text(65536)
         except Exception:
             pass
     stdin_ctx = _parse_stdin_context(raw_stdin)
@@ -12833,7 +13064,7 @@ def main():
             raw_persisted = json.load(f)
         if isinstance(raw_persisted, dict):
             persisted_sid = str(raw_persisted.get("session_id") or "") or None
-            persisted = {k: _sanitize(str(v)) if isinstance(v, str) else v for k, v in raw_persisted.items() if k in _STDIN_CTX_KEYS}
+            persisted = {k: _strip_surrogates(_sanitize(str(v))) if isinstance(v, str) else v for k, v in raw_persisted.items() if k in _STDIN_CTX_KEYS}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     # The carried rate limits can be hours or days old (they are an account

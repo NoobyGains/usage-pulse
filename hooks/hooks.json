@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/claude_status.py\" --sync-install-path 2>/dev/null || python \"${CLAUDE_PLUGIN_ROOT}/claude_status.py\" --sync-install-path 2>/dev/null || true",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/claude_status.py\" --sync-install-path; python \"${CLAUDE_PLUGIN_ROOT}/claude_status.py\" --sync-install-path; exit 0",
             "timeout": 15
           }
         ]

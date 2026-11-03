@@ -778,21 +778,29 @@ class AutoProviderIdsTest(unittest.TestCase):
 
 
 class PythonCommandQuotingTest(unittest.TestCase):
-    """The interpreter path is quoted whenever the shell will expand $HOME into it."""
+    """The interpreter path is the literal forward-slash path, quoted only when it has a space.
+
+    It used to be rewritten to ``$HOME/...``: that is Git Bash's home folder,
+    not the one Python installed to, and a ParserError in PowerShell. The
+    ``py`` launcher and 8.3 short paths are pinned off so the interpreter's own
+    path is what is under test (see tests/test_pr2_windows_install.py for those).
+    """
 
     def _cmd(self, home, exe):
         with mock.patch.object(sys, "platform", "win32"), \
                 mock.patch.object(Path, "home", lambda: Path(home)), \
-                mock.patch.object(sys, "executable", exe):
+                mock.patch.object(sys, "executable", exe), \
+                mock.patch.object(cs, "_windows_py_launcher", lambda: None), \
+                mock.patch.object(cs, "_windows_short_path", lambda path: None):
             return cs._get_python_cmd()
 
     def test_home_with_a_space(self):
         self.assertEqual(self._cmd(r"C:\Users\First Last", r"C:\Users\First Last\Py\python.exe"),
-                         '"$HOME/Py/python.exe"')
+                         '"C:/Users/First Last/Py/python.exe"')
 
-    def test_home_without_a_space_is_quoted_too(self):
+    def test_home_without_a_space_is_a_plain_literal_path(self):
         self.assertEqual(self._cmd(r"C:\Users\Plain", r"C:\Users\Plain\Py\python.exe"),
-                         '"$HOME/Py/python.exe"')
+                         "C:/Users/Plain/Py/python.exe")
 
     def test_path_outside_home_stays_bare(self):
         self.assertEqual(self._cmd(r"C:\Users\Plain", r"C:\Python313\python.exe"),

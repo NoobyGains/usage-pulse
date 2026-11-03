@@ -1823,7 +1823,7 @@ def install_hooks(groups=None):
         if group not in groups:
             continue
         for event, flag, blocking in _HOOK_GROUPS[group]:
-            command = f'{python_cmd} "{script_path}" {flag}'
+            command = _pulse_command(python_cmd, script_path, flag, settings)
             existing = hooks.get(event)
             if not isinstance(existing, list):
                 existing = []
@@ -1831,7 +1831,8 @@ def install_hooks(groups=None):
                     if k is not None]
             if blocking:
                 kept.append({"hooks": [{"type": "command", "command":
-                                        _blocking_hook_command(flag, python_cmd, script_path)}]})
+                                        _blocking_hook_command(flag, _shell_python(python_cmd, settings),
+                                                               script_path)}]})
             else:
                 kept.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
             hooks[event] = kept
@@ -1843,7 +1844,7 @@ def install_hooks(groups=None):
     names = ", ".join(g for g in HOOK_GROUP_NAMES if g in groups)
     utf8_print(f"{GREEN}Installed usage-pulse hooks ({names}) to {settings_path}{RESET}")
     if "heartbeat" in groups:
-        utf8_print(f"  Command: {python_cmd} \"{script_path}\" --hook-refresh")
+        utf8_print(f"  Command: {_pulse_command(python_cmd, script_path, '--hook-refresh', settings)}")
     utf8_print(f"")
     utf8_print(f"This enables:")
     if "heartbeat" in groups:
@@ -8894,35 +8895,170 @@ def cmd_subagent_status_line():
 # ---------------------------------------------------------------------------
 
 def _win_portable_path(path_str):
-    """Convert a Windows absolute path to use $HOME where possible.
+    """Return a Windows absolute path spelled with forward slashes.
 
-    Claude Code v2.1.47+ invokes statusLine commands via a shell that
-    does not expand backslash paths correctly on Windows.  Using forward
-    slashes and ``$HOME`` instead of the literal home directory avoids
-    the issue.  See: https://github.com/anthropics/claude-code/issues/27057
+    Claude Code v2.1.47+ invokes statusLine commands via Git Bash, which
+    treats an unquoted backslash as an escape and drops it from the path.
+    Forward slashes survive every shell. See:
+    https://github.com/anthropics/claude-code/issues/27057
+
+    The path stays literal. It used to be rewritten to ``$HOME/...``, but
+    ``$HOME`` is whatever the *shell* says: Git Bash reads the HOME variable
+    (a corporate home drive, or one set for Emacs or ssh), and Python's
+    ``Path.home()`` ignores it, so the command pointed at a folder the
+    installer never wrote to. PowerShell needs ``$env:HOME`` spelled
+    differently anyway.
     """
     if sys.platform != "win32":
         return path_str
     path_str = str(path_str).replace("\\", "/")
-    home = str(Path.home()).replace("\\", "/")
-    if path_str.startswith(home + "/") or path_str == home:
-        path_str = "$HOME" + path_str[len(home):]
+    # Extended-length prefix (``\\?\C:\x`` / ``\\?\UNC\srv\share``) that
+    # Path.resolve() can return: no shell understands it.
+    if path_str.startswith("//?/UNC/"):
+        path_str = "//" + path_str[len("//?/UNC/"):]
+    elif path_str.startswith("//?/") and len(path_str) > 5 and path_str[5] == ":":
+        path_str = path_str[len("//?/"):]
     return path_str
 
 
-def _get_python_cmd():
-    """Return the Python command to use in hooks/settings.
+def _windows_py_launcher():
+    """``py -3`` when the Python launcher is installed and really runs Python 3.8+.
 
-    Uses sys.executable to ensure we match whatever Python is running this script.
-    On Linux this is typically 'python3', on Windows 'python'.
+    The launcher is the one Python entry point that survives upgrades: a
+    python.org install lives in a versioned folder (``Python313``), and the
+    Python install manager in ``pythoncore-3.13-64``, so a command that names
+    one of those blanks the status bar the day the old version is removed.
+    ``py`` also exists as a Microsoft Store alias that does nothing, so it is
+    only used once it has actually run Python.
     """
-    exe = _win_portable_path(sys.executable)
-    # Quote a path with spaces, and any path under $HOME: the shell expands
-    # $HOME at run time, and a home folder like "C:/Users/First Last" would
-    # otherwise split the command. Double quotes keep the expansion.
-    if " " in exe or "$HOME" in exe:
+    if sys.platform != "win32":
+        return None
+    launcher = shutil.which("py")
+    if not launcher:
+        return None
+    try:
+        result = subprocess.run(
+            [launcher, "-3", "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "py -3" if result.returncode == 0 else None
+
+
+def _windows_short_path(path):
+    """The 8.3 short form of an existing Windows path (``C:/PROGRA~1/...``), or None.
+
+    A short path has no space, so it needs no quotes and runs unchanged in
+    Git Bash and PowerShell. Volumes with 8.3 names switched off hand the long
+    name back, and the caller then falls back to quoting.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+    except (AttributeError, ImportError, OSError, ValueError):
+        return None
+    if not length or length >= len(buf):
+        return None
+    return buf.value.replace("\\", "/")
+
+
+def _git_bash_available(settings=None):
+    """True when Claude Code can run shell commands through Git Bash on Windows.
+
+    Claude Code runs a status line or hook command through Git Bash when it
+    finds it and through PowerShell when it does not, and the ``statusLine``
+    setting has no field to choose. It looks at ``CLAUDE_CODE_GIT_BASH_PATH``
+    (environment or the ``env`` block of settings.json), then the usual Git
+    for Windows locations. WSL's ``System32\\bash.exe`` is not Git Bash.
+    """
+    candidates = []
+    configured = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if not configured and isinstance(settings, dict) and isinstance(settings.get("env"), dict):
+        configured = settings["env"].get("CLAUDE_CODE_GIT_BASH_PATH")
+    if configured and isinstance(configured, str):
+        candidates.append(Path(configured))
+    for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = os.environ.get(var)
+        if base:
+            candidates.append(Path(base) / "Git" / "bin" / "bash.exe")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Programs" / "Git" / "bin" / "bash.exe")
+    git = shutil.which("git")
+    if git:
+        try:
+            git_dir = Path(git).resolve().parent
+        except (OSError, RuntimeError):
+            git_dir = Path(git).parent
+        # Git\cmd\git.exe, Git\bin\git.exe and Git\mingw64\bin\git.exe
+        candidates.append(git_dir.parent / "bin" / "bash.exe")
+        candidates.append(git_dir.parent.parent / "bin" / "bash.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _get_python_cmd():
+    """Return the interpreter part of the command written to settings.json.
+
+    On Windows the result is, in order of preference: ``py -3`` (the launcher
+    survives Python upgrades and venv removal), the interpreter's own
+    forward-slash path (a venv is swapped for the Python underneath it), its
+    8.3 short path when the long one has a space, and as a last resort the
+    quoted path. Everything but the quoted form is one plain word that Git Bash
+    and both PowerShells read the same way; ``_pulse_command`` deals with the
+    quoted one. Elsewhere it is ``sys.executable``, quoted if it has a space.
+    """
+    if sys.platform == "win32":
+        launcher = _windows_py_launcher()
+        if launcher:
+            return launcher
+        exe = sys.executable
+        if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+            exe = getattr(sys, "_base_executable", None) or exe
+        portable = _win_portable_path(exe)
+        if _SHELL_NEUTRAL_WORD.fullmatch(portable):
+            return portable
+        short = _windows_short_path(exe)
+        if short and _SHELL_NEUTRAL_WORD.fullmatch(short):
+            return short
+        return f'"{portable}"'
+    exe = sys.executable
+    if " " in exe:
         return f'"{exe}"'
     return exe
+
+
+def _pulse_command(python_cmd, script_path, flag=None, settings=None):
+    """Build the full status-line or hook command from ``_get_python_cmd()``.
+
+    Claude Code runs it through Git Bash, or through PowerShell when Git Bash
+    is absent, so on Windows the text must parse in both: a plain interpreter
+    word first, then the script path in single quotes. A quoted interpreter
+    cannot do that. Bash reads ``& "..."`` as "run in the background" and
+    PowerShell reads a line that starts with a quoted string as text to print,
+    so that one case gets the form of whichever shell will really run it.
+    """
+    tail = f" {flag}" if flag else ""
+    if sys.platform != "win32":
+        return f'{python_cmd} "{script_path}"{tail}'
+    script = str(script_path)
+    quoted_script = f'"{script}"' if "'" in script else f"'{script}'"
+    return f"{_shell_python(python_cmd, settings)} {quoted_script}{tail}"
+
+
+def _shell_python(python_cmd, settings=None):
+    """``python_cmd`` as the shell that will run it needs it written."""
+    if sys.platform == "win32" and python_cmd.startswith('"') and not _git_bash_available(settings):
+        return "& " + python_cmd    # PowerShell's call operator
+    return python_cmd
 
 
 # Refresh cadences (seconds) for `statusLine.refreshInterval`, chosen by what
@@ -9037,10 +9173,12 @@ def install_status_line():
             print(f"Error: Cannot read {settings_path}: {e}", file=sys.stderr)
             return
 
-    # Status line command — use $HOME on Windows for Claude Code compat
+    # Status line command: forward-slash literal paths on Windows, written so
+    # that both Git Bash and PowerShell read it the same way.
+    status_command = _pulse_command(python_cmd, script_path, settings=settings)
     status_line = {
         "type": "command",
-        "command": f'{python_cmd} "{script_path}"',
+        "command": status_command,
     }
     # Versions up to v3.1.0 wrote `"refresh": 150` here. Claude Code has no
     # such setting, so it was silently ignored and the timed repaint never
@@ -9054,7 +9192,7 @@ def install_status_line():
     # rendering for anything we don't emit, so this can only add information.
     settings["subagentStatusLine"] = {
         "type": "command",
-        "command": f'{python_cmd} "{script_path}" --subagent-status-line',
+        "command": _pulse_command(python_cmd, script_path, "--subagent-status-line", settings),
     }
 
     # No hooks installed here — static status bar by default.
@@ -9069,7 +9207,10 @@ def install_status_line():
     if backup:
         utf8_print(f"Previous settings.json kept at {backup}")
     utf8_print("Installed subagent status line (per-agent rows in the agent panel)")
-    utf8_print(f"Command: {python_cmd} \"{script_path}\"")
+    utf8_print(f"Command: {status_command}")
+    if status_command.startswith("& "):
+        utf8_print("Note: Git for Windows (Git Bash) was not found, so the command is written for PowerShell.")
+        utf8_print("      If you install Git for Windows later, run --setup again to rewrite it.")
     if interval is not None:
         utf8_print(f"Refresh: every {interval}s (plus Claude Code's own events)")
     else:

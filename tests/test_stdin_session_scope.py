@@ -26,6 +26,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import claude_status as cs  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from terminal_fixtures import host_terminal_width  # noqa: E402
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -47,6 +50,9 @@ class SessionScopeTest(unittest.TestCase):
         for target, value in (("get_state_dir", lambda: self.state),
                               ("_claude_config_dir", lambda: cfg_dir),
                               ("get_config_path", lambda: Path(self._td.name) / "config.json"),
+                              # main() fits the line to the terminal it finds; pin
+                              # "no terminal" so the contributor's window cannot cut it.
+                              ("_detect_terminal_width", lambda: None),
                               ("check_for_update", lambda: False),
                               ("check_claude_code_update", lambda: False),
                               ("get_credentials", lambda: ("token", "Max 20x")),
@@ -97,6 +103,17 @@ class SessionScopeTest(unittest.TestCase):
 
     def _persisted(self):
         return json.loads((cs.get_account_state_dir() / "stdin_ctx.json").read_text(encoding="utf-8"))
+
+    def test_context_and_cost_draw_whatever_width_the_hosts_terminal_has(self):
+        """main() fits the line to the terminal it finds; the fake stdout has
+        no fileno, so an ordinary 80-column window used to cut the context % and
+        cost, and every assertNotIn below would then pass for the wrong reason."""
+        for columns in (80, 160):
+            with self.subTest(columns=columns):
+                with host_terminal_width(columns):
+                    line = self._repaint(self._payload("s1", pct=45, cost=0.43))
+                self.assertIn("45%", line, "fitted to a %d-column host terminal" % columns)
+                self.assertIn("$0.43", line, "fitted to a %d-column host terminal" % columns)
 
     def test_new_session_starts_without_the_old_context_and_cost(self):
         line = self._repaint(self._payload("s1", pct=45, cost=0.43))

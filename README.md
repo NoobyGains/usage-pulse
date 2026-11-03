@@ -242,9 +242,9 @@ State that belongs to one account (usage cache, stdin context, history, sessions
 
 `--animation-speed` takes `slow`, `normal` or `fast`. Animation needs repaints, so setup writes a 2-second `refreshInterval` while animation is on.
 
-**8 bar styles** with `--bar-style <name>`: classic, block, shade, pipe, dot, square, star, braille. If Unicode looks wrong in your terminal, `block` is the safe one. **Bar sizes**: small, small-medium, medium, medium-large, large (`--bar-size`). A named size is exactly that wide whatever the window does; `--bar-size auto` shrinks the bars to fit a narrow window instead, and `--wrap auto` moves what does not fit onto a second row.
+**8 bar styles** with `--bar-style <name>`: classic, block, shade, pipe, dot, square, star, braille. If Unicode looks wrong in your terminal, `block` is the safe one. **Bar sizes**: small, small-medium, medium, medium-large, large (`--bar-size`). A named size is exactly that wide whatever the window does; `--bar-size auto` shrinks the bars to fit a narrow window instead, and `--wrap auto` moves what does not fit onto extra rows, up to four.
 
-**Layouts** (`--layout`): `standard` has full labels, `compact` one-letter labels, `minimal` no labels, and `percent-first` puts the number before the bar. `--max-width` sets the share of the terminal the bar may use and `--wrap auto` wraps onto a second row instead of cutting the line. For a deliberate two-row split, set `line2_widgets` (these go to row 2) or `line1_widgets` (an allowlist for row 1, the rest flows to row 2) in `config.json`.
+**Layouts** (`--layout`): `standard` has full labels, `compact` one-letter labels, `minimal` no labels, and `percent-first` puts the number before the bar. `--max-width` sets the share of the terminal the bar may use and `--wrap auto` wraps onto up to four rows instead of cutting the line. A line that still does not fit loses whole widgets from the end and finishes with a dim `…`. For a deliberate two-row split, set `line2_widgets` (these go to row 2) or `line1_widgets` (an allowlist for row 1, the rest flows to row 2) in `config.json`.
 
 ## Widgets
 
@@ -278,18 +278,18 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `pomodoro` | on | The focus timer, while one is running (`--focus start 25`) |
 | `staleness` | on | `(5m ago)` when the data on screen is old |
 | `update` | on | `↑ Pulse Update` when a new Usage Pulse release exists |
-| `claude_update` | on | `↑ Claude Update` when a new Claude Code release exists |
+| `claude_update` | on | `↑ Claude Update` when a newer Claude Code is out on your release channel (`latest`, or `stable` if your `autoUpdatesChannel` says so); `↻ Restart Claude` when that version is already installed and only a restart applies it |
 | `opus`, `sonnet`, `fable` | off | Per-model weekly cap bars. These call the usage API, see [below](#per-model-weekly-caps) |
 | `plan` | off | Your plan name |
-| `extra` | off | Extra-usage (bonus) credits. Appears by itself if you have any (`--extra-display`) |
+| `extra` | off | Extra-usage (bonus) credits, in your currency. Appears by itself if you have any (`--extra-display`), refreshes with the per-model caps, and shows `(stale)` or `(3d ago)` when the figure is old |
 | `thinking` | off | `think` or `no-think` |
 | `cache` | off | Share of input served from the prompt cache |
 | `cache_warm` | off | Prompt-cache warmth, such as `♨ 92% · 3m` |
 | `pr` | off | Clickable `#123` pull request badge with review state. GitLab merge requests show as `!123` |
 | `repo` | off | `owner/name` of the current repository |
 | `session_name` | off | The name you gave the session with `/rename` |
-| `weekly_cost` | off | Rolling 7-day API-equivalent cost |
-| `cumulative_cost` | off | API-equivalent cost across all sessions |
+| `weekly_cost` | off | Rolling 7-day API-equivalent cost. Fills in a few seconds after you first switch it on |
+| `cumulative_cost` | off | API-equivalent cost across all sessions. Fills in a few seconds after you first switch it on |
 | `burn_rate` | off | How fast the window is filling, such as `↑3%/hr` |
 | `runway` | off | Estimated time until the window is full |
 | `sparkline` | off | A small chart of recent session usage |
@@ -299,8 +299,8 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `sessions` | off | `+2 sessions` when other windows are open |
 | `git_drift` | off | Commits behind and ahead of upstream |
 | `files_changed` | off | Count of uncommitted files |
-| `heartbeat` | off | Spinner, tool count and elapsed time. Needs the [heartbeat hook](#agents-and-teams) |
-| `last_tool` | off | The last tool Claude used. Needs the heartbeat hook |
+| `heartbeat` | off | Spinner, and this session's tool count and elapsed time. Needs the [heartbeat hook](#agents-and-teams) |
+| `last_tool` | off | The last tool Claude used in this session. Needs the heartbeat hook |
 
 </details>
 
@@ -319,7 +319,7 @@ The `opus`, `sonnet` and `fable` bars show your weekly cap for each model, when 
 | Sonnet 5.5 | $2 / $10 |
 | Haiku 5.5 | $0.10 / $0.50 up to 100K prompt tokens, $0.50 / $2.50 above |
 
-All four have a 1M-token context window. Costs are API-equivalent: a figure to compare sessions by, not your bill. `--currency £` converts from USD at a daily exchange rate, and `--budget 25` draws a spend bar against the number you give Claude Code's `--max-budget-usd`, which the status line cannot read by itself.
+All four have a 1M-token context window. Costs are API-equivalent: a figure to compare sessions by, not your bill. `--currency £` converts from USD at a daily exchange rate; give a symbol or any ISO code the rate service lists, such as `--currency DKK`, `NOK` or `SEK` (shown as `DKK68.50`). A bare `kr` follows your machine's country: Danish kroner in Denmark, Norwegian in Norway, Swedish elsewhere. The 7-day and all-time cost widgets are worked out by a background process, so they appear a few seconds after you first switch them on. `--budget 25` draws a spend bar against the number you give Claude Code's `--max-budget-usd`, which the status line cannot read by itself.
 
 ## Agents and teams
 
@@ -334,11 +334,11 @@ python3 ~/.usage-pulse/claude_status.py --install-hooks --only agents,team    # 
 |---|---|---|---|
 | `agents` | SubagentStart, SubagentStop | The live agent counter, `agents 3 live · 47/200` | A short Python run when a subagent starts or stops |
 | `team` | TeammateIdle, TaskCreated, TaskCompleted | The agent-team segment, `team 3 · tasks 4/7` | A short Python run on each of those events |
-| `heartbeat` | PostToolUse | The spinner and tool count, plus `last_tool` | A Python run after **every** tool call, and it keeps the repaint timer alive, which is why it is off by default |
+| `heartbeat` | PostToolUse | The spinner and this session's tool count, plus `last_tool` | A Python run after **every** tool call, and it keeps the repaint timer alive, which is why it is off by default |
 
 The agent panel rows need no hook: `--setup` registers `subagentStatusLine`, and Claude Code then asks Usage Pulse to draw each subagent's row with its status, model, effort, a context bar and elapsed time. `--limits subagent_spawns=200,subagent_concurrent=20,web_searches=200` sets the denominators, since Claude Code enforces those caps but does not report them.
 
-**Hooks never block Claude.** For the events where exit code 2 would steer Claude Code (SubagentStop, TeammateIdle, TaskCreated, TaskCompleted) the installed command ends in `; exit 0`, so even a moved or deleted script cannot keep a subagent running or refuse a task. `--install-hooks` refuses to touch a `settings.json` that is not valid JSON, and your other hooks are left alone.
+**Hooks never block Claude.** Every installed hook command ends in `; exit 0`. For the events where exit code 2 would steer Claude Code (SubagentStop, TeammateIdle, TaskCreated, TaskCompleted) that means even a moved or deleted script cannot keep a subagent running or refuse a task, and for the others it means no hook error after each tool call. `--install-hooks` refuses to touch a `settings.json` that is not valid JSON, and your other hooks are left alone.
 
 <details>
 <summary><b>Agent team requirements and limits</b></summary>
@@ -363,7 +363,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 --bar-size large           # small, small-medium, medium, medium-large, large, auto
 --bar-style block          # classic, block, shade, pipe, dot, square, star, braille
 --layout compact           # standard, compact, minimal, percent-first
---currency £               # $, £, €, ¥, C$, A$, ₹, kr, and 20+ more
+--currency £               # $, £, €, ¥, C$, A$, ₹, kr, and 20+ more; or an ISO code such as DKK, NOK, SEK
 --clock-format 12h         # 12h or 24h
 --effort-format labeled    # labeled 'Effort: Medium', full 'Medium', short 'med'
 --budget 25                # spend bar; use the number you pass to Claude Code's --max-budget-usd
@@ -375,6 +375,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 --stats                    # usage statistics and streaks
 --heatmap                  # activity heatmap
 --update                   # update a git install
+--uninstall                # remove the status line, hooks and /pulse from Claude Code's settings
 ```
 
 <details>
@@ -402,6 +403,8 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 | `providers_refresh_seconds` | Poll interval for other Claude accounts. Default 300, minimum 60 |
 | `model_caps_refresh_seconds` | Poll interval for the per-model caps. Default 300, minimum 60 |
 
+`config.json` is read as UTF-8 (a byte-order mark is fine) or UTF-16, so Notepad's "UTF-8 with BOM" and "Unicode" saves both work. A file in another encoding, such as ANSI with a `£` in it, cannot be read and is skipped: the defaults apply until you save it as UTF-8.
+
 **The refresh timer.** Claude Code repaints the status line on its own events (a prompt, a tool call). Anything that moves with the clock, such as animation frames, the focus countdown or the heartbeat's elapsed time, needs a timer as well. Setup writes `statusLine.refreshInterval` into `settings.json` for this: 2 seconds while animating, 15 seconds for time-based widgets, and nothing at all for a static bar. It is kept in sync whenever you change a setting.
 
 </details>
@@ -411,7 +414,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 This is the output of `python claude_status.py --help`:
 
 ```
-usage-pulse 3.6.2 — usage status line for Claude Code
+usage-pulse 3.7.0 — usage status line for Claude Code
 
 Usage: python claude_status.py [flag [args]]
 With no flag and JSON on stdin (how Claude Code runs it) it prints the status line.
@@ -420,6 +423,7 @@ Setup
   --setup [--non-interactive]         Guided setup: status line, hooks, providers, theme, widgets
   --install                           Install the status line, agent-panel rows and /pulse (no questions)
   --update                            Update a git install to the latest release
+  --uninstall                         Remove the status line, hooks and /pulse from Claude Code's settings
   --help                              Show this list (also -h)
 
 Look
@@ -442,14 +446,14 @@ Look
   --layout <standard|compact|minimal|percent-first>
                                       How labels, bars and numbers are arranged
   --max-width <20-100>                Percent of the terminal width to use
-  --wrap <off|auto>                   Wrap onto a second row instead of truncating
+  --wrap <off|auto>                   Wrap onto up to 4 rows instead of truncating
   --preset <minimal|default>          Apply a bundle of settings (default = factory reset)
 
 Widgets
   --show <parts>                      Turn widgets on (comma-separated)
   --hide <parts>                      Turn widgets off (comma-separated)
   --priority <widget=N,...>           Reorder widgets (lower = further left)
-  --currency <symbol>                 Currency for cost widgets (converted from USD)
+  --currency <symbol|code>            Currency for cost widgets: a symbol or ISO code such as DKK (converted from USD)
   --clock-format <12h|24h>            Clock for reset times
   --effort-format <labeled|full|short>
                                       How reasoning effort is written
@@ -553,7 +557,7 @@ Claude Code sends `rate_limits` on stdin, so the main bars need no OAuth call an
 | A provider row shows `--` | The source could not be read yet: no token, a missing file, or no rate-limit data in the newest Codex session |
 | "Rate limited" message | The main bars read stdin, so they keep working. API-backed parts back off before retrying |
 | `--update` says it cannot reach GitHub | Both the GitHub API and `git ls-remote` failed. Check the network; the unauthenticated API alone is not needed since 3.4.1 |
-| The bars are two characters wide | `--bar-size auto` is on, or the version is older than 3.6.0, which shrank bars to fit the window. Set a named size with `--bar-size large`; in a narrow window, `--wrap auto` puts the rest of the line on a second row |
+| The bars are two characters wide | `--bar-size auto` is on, or the version is older than 3.6.0, which shrank bars to fit the window. Set a named size with `--bar-size large`; in a narrow window, `--wrap auto` puts the rest of the line on extra rows |
 | Animation or timer frozen when idle | Run `--setup` again. The real setting is `statusLine.refreshInterval` |
 | Opus/Sonnet/Fable bar missing | They are off by default (`--show fable`). They also render only when your plan reports that cap, and Claude Pro returns none |
 | Heartbeat not showing | Run `--install-hooks --only heartbeat`, switch the widget on with `--show heartbeat`, and restart Claude Code. It shows after the first tool call |

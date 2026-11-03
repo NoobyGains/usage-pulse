@@ -8,6 +8,7 @@ accounts can never leak in.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -48,6 +49,14 @@ class ProviderSandbox:
         memo = getattr(cs, "_ACCOUNT_LABELS_MEMO", {})
         memo.clear()
         testcase.addCleanup(memo.clear)
+
+    def next_repaint(self):
+        """Start a new repaint: the 5 s gap the optional network checks leave
+        between turns (``_NET_MIN_SPACING``) has passed."""
+        try:
+            cs._stamp_path("_last").unlink()
+        except OSError:
+            pass
 
     # --- fake sources -----------------------------------------------------
     def set_active(self, path):
@@ -112,3 +121,43 @@ def codex_line(used5=29.0, usedw=5.0, limit_id="codex", reset5=None, resetw=None
 def iso_z(seconds_from_now):
     t = time.gmtime(time.time() + seconds_from_now)
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", t)
+
+
+def mmx_quota(left5=20.0, leftw=80.0):
+    """``mmx quota show --output json`` as the CLI prints it."""
+    end_ms = int((time.time() + 3600) * 1000)
+    return {"model_remains": [{
+        "current_interval_status": 1,
+        "current_interval_remaining_percent": left5,
+        "current_weekly_remaining_percent": leftw,
+        "end_time": end_ms, "weekly_end_time": end_ms + 86_400_000,
+    }]}
+
+
+class FakeMmx:
+    """A stand-in for ``subprocess.run`` that delivers output like the real one.
+
+    The output goes wherever ``stdout`` points: into the file object handed in
+    (mmx runs with no pipes), or back on the result when a caller asked for a
+    captured pipe. ``exc`` is raised instead, to model a failure or a kill.
+    """
+
+    def __init__(self, payload=None, rc=0):
+        self.payload = mmx_quota() if payload is None else payload
+        self.rc = rc
+        self.exc = None
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append((list(cmd), kwargs))
+        if self.exc is not None:
+            raise self.exc
+        text = json.dumps(self.payload)
+        dest = kwargs.get("stdout")
+        out = None
+        if hasattr(dest, "write"):
+            dest.write(text.encode("utf-8"))
+        elif kwargs.get("capture_output") or dest is subprocess.PIPE:
+            wants_text = any(kwargs.get(k) for k in ("text", "universal_newlines", "encoding"))
+            out = text if wants_text else text.encode("utf-8")
+        return subprocess.CompletedProcess(cmd, self.rc, stdout=out, stderr=None)

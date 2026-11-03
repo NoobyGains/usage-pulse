@@ -5,7 +5,6 @@ Run: ``python -m unittest tests.test_provider_sources``
 import io
 import json
 import os
-import subprocess
 import sys
 import time
 import unittest
@@ -13,7 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from provider_fixtures import ProviderSandbox, codex_line, cs, iso_z  # noqa: E402
+from provider_fixtures import (  # noqa: E402
+    FakeMmx, ProviderSandbox, codex_line, cs, iso_z, mmx_quota)
 
 
 class TimeHelpersTest(unittest.TestCase):
@@ -263,21 +263,20 @@ class MiniMaxProviderTest(unittest.TestCase):
     def setUp(self):
         self.sb = ProviderSandbox(self)
 
-    def _proc(self):
-        end_ms = int((time.time() + 3600) * 1000)
-        out = {"model_remains": [{"current_interval_remaining_percent": 80,
-                                  "current_weekly_remaining_percent": 40,
-                                  "end_time": end_ms, "weekly_end_time": end_ms + 86400000}]}
-        return subprocess.CompletedProcess([], 0, stdout=json.dumps(out), stderr="")
+    def _run(self):
+        # mmx runs with no pipes now: its output lands in the stdout file it is
+        # handed, as the real subprocess.run would deliver it.
+        return FakeMmx(mmx_quota(left5=80, leftw=40))
 
     def test_reuses_parser_and_respects_ttl(self):
+        run = self._run()
         with mock.patch.object(cs.shutil, "which", return_value="/bin/mmx"), \
-                mock.patch.object(cs.subprocess, "run", return_value=self._proc()) as run:
+                mock.patch.object(cs.subprocess, "run", run):
             c = cs._read_minimax_quota("minimax")
             self.assertAlmostEqual(c["usage"]["five_hour"]["utilization"], 20.0)
             self.assertAlmostEqual(c["usage"]["seven_day"]["utilization"], 60.0)
             cs._read_minimax_quota("minimax")
-            self.assertEqual(run.call_count, 1)  # cached for 120 s
+            self.assertEqual(len(run.calls), 1)  # cached for 120 s
 
     def test_no_mmx_no_process(self):
         with mock.patch.object(cs.shutil, "which", return_value=None), \

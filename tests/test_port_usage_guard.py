@@ -37,6 +37,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider_fixtures import ProviderSandbox, cs  # noqa: E402
+from terminal_fixtures import host_terminal_width  # noqa: E402
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -45,13 +46,13 @@ FABLE_PAYLOAD = {
     "limits": [{
         "kind": "weekly_scoped",
         "percent": 81,
-        "resets_at": "2026-09-14T18:00:00+00:00",
+        "resets_at": "2099-09-14T18:00:00+00:00",
         "scope": {"model": {"display_name": "Fable"}},
     }],
 }
-STALE_FABLE = {"utilization": 37.0, "resets_at": "2026-09-14T18:00:00+00:00"}
-STALE_CORE = {"five_hour": {"utilization": 42.0, "resets_at": "2026-09-08T18:00:00+00:00"},
-              "seven_day": {"utilization": 23.0, "resets_at": "2026-09-14T18:00:00+00:00"}}
+STALE_FABLE = {"utilization": 37.0, "resets_at": "2099-09-14T18:00:00+00:00"}
+STALE_CORE = {"five_hour": {"utilization": 42.0, "resets_at": "2099-09-08T18:00:00+00:00"},
+              "seven_day": {"utilization": 23.0, "resets_at": "2099-09-14T18:00:00+00:00"}}
 PROVIDER_ROW = "PROVIDER-ROW-SENTINEL"
 
 
@@ -107,6 +108,10 @@ class _GuardHarness(unittest.TestCase):
 
         patches = [
             mock.patch.dict(cs._own_stamps, {}, clear=True),
+            # The line is printed through a fake stdout with no fileno, so width
+            # detection would fall through to the contributor's own terminal and
+            # fit (cut) the line to their window. Pin it to "no terminal".
+            mock.patch.object(cs, "_detect_terminal_width", lambda: None),
             mock.patch.object(cs, "get_credentials", lambda: ("fake-token", "Max 20x")),
             mock.patch.object(cs, "fetch_usage", self._fetch),
             mock.patch.object(cs, "load_config",
@@ -294,6 +299,22 @@ class CrossAccountCapsTest(_GuardHarness):
         # A's guard is still armed: B neither saw it nor lifted it.
         self._use(self.account_a)
         self.assertFalse(cs._begin_net_attempt("usage", cs._USAGE_KILL_GUARD, primary=True))
+
+
+class HostTerminalWidthTest(_GuardHarness):
+    """The line these tests read is not fitted to the contributor's own window
+    (the harness's fake stdout has no fileno, so width detection falls through
+    to stderr and the Fable bar is cut in an ordinary terminal)."""
+
+    def test_the_cap_is_drawn_whatever_width_the_hosts_terminal_has(self):
+        self._use(None)
+        for columns in (80, 160):
+            with self.subTest(columns=columns):
+                self._plant_stale_caps()
+                with host_terminal_width(columns):
+                    line = self._repaint(self._stdin_payload())
+                self.assertIn("81%", line,
+                              "the line was fitted to a %d-column host terminal" % columns)
 
 
 class RefusedGuardDoesNotBurnRetryTest(_GuardHarness):

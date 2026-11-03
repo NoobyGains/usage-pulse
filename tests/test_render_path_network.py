@@ -206,7 +206,8 @@ def _new_process():
     getattr(cs, "_own_stamps", {}).clear()
 
 
-NPM_LATEST = json.dumps({"version": "9.9.9"}).encode()
+# The registry's dist-tags document (what the Claude Code check now fetches).
+NPM_LATEST = json.dumps({"stable": "9.9.0", "next": "9.9.9", "latest": "9.9.9"}).encode()
 FX_LATEST = json.dumps({"rates": {"GBP": 0.5}}).encode()
 
 
@@ -719,7 +720,7 @@ class AuthorizedRequestConnectTest(unittest.TestCase):
         )
 
 
-USAGE = {"five_hour": {"utilization": 42.0, "resets_at": "2026-08-01T00:00:00Z"}}
+USAGE = {"five_hour": {"utilization": 42.0, "resets_at": "2099-08-01T00:00:00Z"}}
 
 
 class UsageFetchTrapTest(unittest.TestCase):
@@ -1107,7 +1108,7 @@ class UsageFetchTrapTest(unittest.TestCase):
         cases += [
             ("five_hour utilization NaN",
              {"five_hour": {"utilization": float("nan"),
-                            "resets_at": "2026-08-01T00:00:00Z"}}, True),
+                            "resets_at": "2099-08-01T00:00:00Z"}}, True),
             ("seven_day as text", {"seven_day": "text"}, True),
         ]
         for label, bad, real_render in cases:

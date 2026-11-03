@@ -98,22 +98,41 @@ install_repo() {
   install_from_raw
 }
 
-run_python_setup() {
-  if has_cmd python3; then
+# A command that exists is not a command that works: on Windows the Microsoft
+# Store leaves python.exe / python3.exe stubs on PATH that only complain, and
+# python.org's classic installer ships python.exe but no python3.exe. So each
+# candidate has to run a real Python 3.8+ before it is picked.
+python_runs() {
+  "$@" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1
+}
+
+pick_python() {
+  PY_ARGS=""
+  if has_cmd python3 && python_runs python3; then
     PY=python3
-  elif has_cmd python; then
+  elif has_cmd python && python_runs python; then
     PY=python
+  elif has_cmd py && python_runs py -3; then
+    PY=py
+    PY_ARGS="-3"
   else
-    die "Python 3 is required. Install Python, then run this installer again."
+    die "Python 3.8 or newer is required. Install Python (python.org or the Microsoft Store), then run this installer again."
   fi
+}
+
+run_python_setup() {
+  pick_python
 
   # `curl | bash` leaves stdin on the pipe, so test stdout and /dev/tty
   # instead: when both work, the wizard reads real keys from /dev/tty.
   # USAGE_PULSE_NONINTERACTIVE=1 (dotfiles, CI) always takes the defaults.
   if [ -z "${USAGE_PULSE_NONINTERACTIVE:-}${CLAUDE_PULSE_NONINTERACTIVE:-}" ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
-    "$PY" "$INSTALL_DIR/claude_status.py" --setup </dev/tty
+    # PY_ARGS is empty or the single word "-3" on purpose, so it is unquoted.
+    # shellcheck disable=SC2086
+    "$PY" $PY_ARGS "$INSTALL_DIR/claude_status.py" --setup </dev/tty
   else
-    "$PY" "$INSTALL_DIR/claude_status.py" --setup --non-interactive
+    # shellcheck disable=SC2086
+    "$PY" $PY_ARGS "$INSTALL_DIR/claude_status.py" --setup --non-interactive
   fi
 }
 

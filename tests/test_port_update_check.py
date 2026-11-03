@@ -56,7 +56,8 @@ import claude_status as cs  # noqa: E402
 LOCAL_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 UPSTREAM_URL = "https://github.com/%s.git" % cs.GITHUB_REPO
-NPM_LATEST = json.dumps({"version": "9.9.9"}).encode()
+# The registry's dist-tags document (what the Claude Code check now fetches).
+NPM_LATEST = json.dumps({"stable": "9.9.0", "next": "9.9.9", "latest": "9.9.9"}).encode()
 FAKE_CLAUDE = "claude-fake-for-tests"
 NETWORK_GIT = ("ls-remote", "fetch", "pull", "clone", "push")
 

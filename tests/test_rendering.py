@@ -14,6 +14,7 @@ spill into Claude Code's notification area.  Three things are pinned here:
 Run: ``python tests/test_rendering.py``
 """
 import sys
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -24,6 +25,15 @@ sys.path.insert(0, str(REPO_ROOT))
 import claude_status as cs  # noqa: E402
 
 URL = "https://github.com/owner/repo/pull/1234"
+
+
+class _UsageApiReached(BaseException):
+    """A BaseException, so no ``except Exception`` in the render path can
+    swallow it and let a test pass after quietly calling the real usage API."""
+
+
+def _no_usage_api(*args, **kwargs):
+    raise _UsageApiReached("a test reached the real usage API")
 
 
 class VisibleLenTest(unittest.TestCase):
@@ -450,9 +460,14 @@ class RefreshSyncTransitionsTest(unittest.TestCase):
         self.assertTrue(write.called)
         self.assertTrue(sync.called)
 
-    def test_status_line_render_self_heals_the_timer(self):
-        """The heartbeat ageing past its TTL is observed by nothing but the
-        repaints themselves, so the render path re-syncs on every run."""
+    def _render_once(self, fetch=_no_usage_api):
+        """One status-line repaint with no credentials, as its own process;
+        returns the mock standing in for sync_status_line_refresh.
+
+        Nothing outside the temp dir is read: the config (XDG_CONFIG_HOME, or
+        ~/.config on Linux/macOS) and the home dir (other ``~/.claude-*``
+        accounts and providers) are redirected too, and the usage API raises
+        unless a test hands in its own ``fetch``."""
         import io
         import os
         import tempfile
@@ -466,11 +481,13 @@ class RefreshSyncTransitionsTest(unittest.TestCase):
             # the run cannot touch — or be satisfied by — real bar state
             # such as an expired pomodoro syncing from the render widget.
             env = {"CLAUDE_CONFIG_DIR": td, "LOCALAPPDATA": td,
-                   "XDG_CACHE_HOME": td}
+                   "XDG_CACHE_HOME": td, "XDG_CONFIG_HOME": td,
+                   "HOME": td, "USERPROFILE": td}
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(sys, "argv", ["claude_status.py"]), \
                     mock.patch.object(sys, "stdin", tty_stdin), \
                     mock.patch.object(sys, "stdout", fake_stdout), \
+                    mock.patch.object(cs, "fetch_usage", fetch), \
                     mock.patch.object(cs, "sync_status_line_refresh",
                                       return_value=False) as sync, \
                     mock.patch.object(cs, "get_credentials",
@@ -480,10 +497,49 @@ class RefreshSyncTransitionsTest(unittest.TestCase):
                     mock.patch.object(cs, "append_claude_update_indicator",
                                       side_effect=passthrough):
                 cs.main()
+        return sync
+
+    def test_status_line_render_self_heals_the_timer(self):
+        """The heartbeat ageing past its TTL is observed by nothing but the
+        repaints themselves, so the render path re-syncs on every run."""
+        sync = self._render_once()
         # The self-heal call is the one that passes the loaded config as an
         # argument; widget-level calls take none. Asserting on the args pins
         # this to the top-of-render sync specifically.
         self.assertTrue(any(c.args for c in sync.call_args_list))
+
+    def test_render_run_ignores_the_contributors_own_posix_home(self):
+        """On Linux/macOS the config lives under XDG_CONFIG_HOME or ~/.config,
+        which the render run did not redirect: a contributor with a second
+        Claude account in their config had its token sent to the usage API on
+        every run. Reproduced on any OS by faking the platform and a home that
+        holds such a config, then checking nothing reaches the API."""
+        import json
+        import os
+        import tempfile
+        calls = []
+
+        def recorder(token, *args, **kwargs):
+            calls.append(token)
+            return {}
+
+        with tempfile.TemporaryDirectory() as host:
+            home = Path(host)
+            (home / ".config" / "claude-status").mkdir(parents=True)
+            (home / ".config" / "claude-status" / "config.json").write_text(
+                json.dumps({"providers": [{"id": "claude:b", "type": "claude"}]}),
+                encoding="utf-8")
+            (home / ".claude-b").mkdir()
+            (home / ".claude-b" / ".credentials.json").write_text(
+                json.dumps({"claudeAiOauth": {
+                    "accessToken": "SECOND-ACCOUNT-TOKEN",
+                    "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOME": host, "USERPROFILE": host}), \
+                    mock.patch.object(sys, "platform", "linux"):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self._render_once(fetch=recorder)
+        self.assertEqual(calls, [], "the render run reached the contributor's second account")
 
 
 if __name__ == "__main__":

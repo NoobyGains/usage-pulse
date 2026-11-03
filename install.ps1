@@ -95,17 +95,53 @@ if (-not ($env:USAGE_PULSE_NONINTERACTIVE -or $env:CLAUDE_PULSE_NONINTERACTIVE))
 }
 $SetupArgs = if ($Interactive) { @("--setup") } else { @("--setup", "--non-interactive") }
 
-if (Get-Command python -ErrorAction SilentlyContinue) {
-  & python $StatusScriptPath @SetupArgs
-  Throw-IfFailed "usage-pulse setup failed"
+# A command that exists is not a command that works. With the default App
+# execution aliases switched on, `python` resolves to a Microsoft Store stub in
+# WindowsApps that exists but only complains, and a python.org install without
+# "Add python.exe to PATH" has no `python` at all. So every candidate has to run
+# a real Python 3.8+ before it is picked.
+function Test-PythonCommand {
+  param([string]$Exe, [string[]]$PreArgs = @())
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & $Exe @PreArgs -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" *> $null
+    return ($LASTEXITCODE -eq 0)
+  }
+  catch {
+    return $false
+  }
+  finally {
+    $ErrorActionPreference = $previous
+  }
 }
-elseif (Get-Command py -ErrorAction SilentlyContinue) {
-  & py -3 $StatusScriptPath @SetupArgs
-  Throw-IfFailed "usage-pulse setup failed"
+
+# The py launcher goes first: it is installed by python.org and the Python
+# install manager, it skips the Store stub, and it keeps pointing at a real
+# Python after an upgrade, which a versioned python.exe path does not.
+function Find-Python {
+  if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Exe "py" -PreArgs @("-3"))) {
+    return @{ Exe = "py"; PreArgs = @("-3") }
+  }
+  foreach ($name in @("python", "python3")) {
+    $found = @(Get-Command $name -All -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq "Application" })
+    foreach ($candidate in $found) {
+      if (Test-PythonCommand -Exe $candidate.Source) {
+        return @{ Exe = $candidate.Source; PreArgs = @() }
+      }
+    }
+  }
+  return $null
 }
-else {
-  throw "Python 3 is required. Install Python, then run this installer again."
+
+$Python = Find-Python
+if (-not $Python) {
+  throw "Python 3.8 or newer is required. Install Python (python.org or the Microsoft Store), then run this installer again."
 }
+$PythonExe = $Python.Exe
+$PythonPreArgs = $Python.PreArgs
+& $PythonExe @PythonPreArgs $StatusScriptPath @SetupArgs
+Throw-IfFailed "usage-pulse setup failed"
 
 Write-Host ""
 Write-Host "usage-pulse installed in: $InstallDir"

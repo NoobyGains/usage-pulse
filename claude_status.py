@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.6.2"
+VERSION = "3.7.0"
 
 import hashlib
 import json
@@ -818,26 +818,18 @@ def rainbow_colorize(text, color_all=True, shimmer=True, config=None):
 
     while i < len(text):
         if text[i] == "\033":
-            j = i
-            while j < len(text) and j - i < 25 and text[j] != "m":
-                j += 1
-            if j >= len(text) or text[j] != "m":
-                result.append(text[i])
-                i += 1
-                visible_idx += 1
-                continue
-            seq = text[i : j + 1]
+            # Step over the whole escape sequence: a CSI colour code, or an
+            # OSC 8 hyperlink (which ends in BEL, not a letter, and whose URL
+            # can contain an "m" that looked like the end of a colour code).
+            j = _skip_escape(text, i)
+            seq = text[i:j]
+            i = j
             if color_all:
-                i = j + 1
                 continue
-            else:
-                if seq == "\033[0m":
-                    has_existing_color = False
-                else:
-                    has_existing_color = True
-                result.append(seq)
-                i = j + 1
-                continue
+            if seq.startswith("\033[") and seq.endswith("m"):
+                has_existing_color = seq not in ("\033[0m", "\033[m")
+            result.append(seq)
+            continue
 
         if not color_all and has_existing_color:
             result.append(text[i])
@@ -1019,6 +1011,45 @@ def _secure_open_write(filepath):
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
+# Pauses (seconds) between attempts to swap a file into place on Windows,
+# about half a second in all. See _replace_with_retry.
+_REPLACE_RETRY_PAUSES = (0.01, 0.02, 0.05, 0.1, 0.1, 0.1, 0.1)
+
+
+def _replace_with_retry(src, dst):
+    """``os.replace(src, dst)``, retried briefly on Windows when it is refused.
+
+    Windows will not replace a file another process has open without delete
+    sharing, and answers PermissionError (WinError 5 or 32). The holder is
+    usually passing through: an on-access virus scanner, the search indexer, a
+    repaint reading the same config. A few short pauses ride that out. Any
+    other error, and PermissionError elsewhere, is raised at once.
+    """
+    for pause in _REPLACE_RETRY_PAUSES:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if sys.platform != "win32":
+                raise
+            time.sleep(pause)
+    os.replace(src, dst)
+
+
+def _json_text(data, indent):
+    """``data`` as JSON text, keeping non-ASCII characters readable.
+
+    A lone surrogate cannot be written as UTF-8, so text that holds one falls
+    back to ``\\uXXXX`` escapes, which json.load reads straight back.
+    """
+    text = json.dumps(data, indent=indent, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(data, indent=indent)
+    return text
+
+
 def _atomic_json_write(filepath, data, indent=2):
     """Atomically write JSON with 0o600 permissions on Unix.
 
@@ -1026,14 +1057,27 @@ def _atomic_json_write(filepath, data, indent=2):
     The sibling's name is unique per writer: two windows that write the same
     cache at the same moment must not truncate, rename or delete each other's
     file. Cleans up its own temp file on failure.
+
+    A symlinked destination (a dotfile manager's settings.json) is written
+    through: the swap happens at the link's target, so the link survives
+    instead of being replaced by a plain file. Non-ASCII text is written as
+    is, not as ``\\uXXXX`` escapes.
     """
     filepath = Path(filepath)
+    if os.path.islink(filepath):
+        try:
+            target = Path(os.path.realpath(filepath))
+        except (OSError, ValueError):
+            target = filepath
+        if target.parent.is_dir():
+            filepath = target
     tmp_path = filepath.with_name(
         f"{filepath.name}.{os.getpid()}-{random.randrange(1 << 32):08x}.tmp")
     try:
+        text = _json_text(data, indent)
         with _secure_open_write(tmp_path) as f:
-            json.dump(data, f, indent=indent)
-        os.replace(str(tmp_path), str(filepath))
+            f.write(text)
+        _replace_with_retry(str(tmp_path), str(filepath))
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -1093,11 +1137,10 @@ def _migrate_config_from_cache():
             pass
 
 
-def _detect_default_currency():
-    """Auto-detect currency symbol from system locale/timezone."""
+def _locale_country():
+    """Two-letter country of the machine's locale ("DK" for da_DK), or ""."""
     import locale as _locale
 
-    # Try locale-based detection
     country = ""
     try:
         # getdefaultlocale deprecated in 3.13 but still works on Windows
@@ -1113,6 +1156,17 @@ def _detect_default_currency():
                 country = loc.split("_")[-1].upper()
         except (ValueError, AttributeError):
             pass
+    return country
+
+
+def _detect_default_currency():
+    """Auto-detect currency symbol from system locale/timezone.
+
+    "kr" is the symbol of three currencies, so only Sweden gets it (it prices
+    as SEK). Denmark and Norway get their ISO code, which names the currency
+    unambiguously and which _get_exchange_rate understands.
+    """
+    country = _locale_country()
 
     _COUNTRY_CURRENCY = {
         "GB": "\u00a3", "UK": "\u00a3",
@@ -1121,7 +1175,7 @@ def _detect_default_currency():
         "BE": "\u20ac", "AT": "\u20ac", "IE": "\u20ac", "FI": "\u20ac", "PT": "\u20ac", "GR": "\u20ac",
         "JP": "\u00a5",
         "CA": "C$", "AU": "A$", "NZ": "NZ$",
-        "CH": "Fr", "SE": "kr", "NO": "kr", "DK": "kr",
+        "CH": "Fr", "SE": "kr", "NO": "NOK", "DK": "DKK",
         "IN": "\u20b9", "KR": "\u20a9", "BR": "R$", "ZA": "R",
         "PL": "z\u0142", "CZ": "K\u010d", "TR": "\u20ba", "IL": "\u20aa",
         "SG": "S$", "HK": "HK$", "MX": "$",
@@ -1151,14 +1205,21 @@ def load_config():
     repo_path = Path(__file__).parent / "config.json"
 
     # User config takes priority, fall back to repo template
+    # The README tells people to hand-edit this file, and Windows editors save
+    # it in whatever they like. json.loads() on bytes detects UTF-8 (with or
+    # without a BOM), UTF-16 and UTF-32. A file it cannot decode (ANSI with a
+    # pound sign), cannot parse, cannot open, or that is not a JSON object is
+    # skipped like a missing one: a raise here is a blank bar on every repaint.
     data = {}
     for path in (user_path, repo_path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            break
-        except (FileNotFoundError, json.JSONDecodeError):
+            with open(path, "rb") as f:
+                loaded = json.loads(f.read())
+        except (OSError, ValueError, RecursionError):
             continue
+        if isinstance(loaded, dict):
+            data = loaded
+            break
 
     # Clean up removed settings
     data.pop("rainbow_bars", None)
@@ -1249,6 +1310,21 @@ def _cleanup_hooks():
 
     changed = False
     script_name = "claude_status.py"
+    # The hooks installed today share this script name and one of these events
+    # (the heartbeat's PostToolUse), so the name alone cannot tell a legacy
+    # hook from a current one: this cleanup ran on the first draw after setup
+    # and deleted the heartbeat hook it had just installed. A command that
+    # carries one of today's flags for its event is current, and stays.
+    current_flags = {}
+    for events in _HOOK_GROUPS.values():
+        for event, flag, _blocking in events:
+            current_flags.setdefault(event, []).append(flag)
+
+    def is_legacy(command, event):
+        command = str(command or "")
+        return script_name in command and not any(
+            flag in command for flag in current_flags.get(event, ()))
+
     for hook_type in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
         hooks = settings.get("hooks", {}).get(hook_type, [])
         if hooks:
@@ -1256,11 +1332,11 @@ def _cleanup_hooks():
             for h in hooks:
                 is_pulse = False
                 # Old format: {"command": "...claude_status.py..."}
-                if script_name in h.get("command", ""):
+                if is_legacy(h.get("command", ""), hook_type):
                     is_pulse = True
                 # New nested format: {"hooks": [{"command": "...claude_status.py..."}]}
                 for inner in h.get("hooks", []):
-                    if script_name in inner.get("command", ""):
+                    if is_legacy(inner.get("command", ""), hook_type):
                         is_pulse = True
                 if not is_pulse:
                     filtered.append(h)
@@ -1295,17 +1371,21 @@ def _get_hook_state_path():
 
 
 def _read_hook_state():
-    try:
-        with open(_get_hook_state_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
+    """The shared heartbeat snapshot, or None when missing, damaged or not an object."""
+    _, data = _read_state_json(_get_hook_state_path())
+    return data if isinstance(data, dict) else None
 
 
 def _is_hook_state_fresh(hook_state, ttl=HOOK_STATE_FRESH_TTL):
-    if not hook_state:
+    # The file is untrusted: valid JSON of the wrong shape (a list, a number) or
+    # a stamp that is text, null, NaN or absurdly far ahead all read as stale
+    # instead of raising, which would blank the bar on every repaint.
+    if not isinstance(hook_state, dict) or not hook_state:
         return False
-    return (time.time() - hook_state.get("last_refresh", 0)) < ttl
+    refreshed = _cache_seconds(hook_state.get("last_refresh"))
+    if refreshed is None:
+        return False
+    return abs(time.time() - refreshed) < ttl
 
 
 def _format_elapsed(seconds):
@@ -1319,66 +1399,275 @@ def _format_elapsed(seconds):
     return f"{mins}m"
 
 
+# What git says (branch, changed files, ahead/behind) is true of one repo
+# folder, but every window shares this state dir. Each cache is therefore a
+# small file holding one entry per repo folder, so a window never reads another
+# window's repo, and a folder that is not a repo cannot hide a branch elsewhere.
+GIT_BRANCH_FILE = "git_branch.json"
+GIT_CACHE_MAX_REPOS = 16
+# Claude Code cancels a repaint when the next update fires, so git on the
+# render path must give up fast and leave the last known answer on screen.
+GIT_RENDER_TIMEOUT = 1.5
+
+
+def _git_repo_key():
+    """The folder git runs in for this repaint, as a stable cache key."""
+    try:
+        return os.path.normcase(os.path.realpath(os.getcwd()))
+    except OSError:
+        return ""
+
+
+def _read_git_cache(name, key):
+    """Repo *key*'s entry in per-repo git cache *name*, or {} when unusable.
+
+    The file is untrusted input: wrong JSON shape, bytes that are not UTF-8
+    (a ValueError) or hand edits must read as "nothing cached", never raise.
+    """
+    try:
+        with open(get_state_dir() / name, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    repos = data.get("repos") if isinstance(data, dict) else None
+    entry = repos.get(key) if isinstance(repos, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _cache_stamp(entry, field):
+    """A time field of a git cache entry as finite seconds; 0.0 when unusable."""
+    seconds = _cache_seconds(entry.get(field)) if isinstance(entry, dict) else None
+    return seconds if seconds is not None else 0.0
+
+
+def _git_cache_fresh(entry, ttl):
+    """True when the answer, or an attempt to get one, is younger than *ttl*.
+
+    A stamp in the future (clock change, damaged file) is never fresh, so it
+    cannot pin an old answer on screen.
+    """
+    now = time.time()
+    return any(0 <= now - stamp < ttl
+               for stamp in (_cache_stamp(entry, "timestamp"), _cache_stamp(entry, "attempted"))
+               if stamp)
+
+
+def _cache_count(value):
+    """A cached count as a non-negative int; 0 when unusable."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _write_git_cache(name, key, entry):
+    """Store *entry* for repo *key*, keeping only the most recent few repos.
+
+    Best effort: a cache that cannot be written just means git runs again.
+    """
+    try:
+        path = get_state_dir() / name
+        repos = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("repos"), dict):
+                repos = data["repos"]
+        except (OSError, ValueError, RecursionError):
+            pass
+        repos.pop(key, None)
+        others = sorted(repos, key=lambda k: max(_cache_stamp(repos[k], "timestamp"),
+                                                 _cache_stamp(repos[k], "attempted")),
+                        reverse=True)[:GIT_CACHE_MAX_REPOS - 1]
+        kept = {k: repos[k] for k in others}
+        kept[key] = entry
+        _atomic_json_write(path, {"repos": kept}, indent=None)
+    except OSError:
+        pass
+
+
 def _get_git_branch():
-    hook_state = _read_hook_state()
-    if hook_state:
-        cached_branch = hook_state.get("git_branch")
-        branch_ts = hook_state.get("git_branch_ts", 0)
-        if cached_branch is not None and (time.time() - branch_ts) < GIT_BRANCH_CACHE_TTL:
-            return cached_branch if cached_branch else None
+    key = _git_repo_key()
+    entry = _read_git_cache(GIT_BRANCH_FILE, key)
+    cached_branch = entry.get("branch")
+    if isinstance(cached_branch, str) and _git_cache_fresh(entry, GIT_BRANCH_CACHE_TTL):
+        return cached_branch if cached_branch else None
     try:
         result = subprocess.run(
             [_GIT_PATH, "branch", "--show-current"],
-            capture_output=True, text=True, timeout=3,
+            # git prints UTF-8 whatever the machine's code page is.
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=3,
         )
         branch = result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         branch = ""
+    _write_git_cache(GIT_BRANCH_FILE, key, {"branch": branch, "timestamp": time.time()})
+    return branch if branch else None
+
+
+# The heartbeat (tool count and elapsed time) describes one session. Each
+# session keeps its own counters in hook_sessions/<session_id>.json beside
+# hook_state.json, and hook_state.json carries a snapshot of whichever
+# session's hook fired last, which is what the status line and the repaint
+# timer read.
+HOOK_SESSIONS_DIR = "hook_sessions"
+HOOK_SESSION_MAX_AGE = 7 * 86400   # per-session files untouched this long are removed
+HOOK_SESSION_PRUNE_BATCH = 50      # at most this many removals per hook call
+HOOK_WRITE_ATTEMPTS = 3            # Windows refuses os.replace while a reader has the file open
+# Only when a hook carries no session id: an idle gap this long starts a new count.
+HEARTBEAT_IDLE_RESET = 3600
+
+
+def _hook_sessions_dir():
+    return _get_hook_state_path().parent / HOOK_SESSIONS_DIR
+
+
+def _read_json_dict(path):
+    """A JSON file's top-level dict; {} when missing, unreadable or another shape."""
     try:
-        state = hook_state if hook_state else {}
-        state["git_branch"] = branch
-        state["git_branch_ts"] = time.time()
-        _atomic_json_write(_get_hook_state_path(), state, indent=None)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_session_heartbeat(session_id):
+    """One session's heartbeat counters ({tool_count, session_start, ...}), or None."""
+    sid = _safe_path_id(session_id)
+    if not sid:
+        return None
+    return _read_json_dict(_hook_sessions_dir() / f"{sid}.json") or None
+
+
+def _write_hook_state(path, data):
+    """Atomic write that rides out a reader briefly holding the file (Windows)."""
+    for attempt in range(HOOK_WRITE_ATTEMPTS):
+        try:
+            _atomic_json_write(path, data, indent=None)
+            return
+        except PermissionError:
+            if attempt + 1 >= HOOK_WRITE_ATTEMPTS:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
+def _prune_old_json(folder, max_age, limit, now):
+    """Remove up to *limit* ``*.json`` files in *folder* older than *max_age*.
+
+    Judged by file age alone, so nothing is opened or parsed, and bounded, so a
+    backlog is cleared over several calls instead of stalling one repaint.
+    """
+    removed = 0
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if removed >= limit:
+                    break
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    if now - entry.stat().st_mtime > max_age:
+                        os.unlink(entry.path)
+                        removed += 1
+                except OSError:
+                    continue
     except OSError:
         pass
-    return branch if branch else None
+
+
+def _beat_start(record, now):
+    """A record's session_start if it is a sane past time, else *now*."""
+    started = _cache_seconds(record.get("session_start"))
+    return started if started and started <= now else now
+
+
+def _read_stdin_text(limit):
+    """Read up to ``limit`` bytes of stdin and decode them as UTF-8.
+
+    Claude Code pipes UTF-8 JSON. A text-mode stdin on Windows decodes a pipe
+    with the ANSI code page instead and keeps the bytes that page leaves
+    undefined as lone surrogates: an accented name comes out garbled, and a
+    Cyrillic, CJK or emoji one later raises UnicodeEncodeError and blanks the
+    bar. So read the raw bytes and decode them here, replacing anything
+    invalid. A leading byte-order mark is dropped. A stdin without a byte
+    stream (or one that does not return bytes) falls back to the text read.
+    """
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is not None:
+        data = stream.read(limit)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data).decode("utf-8-sig", "replace")
+    return sys.stdin.read(limit)
+
+
+def _strip_surrogates(text):
+    """``text`` with any lone surrogate replaced by ``?``.
+
+    Versions up to 3.6.2 saved those in stdin_ctx.json; one of them kept in
+    the line makes the final UTF-8 encode raise and blanks the bar.
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def hook_refresh(tool_name_arg):
     """Handle --hook-refresh: update hook state silently (no stdout).
 
     Tool name comes from stdin JSON (PostToolUse event data), not env vars.
-    Falls back to tool_name_arg if stdin is unavailable.
+    Falls back to tool_name_arg if stdin is unavailable. The session id comes
+    from the same JSON, so each session counts its own tools and time.
     """
     # Parse tool name from stdin JSON (best practice per Claude Code docs)
     tool_name = tool_name_arg or "unknown"
+    session_id = None
     if not sys.stdin.isatty():
         try:
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
             if raw.strip():
                 data = json.loads(raw)
-                tool_name = _sanitize(data.get("tool_name", tool_name))
+                if isinstance(data, dict):
+                    tool_name = _sanitize(data.get("tool_name", tool_name))
+                    session_id = _safe_path_id(data.get("session_id")) or None
         except (json.JSONDecodeError, OSError, ValueError):
             pass
 
     hook_state_path = _get_hook_state_path()
     now = time.time()
-    state = {}
-    try:
-        with open(hook_state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    if session_id:
+        session_path = _hook_sessions_dir() / f"{session_id}.json"
+        mine = _read_json_dict(session_path)
+        state = {
+            "tool_count": _cache_count(mine.get("tool_count")) + 1,
+            "session_start": _beat_start(mine, now),
+            "session_id": session_id,
+        }
+    else:
+        session_path = None
+        previous = _read_json_dict(hook_state_path)
+        idle = now - _cache_stamp(previous, "last_refresh")
+        if previous.get("session_id") or idle > HEARTBEAT_IDLE_RESET:
+            previous = {}  # another session's snapshot, or long idle: start over
+        state = {
+            "tool_count": _cache_count(previous.get("tool_count")) + 1,
+            "session_start": _beat_start(previous, now),
+        }
     state["last_tool"] = _sanitize(str(tool_name))[:50]
-    state["tool_count"] = state.get("tool_count", 0) + 1
-    if "session_start" not in state:
-        state["session_start"] = now
     state["last_refresh"] = now
-    # Fed only the activity widget, removed in 3.6.2.
-    state.pop("_call_times", None)
-    state.pop("rapid_calls", None)
+    if session_path is not None:
+        try:
+            _secure_mkdir(session_path.parent)
+            if not mine:
+                _prune_old_json(session_path.parent, HOOK_SESSION_MAX_AGE,
+                                HOOK_SESSION_PRUNE_BATCH, now)
+            _write_hook_state(session_path, state)
+        except OSError:
+            pass
     try:
-        _atomic_json_write(hook_state_path, state, indent=None)
+        _write_hook_state(hook_state_path, state)
     except OSError:
         pass
 
@@ -1400,23 +1689,28 @@ _SHELL_NEUTRAL_WORD = re.compile(r"[A-Za-z0-9/][A-Za-z0-9_./:~-]*")
 
 
 def _blocking_hook_command(flag, python_cmd, script_path):
-    """Return the command for a hook whose exit code can steer the team.
+    """Return the command installed for a hook; every hook uses it.
+
+    The name is from when only the hooks whose exit code can steer the team
+    (SubagentStop and the three team events) were built this way. Now all of
+    them are, so a moved or deleted install never makes Claude Code report a
+    hook error after a tool call either.
 
     Claude Code runs a hook's command through sh, or on Windows through Git
-    Bash — or PowerShell when Git Bash isn't installed. The other hooks'
-    ``$HOME/...`` interpreter is a ParserError in both PowerShells, so there
-    they never run. An unquoted forward-slash absolute interpreter plus a
+    Bash — or PowerShell when Git Bash isn't installed. A ``$HOME/...``
+    interpreter is a ParserError in both PowerShells, so there it would never
+    run. An unquoted forward-slash absolute interpreter plus a
     single-quoted script path parses the same in all of them (checked in Git
     Bash, pwsh 7 and PowerShell 5.1, which also pass the payload through on
     stdin). A *quoted* interpreter cannot: PowerShell needs ``& "..."`` to
     run one and bash reads ``&`` as "background". So an interpreter path
     with a space (or anything else unsafe unquoted) falls back to the
-    bash-only form the other hooks use.
+    bash-only form, with ``python_cmd`` as the caller wrote it for its shell.
 
     ``; exit 0`` pins the status whichever shell runs it: Python exits 2 by
     itself when the script path is missing (a moved or deleted install), and
-    for these events exit 2 would delete every task the team creates, block
-    every completion, or keep teammates from ever going idle.
+    for the blocking events exit 2 would delete every task the team creates,
+    block every completion, or keep teammates from ever going idle.
     """
     python = Path(sys.executable).as_posix()
     script = Path(__file__).resolve().as_posix()
@@ -1427,8 +1721,9 @@ def _blocking_hook_command(flag, python_cmd, script_path):
 
 # Hook groups, installable on their own (`--install-hooks --only agents,team`,
 # and the setup wizard's hooks screen). Each entry is (event, flag, blocking):
-# a blocking event is one whose exit code 2 steers Claude Code, so its command
-# is pinned to exit 0 by _blocking_hook_command.
+# a blocking event is one whose exit code 2 steers Claude Code, and its entry
+# takes no matcher. Every command, blocking or not, is pinned to exit 0 by
+# _blocking_hook_command.
 _HOOK_GROUPS = {
     # PostToolUse drives the heartbeat spinner, tool counter and last-tool
     # widget. It runs Python after every tool call, so it is opt-in.
@@ -1634,19 +1929,24 @@ def install_hooks(groups=None):
         return False
 
     hooks = settings.setdefault("hooks", {})
+    commands = {}
     for group in HOOK_GROUP_NAMES:          # fixed order keeps the file stable
         if group not in groups:
             continue
         for event, flag, blocking in _HOOK_GROUPS[group]:
-            command = f'{python_cmd} "{script_path}" {flag}'
+            # Every hook command is pinned to exit 0, the non-blocking ones too:
+            # when the install is moved or deleted Python exits 2 by itself, and
+            # Claude Code would show a hook error after each tool call.
+            command = _blocking_hook_command(flag, _shell_python(python_cmd, settings),
+                                             script_path)
+            commands[event] = command
             existing = hooks.get(event)
             if not isinstance(existing, list):
                 existing = []
             kept = [k for k in (_without_pulse_command(h, flag) for h in existing)
                     if k is not None]
             if blocking:
-                kept.append({"hooks": [{"type": "command", "command":
-                                        _blocking_hook_command(flag, python_cmd, script_path)}]})
+                kept.append({"hooks": [{"type": "command", "command": command}]})
             else:
                 kept.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
             hooks[event] = kept
@@ -1658,7 +1958,7 @@ def install_hooks(groups=None):
     names = ", ".join(g for g in HOOK_GROUP_NAMES if g in groups)
     utf8_print(f"{GREEN}Installed usage-pulse hooks ({names}) to {settings_path}{RESET}")
     if "heartbeat" in groups:
-        utf8_print(f"  Command: {python_cmd} \"{script_path}\" --hook-refresh")
+        utf8_print(f"  Command: {commands['PostToolUse']}")
     utf8_print(f"")
     utf8_print(f"This enables:")
     if "heartbeat" in groups:
@@ -2392,6 +2692,43 @@ def _cache_age(cached):
     return float("inf") if timestamp is None else time.time() - timestamp
 
 
+def _is_plugin_install():
+    """True when this script runs from a marketplace plugin's version folder.
+
+    Claude Code updates those itself, and the folder has no ``.git``, so
+    asking git there finds nothing or, worse, finds a repo further up (a
+    dotfiles-managed ``~/.claude``). A developer's checkout that merely sits in
+    a folder named like the plugin has a ``.git`` beside the script and is not
+    a plugin install.
+    """
+    try:
+        here = Path(__file__).resolve()
+    except (OSError, RuntimeError):
+        here = Path(__file__)
+    return _is_plugin_cache_path(here) and not (here.parent / ".git").exists()
+
+
+def _cache_quiet_update_verdict(update_cache, script_mtime, reason, local=None):
+    """Remember "nothing to nag about" so the next repaints don't ask git again.
+
+    Written like the positive verdicts, keyed on the script's mtime and the
+    hour's TTL, with the *reason* beside it ("no_git", "fork").
+    """
+    entry = {
+        "timestamp": time.time(),
+        "update_available": False,
+        "reason": reason,
+        "script_mtime": script_mtime,
+    }
+    if local:
+        entry["local"] = local[:8]
+    try:
+        with _secure_open_write(update_cache) as f:
+            json.dump(entry, f)
+    except OSError:
+        pass
+
+
 def check_for_update(*, interactive=False):
     """Check if a newer version is available on GitHub. Returns True/False/None.
 
@@ -2403,6 +2740,8 @@ def check_for_update(*, interactive=False):
     lands in the same cache. Keyword-only, so a stray positional True can't
     skip the status line's gates.
     """
+    if _is_plugin_install():
+        return None  # Claude Code updates plugins; nothing here to compare
     state_dir = get_state_dir()
     update_cache = state_dir / "update_check.json"
 
@@ -2490,7 +2829,11 @@ def check_for_update(*, interactive=False):
 
     local = get_local_commit(deadline=_deadline)
     if not local:
-        return None  # not a git install, skip silently
+        # Not a git install (the curl / Invoke-WebRequest installs have no
+        # .git), or git is unusable. Remember it for the TTL: left uncached,
+        # every repaint spawned `git rev-parse` again for the same answer.
+        _cache_quiet_update_verdict(update_cache, script_mtime, "no_git")
+        return None  # skip silently
 
     if fresh and cached.get("local") == local[:8]:
         return cached["update_available"]
@@ -2526,7 +2869,10 @@ def check_for_update(*, interactive=False):
     if time.time() > _deadline:
         return None
     if _tracks_upstream(deadline=_deadline) is False:
-        return None
+        # Cached like the branch check above: a fork re-ran three git
+        # processes per repaint to learn the same thing every time.
+        _cache_quiet_update_verdict(update_cache, script_mtime, "fork", local)
+        return False
 
     # Perform the check
     if time.time() > _deadline:
@@ -2594,10 +2940,209 @@ def append_update_indicator(line, config=None):
     return line
 
 
+# --- Claude Code versions: comparing, the release channel, what is installed --
+
+_CLAUDE_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
+_CLAUDE_UPDATE_TEXT = "↑ Claude Update"
+_CLAUDE_RESTART_TEXT = "↻ Restart Claude"
+_VERSION_PREFIX_RE = re.compile(r"v?(\d+(?:\.\d+)*)")
+# A native install keeps one file per version, named for it ("2.1.317"; some
+# builds add ".exe").
+_VERSION_ENTRY_RE = re.compile(r"(\d+(?:\.\d+)+)(?:\.exe)?", re.IGNORECASE)
+
+
+def _version_tuple(text):
+    """The dotted numeric prefix of a version as a tuple of ints, or None.
+
+    "2.1.317" is (2, 1, 317); a suffix is ignored ("2.1.317-rc.1" is the same
+    tuple); text with no such prefix ("nightly", "") is None. The text is
+    capped first, so a hostile run of digits can't reach int()'s size limit.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _VERSION_PREFIX_RE.match(text.strip()[:64])
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def _version_cmp(a, b):
+    """1, 0 or -1 as version *a* is newer than, equal to or older than *b*.
+
+    None when either side is unparseable. A short version is padded with
+    zeros, so "2.1" equals "2.1.0".
+    """
+    ta, tb = _version_tuple(a), _version_tuple(b)
+    if ta is None or tb is None:
+        return None
+    width = max(len(ta), len(tb))
+    ta += (0,) * (width - len(ta))
+    tb += (0,) * (width - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
+def _claude_update_channel():
+    """The release channel Claude Code follows: "stable", or "latest".
+
+    Read from ``autoUpdatesChannel`` in the user's Claude ``settings.json``
+    (``$CLAUDE_CONFIG_DIR`` when set). A missing file or key, unreadable or
+    invalid JSON, or any value but "stable" means "latest", the default.
+    """
+    try:
+        with open(_claude_config_dir() / "settings.json", "r", encoding="utf-8") as f:
+            settings = json.loads(f.read(1_000_000))
+    except Exception:  # noqa: BLE001 - a settings problem must never break the check
+        return "latest"
+    value = settings.get("autoUpdatesChannel") if isinstance(settings, dict) else None
+    return "stable" if value == "stable" else "latest"
+
+
+def _parse_claude_dist_tags(body):
+    """``{tag: version}`` from the registry's dist-tags document, or None.
+
+    Unusable unless it is a JSON object with a parseable "latest": that tag is
+    the default channel, so a document without it is a bad answer, not data.
+    """
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tags = {}
+    for name, version in data.items():
+        if isinstance(name, str) and isinstance(version, str) and len(tags) < 32:
+            tags[_sanitize(name)[:32]] = _sanitize(version)[:64]
+    return tags if _version_tuple(tags.get("latest")) is not None else None
+
+
+def _cached_claude_tags(cached):
+    """The tags stored in a cache entry, or None when absent or malformed."""
+    tags = cached.get("tags")
+    if not (isinstance(tags, dict) and len(tags) <= 32
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items())):
+        return None
+    return tags if _version_tuple(tags.get("latest")) is not None else None
+
+
+def _claude_channel_verdict(tags, channel, local_version):
+    """``(channel version, update available)`` for the running *local_version*.
+
+    An update is available only when the channel's version is strictly newer.
+    A channel missing from the tags offers nothing.
+    """
+    remote_version = tags.get(channel) or ""
+    return remote_version, _version_cmp(remote_version, local_version) == 1
+
+
+def _write_claude_update_cache(path, timestamp, local, remote, update_available,
+                               channel, tags):
+    try:
+        with _secure_open_write(path) as f:
+            json.dump({
+                "timestamp": timestamp,
+                "update_available": update_available,
+                "local": local,
+                "remote": remote,
+                "channel": channel,
+                "tags": tags,
+            }, f)
+    except OSError:
+        pass
+
+
+def _claude_data_dir():
+    """Claude Code's data dir: ``$XDG_DATA_HOME/claude``, else ``~/.local/share/claude``."""
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".local" / "share"
+    return base / "claude"
+
+
+def _newest_native_version(versions_dir):
+    """The highest version-named entry of a native install's versions dir, or None."""
+    try:
+        names = os.listdir(versions_dir)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        match = _VERSION_ENTRY_RE.fullmatch(name)
+        if match and (best is None or _version_cmp(match.group(1), best) == 1):
+            best = match.group(1)
+    return best
+
+
+def _npm_package_version(package_dir):
+    """The ``version`` in an installed @anthropic-ai/claude-code package.json, or None."""
+    try:
+        with open(Path(package_dir) / "package.json", "r", encoding="utf-8") as f:
+            data = json.loads(f.read(262_144))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("name") != "@anthropic-ai/claude-code":
+        return None
+    version = data.get("version")
+    if isinstance(version, str) and _version_tuple(version) is not None:
+        return _sanitize(version).strip()
+    return None
+
+
+def _installed_version_for_launcher(launcher):
+    """The Claude Code version the launcher at *launcher* leads to, or None."""
+    real = Path(os.path.realpath(launcher))
+    # Native on macOS, Linux and WSL: the launcher is a symlink into
+    # <data>/claude/versions/<VERSION>, so the target's name is the version.
+    if real.parent.name == "versions":
+        match = _VERSION_ENTRY_RE.fullmatch(real.name)
+        if match:
+            return match.group(1)
+    # npm: the package sits above the resolved launcher (POSIX symlink), or
+    # beside the shim in node_modules (Windows).
+    for folder in list(real.parents)[:6]:
+        if folder.name == "claude-code" and folder.parent.name == "@anthropic-ai":
+            version = _npm_package_version(folder)
+            if version:
+                return version
+            break
+    version = _npm_package_version(
+        Path(launcher).parent / "node_modules" / "@anthropic-ai" / "claude-code")
+    if version:
+        return version
+    # Native on Windows: the launcher is a real file, a copy of the newest
+    # version, and the versions dir holds one file per version.
+    if sys.platform == "win32" and real.suffix.lower() == ".exe":
+        return _newest_native_version(_claude_data_dir() / "versions")
+    return None
+
+
+def _installed_claude_version():
+    """The newest Claude Code version installed on disk, or None when unknown.
+
+    Claude Code updates itself in the background; the new version runs only
+    after a restart. Reads files only (a link, a directory listing, a
+    package.json), never ``claude --version``: this runs on the render path.
+    """
+    try:
+        if _CLAUDE_PATH:
+            launchers = [str(_CLAUDE_PATH)]
+        else:
+            name = "claude.exe" if sys.platform == "win32" else "claude"
+            launchers = [str(Path.home() / ".local" / "bin" / name)]
+        for launcher in launchers:
+            version = _installed_version_for_launcher(launcher)
+            if version:
+                return version
+    except Exception:  # noqa: BLE001 - never break the bar over a file we can't read
+        pass
+    return None
+
+
 def check_claude_code_update(local_version=None, *, interactive=False):
     """Check if a newer Claude Code version is available on npm. Returns True/False/None.
 
-    Cached for 1 hour. Fully silent on any error — never blocks the status line.
+    True only when the version on the user's release channel ("latest", or
+    "stable" per ``autoUpdatesChannel``) is strictly newer than the running
+    one. Cached for 1 hour, as the registry's dist-tags (so a channel switch
+    needs no new request). Fully silent on any error — never blocks the status
+    line.
 
     *interactive* is for a command the user runs (``--config``): it skips the
     status line's turn-taking and backoff, may use the whole
@@ -2645,53 +3190,95 @@ def check_claude_code_update(local_version=None, *, interactive=False):
         cached = None
     fresh = cached is not None and _cache_age(cached) < UPDATE_CHECK_TTL
     if fresh and cached.get("local") == _sanitize(local_version):
-        return cached["update_available"]
+        # The cache holds the registry's tags, not a verdict for one channel:
+        # the verdict is worked out here, for the channel the user follows now.
+        tags = _cached_claude_tags(cached)
+        if tags is not None:
+            channel = _claude_update_channel()
+            remote_version, update_available = _claude_channel_verdict(
+                tags, channel, _sanitize(local_version))
+            if (cached["update_available"] != update_available
+                    or cached.get("remote") != remote_version
+                    or cached.get("channel") != channel):
+                # The channel changed: keep the file in step (--config reads
+                # "remote"), under the original timestamp so the hour isn't extended.
+                _write_claude_update_cache(
+                    update_cache, cached.get("timestamp"), _sanitize(local_version),
+                    remote_version, update_available, channel, tags)
+            return update_available
+        # No tags (written before 3.7.0), or damaged ones: a miss.
 
-    # Get latest version from npm registry
+    # Get the dist-tags from the npm registry: one request serves both channels.
     if not interactive and not _begin_net_attempt("claude_code_update"):
         return None  # a check just failed or was cut short — don't pile on
     try:
         req = urllib.request.Request(
-            "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
+            _CLAUDE_DIST_TAGS_URL,
             headers={"User-Agent": "usage-pulse-update-checker"},
         )
         body = _fetch_bounded(req, 100_000,
                               budget=_UPDATE_CHECK_BUDGET if interactive else None)
         if body is None:
             return None
-        data = json.loads(body.decode("utf-8"))
-        remote_version = _sanitize(str(data.get("version", "")))
-        if not remote_version:
+        tags = _parse_claude_dist_tags(body)
+        if tags is None:
             return None
     except Exception:
         return None
 
-    update_available = _sanitize(local_version) != remote_version
+    channel = _claude_update_channel()
+    remote_version, update_available = _claude_channel_verdict(
+        tags, channel, _sanitize(local_version))
 
     # Cache the result
-    try:
-        with _secure_open_write(update_cache) as f:
-            json.dump({
-                "timestamp": time.time(),
-                "update_available": update_available,
-                "local": _sanitize(local_version),
-                "remote": remote_version,
-            }, f)
-    except OSError:
-        pass
+    _write_claude_update_cache(
+        update_cache, time.time(), _sanitize(local_version),
+        remote_version, update_available, channel, tags)
 
     return update_available
 
 
+def _claude_update_text(running=None):
+    """The indicator's words: restart when the offered version is already installed.
+
+    Claude Code updates itself in the background and applies the new version
+    on the next start, so a channel version that is already on disk needs a
+    restart, not an update. Anything not known for sure keeps "Update".
+    """
+    try:
+        with open(get_state_dir() / "claude_code_update.json", "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict):
+            return _CLAUDE_UPDATE_TEXT
+        if running and cached.get("local") != _sanitize(str(running)).strip():
+            return _CLAUDE_UPDATE_TEXT  # the cache is for another version
+        tags = _cached_claude_tags(cached)
+        if tags is None:
+            return _CLAUDE_UPDATE_TEXT
+        remote_version = tags.get(_claude_update_channel())
+        installed = _installed_claude_version()
+        if installed is not None and _version_cmp(installed, remote_version) in (0, 1):
+            return _CLAUDE_RESTART_TEXT
+    except Exception:  # noqa: BLE001 - the wording must never break the bar
+        pass
+    return _CLAUDE_UPDATE_TEXT
+
+
 def append_claude_update_indicator(line, config=None, stdin_ctx=None):
-    """Append a visible Claude Code update indicator if a newer version is available."""
+    """Append a visible Claude Code update indicator if a newer version is available.
+
+    The text is "Claude Update" (up arrow) when the channel's version still
+    has to be installed, and "Restart Claude" (cycle arrow) when it is already
+    installed and only a restart applies it. Both use the flag ``claude_update``.
+    """
     try:
         if config:
             show = config.get("show", DEFAULT_SHOW)
             if not show.get("claude_update", True):
                 return line
-        if check_claude_code_update((stdin_ctx or {}).get("cc_version")):
-            return line + f" {BRIGHT_YELLOW}\u2191 Claude Update{RESET}"
+        running = (stdin_ctx or {}).get("cc_version")
+        if check_claude_code_update(running):
+            return line + f" {BRIGHT_YELLOW}{_claude_update_text(running)}{RESET}"
     except Exception:
         pass  # never break the status line for an update check
     return line
@@ -2776,6 +3363,30 @@ def cmd_update():
         utf8_print(f"  {GREEN}No update found — you're on the latest version (v{VERSION}).{RESET}")
         return
 
+    # A checkout that already contains upstream's latest commit has local
+    # commits on top of it: nothing to pull, and nothing to roll back.
+    if _remote_is_ancestor(remote) is True:
+        utf8_print(f"  {GREEN}No update found — this checkout is ahead of main with your own commits (v{VERSION}).{RESET}")
+        return
+
+    # Only a clean checkout of main is updated. A side branch would take a
+    # merge, and uncommitted edits are exactly what a failed update must never
+    # touch. Untracked files are ignored: git refuses to overwrite one.
+    if _on_default_branch() is False:
+        branch = _git("symbolic-ref", "--short", "-q", "HEAD")
+        where = f"on branch '{_sanitize(branch)}'" if branch else "on a detached HEAD"
+        utf8_print(f"  {RED}This checkout is {where}, not main, so it was not updated.{RESET}")
+        utf8_print(f"  Switch to main (git checkout main) and run --update again.")
+        return
+    dirty = _git("status", "--porcelain", "--untracked-files=no", timeout=10)
+    if dirty is None:
+        utf8_print(f"  {RED}Could not read the git status of {_sanitize(str(repo_dir))}; not updating.{RESET}")
+        return
+    if dirty:
+        utf8_print(f"  {RED}You have uncommitted changes in {_sanitize(str(repo_dir))}, so it was not updated.{RESET}")
+        utf8_print(f"  Commit or stash them (git stash), then run --update again.")
+        return
+
     # Fetch remote version to show what's available
     remote_version = _fetch_remote_version()
     if remote_version and remote_version != VERSION:
@@ -2805,7 +3416,7 @@ def cmd_update():
     utf8_print(f"  Pulling latest from GitHub...")
     try:
         result = subprocess.run(
-            [_GIT_PATH, "pull", "origin", "main"],
+            [_GIT_PATH, "pull", "--ff-only", "origin", "main"],
             capture_output=True, text=True, timeout=30,
             cwd=str(repo_dir),
         )
@@ -2816,14 +3427,20 @@ def cmd_update():
                 utf8_print(f"  {RED}Integrity check failed: HEAD after pull ({post_pull_head[:8]}) does not match expected remote ({remote[:8]}).{RESET}")
                 if pre_pull_commit:
                     utf8_print(f"  Rolling back to previous commit ({pre_pull_commit[:8]})...")
+                    # --keep, not --hard: it refuses to overwrite a file that
+                    # has local changes instead of silently discarding them.
+                    rolled_back = False
                     try:
-                        subprocess.run(
-                            [_GIT_PATH, "reset", "--hard", pre_pull_commit],
+                        reset = subprocess.run(
+                            [_GIT_PATH, "reset", "--keep", pre_pull_commit],
                             capture_output=True, text=True, timeout=10,
                             cwd=str(repo_dir),
                         )
+                        rolled_back = reset.returncode == 0
                     except Exception:
                         pass
+                    if not rolled_back:
+                        utf8_print(f"  {YELLOW}Could not roll back automatically. To go back by hand run: git -C \"{_sanitize(str(repo_dir))}\" reset --keep {pre_pull_commit[:12]}{RESET}")
                 utf8_print(f"  {YELLOW}Update aborted. Please try again or re-clone the repository.{RESET}")
                 return
             # Read the new version from the updated file on disk
@@ -2856,6 +3473,10 @@ def cmd_update():
                     cache_file.unlink()
                 except OSError:
                     pass
+            # The release may have changed commands/pulse.md (the /pulse
+            # command lists the options this version understands); copy the
+            # new one in, or /pulse keeps advertising the old version.
+            install_pulse_command()
             utf8_print(f"\n  Restart Claude Code to use v{new_version or 'latest'}.")
         else:
             utf8_print(f"  {RED}Update failed:{RESET}")
@@ -2896,11 +3517,219 @@ def _model_caps_ttl(config):
     return max(_MODEL_CAPS_MIN_TTL, ttl)
 
 
+# --- Untrusted state files ---------------------------------------------------
+#
+# Every file under the state dir can be damaged (a hand edit, a disk or
+# antivirus fault, another version's format) or caught mid-write by a window
+# that still writes in place. A raise on the render path is a blank bar on
+# every repaint, and an empty read written straight back erases the data. The
+# helpers below turn a file into only what the renderer can use.
+
+def _usage_number(value):
+    """*value* as a finite float, or None: text, bool, NaN, Infinity, an int too big."""
+    try:
+        return _stdin_number(value)
+    except OverflowError:   # an int past the float range
+        return None
+
+
+_USAGE_WINDOW_KEYS = ("five_hour", "seven_day", "seven_day_opus",
+                      "seven_day_sonnet", "seven_day_fable")
+_EXTRA_USAGE_NUMBERS = ("monthly_limit", "used_credits", "utilization")
+
+
+def _clean_usage(usage):
+    """The part of an untrusted usage dict that the renderer can draw.
+
+    A window is kept only if it is a dict whose utilization is a finite number
+    (or null, which the API sends and the renderer reads as 0); its reset time
+    must be text or null. Anything else is dropped, so that window draws as
+    missing instead of raising. The extra_usage numbers are coerced the same
+    way, to null. A window the plan lacks (null) is kept as null.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    clean = {}
+    for key in _USAGE_WINDOW_KEYS:
+        if key not in usage:
+            continue
+        window = usage[key]
+        if window is None:
+            clean[key] = None
+            continue
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if utilization is not None and _usage_number(utilization) is None:
+            continue
+        window = dict(window)
+        resets_at = window.get("resets_at")
+        if resets_at is not None and not isinstance(resets_at, str):
+            window["resets_at"] = None
+        clean[key] = window
+    extra = usage.get("extra_usage")
+    if isinstance(extra, dict):
+        extra = dict(extra)
+        for key in _EXTRA_USAGE_NUMBERS:
+            if extra.get(key) is not None and _usage_number(extra[key]) is None:
+                extra[key] = None
+        clean["extra_usage"] = extra
+    elif "extra_usage" in usage and extra is None:
+        clean["extra_usage"] = None
+    return clean
+
+
+def _clean_cache_entry(cached):
+    """Make a cache dict read from disk safe to draw from (in place); returns it.
+
+    Usage is cleaned; if nothing in it is usable it is removed, so the caller
+    falls back to the cached line instead of drawing zeros. A line or plan that
+    is not text is removed.
+    """
+    if "usage" in cached:
+        if isinstance(cached["usage"], dict):
+            cleaned = _clean_usage(cached["usage"])
+            if cleaned or not cached["usage"]:
+                cached["usage"] = cleaned
+            else:
+                del cached["usage"]
+        else:
+            del cached["usage"]
+    for key in ("line", "plan"):
+        if key in cached and not isinstance(cached[key], str):
+            del cached[key]
+    return cached
+
+
+_SAFE_FALLBACK_LINE = "Usage unavailable \u2014 retrying shortly"
+
+
+def _guarded_status_line(usage, plan, config, stdin_ctx, cache_age, fallback=""):
+    """build_status_line that never raises, so a bad file never means a blank bar.
+
+    First the data as given; then the data cleaned down to what the renderer can
+    draw; then the cached line, if there is one; then a short message. Only
+    Exception is caught, so Claude Code cancelling a repaint still works.
+    """
+    try:
+        return build_status_line(usage, plan, config, stdin_ctx, cache_age=cache_age)
+    except Exception:
+        pass
+    try:
+        return build_status_line(_clean_usage(usage), plan, config, stdin_ctx,
+                                 cache_age=cache_age)
+    except Exception:
+        pass
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback
+    return _SAFE_FALLBACK_LINE
+
+
+# How long a state file that cannot be parsed is left alone before it is
+# treated as damaged for good. A window that still writes in place leaves the
+# file empty or half-written for a few milliseconds; another window must not
+# take that for "no data" and write a one-sample file over a day of history.
+_DAMAGED_STATE_GRACE = 10
+
+
+# While another window swaps a state file in with os.replace, Windows makes
+# open() on it fail for a moment with PermissionError (measured: a third of
+# the reads in a tight loop against a writer, about one in fifty at a write per
+# 10 ms). Read as "no data" that erased the 429 backoff, so the read is tried
+# again a couple of times first. A PermissionError that persists is real.
+_STATE_READ_TRIES = 3
+_STATE_READ_PAUSE = 0.005
+
+
+def _read_state_file(path, binary=False):
+    """Contents of a state file (bytes if *binary*, else UTF-8 text)."""
+    for attempt in range(_STATE_READ_TRIES):
+        try:
+            if binary:
+                with open(path, "rb") as f:
+                    return f.read()
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except PermissionError:
+            if attempt == _STATE_READ_TRIES - 1:
+                raise
+            time.sleep(_STATE_READ_PAUSE)
+
+
+def _read_state_json(path):
+    """Read a JSON state file ahead of a read-modify-write: ``(ok, data)``.
+
+    A missing file is ``(True, None)``. A file that cannot be parsed or decoded
+    is ``(False, None)`` while it was changed within _DAMAGED_STATE_GRACE
+    seconds (the caller skips this write) and ``(True, None)`` once it has sat
+    that way (the caller starts again from empty, which heals it). A file that
+    cannot be opened at all is ``(False, None)``.
+    """
+    try:
+        return True, json.loads(_read_state_file(path, binary=True))
+    except FileNotFoundError:
+        return True, None
+    except (ValueError, RecursionError):
+        # Not UTF-8, not JSON (a truncated write), or an int past the digit limit.
+        try:
+            recent = abs(time.time() - os.stat(path).st_mtime) <= _DAMAGED_STATE_GRACE
+        except OSError:
+            recent = True
+        return (not recent), None
+    except OSError:
+        return False, None
+
+
+def _load_samples(path, numeric_keys):
+    """``(ok, samples)`` from a history-style file: a list of dicts with a numeric ``t``.
+
+    An entry is kept only if its ``t`` and every key in *numeric_keys* that it
+    carries are finite numbers. A file of any other shape holds no samples.
+    ``ok`` is False when the caller should skip its write (see _read_state_json).
+    """
+    ok, raw = _read_state_json(path)
+    if not ok or not isinstance(raw, list):
+        return ok, []
+    samples = []
+    for sample in raw:
+        if not isinstance(sample, dict) or _usage_number(sample.get("t")) is None:
+            continue
+        if any(key in sample and _usage_number(sample[key]) is None for key in numeric_keys):
+            continue
+        samples.append(sample)
+    return True, samples
+
+
+# Orphans from atomic writes that were killed between the temp file and the
+# rename are named <file>.<pid>-<8 hex>.tmp (see _atomic_json_write). A write
+# takes milliseconds, so anything this old belongs to no live writer.
+_TMP_ORPHAN_RE = re.compile(r"\.\d+-[0-9a-f]{8}\.tmp$")
+_TMP_ORPHAN_AGE = 600
+_TMP_SWEEP_ODDS = 0.02   # about one cache write in fifty
+
+
+def _sweep_stale_tmp_files(directory, max_age=_TMP_ORPHAN_AGE):
+    """Delete this script's own leftover temp files older than *max_age* seconds."""
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+    cutoff = time.time() - max_age
+    for entry in entries:
+        if not _TMP_ORPHAN_RE.search(entry.name):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and \
+                    entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path)
+        except OSError:
+            pass
+
+
 def read_cache(cache_path, ttl):
     """Return the full cache dict if fresh, else None."""
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached = json.loads(_read_state_file(cache_path))
         # The file is ours, but it is still untrusted input: a truncated write,
         # a disk error, or a hand-edit can leave valid JSON of the wrong shape.
         # Anything other than a dict is treated as a cache miss rather than
@@ -2914,7 +3743,7 @@ def read_cache(cache_path, ttl):
         # exactly the retry storm the backoff exists to prevent.
         blocked_until = _cache_seconds(cached.get("rate_limited_until")) or 0
         if blocked_until and time.time() < blocked_until:
-            return cached
+            return _clean_cache_entry(cached)
         # Error-only entries expire faster, except rate limit errors which back off longer
         if "usage" in cached:
             effective_ttl = ttl
@@ -2926,7 +3755,7 @@ def read_cache(cache_path, ttl):
         if timestamp is None:
             return None  # unusable timestamp — treat as a miss
         if time.time() - timestamp < effective_ttl:
-            return cached
+            return _clean_cache_entry(cached)
     except (OSError, ValueError, RecursionError, KeyError):
         # Missing or unreadable (OSError); not UTF-8, not JSON, or an int past
         # the int/str digit limit (each a ValueError); nested past the parser's
@@ -2943,13 +3772,15 @@ def _read_stale_cache(cache_path):
     before any usage data has been cached.
     """
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached = json.loads(_read_state_file(cache_path))
         # Same untrusted-shape rule as read_cache. This one feeds the 429
         # fallback, where raising means no status line is printed at all:
         # a cache file containing bare `42` made `"usage" in cached` raise.
         if not isinstance(cached, dict):
             return None
+        # Values the renderer cannot draw are dropped here too, so the 429
+        # branch and the stdin merge never carry them forward.
+        _clean_cache_entry(cached)
         if "usage" in cached or "line" in cached:
             return cached
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
@@ -2995,8 +3826,14 @@ def write_cache(cache_path, line, usage=None, plan=None,
             data["model_caps_fetched_at"] = model_caps_fetched_at
         if model_caps_attempted_at:
             data["model_caps_attempted_at"] = model_caps_attempted_at
-        with _secure_open_write(cache_path) as f:
-            json.dump(data, f)
+        # Atomic, like stdin_ctx.json: written in place, the file is empty for
+        # most of each write, and a second window that read it then took that
+        # for a miss and wrote it back without the 429 backoff and the caps. A
+        # replace that fails (Windows refuses while a reader holds the file
+        # open) is OSError: skip this write, the next repaint writes again.
+        _atomic_json_write(cache_path, data, indent=None)
+        if random.random() < _TMP_SWEEP_ODDS:
+            _sweep_stale_tmp_files(Path(cache_path).parent)
     except OSError:
         pass
 
@@ -3117,6 +3954,17 @@ def _authorized_request(url, token, headers=None, data=None, method=None, timeou
     req = urllib.request.Request(url, headers=hdrs, data=data, method=method)
     return _safe_opener.open(req, timeout=timeout)
 
+def _oauth_section(data):
+    """The ``claudeAiOauth`` dict of a credentials file, or {} for anything else.
+
+    The file is not ours to validate: an explicit ``null`` (or a list, or text)
+    in place of the section is valid JSON, and ``.get('claudeAiOauth', {})``
+    only supplies its default when the key is missing, not when it is null.
+    """
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    return oauth if isinstance(oauth, dict) else {}
+
+
 def _read_credential_data():
     """Read raw credential data from file or macOS Keychain. Returns (dict, source)."""
     # 1. File-based (~/.claude/.credentials.json)
@@ -3124,9 +3972,12 @@ def _read_credential_data():
     try:
         with open(creds_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("claudeAiOauth", {}).get("accessToken"):
+        if _oauth_section(data).get("accessToken"):
             return data, "file"
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    except (OSError, ValueError, RecursionError):
+        # Missing, locked or unreadable (OSError); not UTF-8 or not JSON (each
+        # a ValueError). Any of them means no credentials here, not a raise on
+        # the render path.
         pass
 
     # 2. macOS Keychain fallback
@@ -3139,7 +3990,7 @@ def _read_credential_data():
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout.strip())
-                if data.get("claudeAiOauth", {}).get("accessToken"):
+                if _oauth_section(data).get("accessToken"):
                     return data, "keychain"
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError, ValueError):
             pass
@@ -3149,13 +4000,13 @@ def _read_credential_data():
 
 def _extract_credentials(data):
     """Extract token and plan from credential data dict."""
-    if not data:
-        return None, None
-    oauth = data.get("claudeAiOauth", {})
+    oauth = _oauth_section(data)
     token = oauth.get("accessToken")
-    tier = oauth.get("rateLimitTier", "")
-    if not token:
+    tier = oauth.get("rateLimitTier")
+    if not token or not isinstance(token, str):
         return None, None
+    if not isinstance(tier, str):
+        tier = ""   # an explicit null (or any non-text) tier means no plan name
     plan = PLAN_NAMES.get(tier, _sanitize(tier.replace("default_claude_", "").replace("_", " ").title()))
     return token, plan
 
@@ -3404,6 +4255,11 @@ _CODEX_TAIL_BYTES = 2_000_000     # rollouts reach ~100 MB; read only the tail
 _CODEX_DAY_DIRS = 2
 _CODEX_MAX_FILES = 3
 _MINIMAX_PROVIDER_TTL = 120
+_MINIMAX_TIMEOUT = 3              # seconds; hard ceiling on one `mmx quota show`
+# Hard wall-clock ceiling on a second Claude account's usage fetch. Kept at the
+# render path's fetch budget so it fits inside the shortest refresh interval.
+_PROVIDER_FETCH_BUDGET = _NET_FETCH_BUDGET
+_PROVIDER_RETRY_JITTER = 8        # seconds; spread so accounts' retries differ
 _GEMINI_BUCKETS = {
     "gemini": ("gemini-5h", "gemini-weekly"),
     "3p": ("3p-5h", "3p-weekly"),   # Claude/GPT-OSS models inside Antigravity
@@ -3903,6 +4759,45 @@ def _read_other_claude_token(config_dir, now=None):
     return token, plan
 
 
+def _provider_retry_seconds(pid):
+    """Minimum gap between two refresh attempts for *pid*.
+
+    ``_PROVIDER_RETRY`` plus a small offset taken from the id: it is stable for
+    one account but differs between accounts, so their retries (and the main
+    fetch's, which keeps the plain 60 s) stop falling due on the same repaint.
+    """
+    return _PROVIDER_RETRY + sum(str(pid).encode("utf-8", "replace")) % _PROVIDER_RETRY_JITTER
+
+
+def _call_bounded(fn, budget):
+    """Return ``fn()``, giving up after *budget* seconds of wall-clock time.
+
+    A socket timeout restarts for every address and ``getaddrinfo`` has none at
+    all, so neither promises a ceiling (see ``_fetch_bounded``). ``fn`` runs on
+    a daemon thread that is simply abandoned at the ceiling: the process exits
+    moments later and takes it along, and a late answer is dropped. What ``fn``
+    raises is raised here (a ``BaseException`` too); running out of time raises
+    ``TimeoutError``.
+    """
+    outcome = []
+
+    def work():
+        try:
+            outcome.append((True, fn()))
+        except BaseException as exc:  # handed back to the caller below
+            outcome.append((False, exc))
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()          # RuntimeError (no thread to spare) is the caller's error
+    worker.join(budget)
+    if not outcome:
+        raise TimeoutError("no answer within %.1fs" % budget)
+    ok, value = outcome[0]
+    if ok:
+        return value
+    raise value
+
+
 def _refresh_claude_provider(entry, config, now=None, budget=None):
     """Return the cache for a non-active Claude account, refreshing it if due.
 
@@ -3910,11 +4805,15 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
     is made only when all of these hold: the data is older than
     ``providers_refresh_seconds``; no 429 / auth / error backoff is running;
     the last *attempt* is over 60 s old; the account has an unexpired token on
-    disk; and ``budget`` (a one-item list shared by one repaint) still allows
-    a network call. The attempt is stamped before the request.
+    disk; ``budget`` (a one-item list shared by one repaint) still allows
+    a network call; and the repaint has not already made one (the main usage
+    fetch or any other check: ``_begin_net_attempt`` lets the optional checks
+    take turns, so this one simply waits for a later repaint). The attempt is
+    stamped before the request, and the request has a hard wall-clock ceiling.
     """
     now = time.time() if now is None else now
     pid = entry["id"]
+    retry = _provider_retry_seconds(pid)
     cache = _read_provider_cache(pid) or {}
 
     def _num(key):
@@ -3928,7 +4827,7 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
     if now < _num("rate_limited_until") or now < _num("auth_failed_until") \
             or now < _num("error_until"):
         return cache
-    if now - _num("last_attempt") < _PROVIDER_RETRY:
+    if now - _num("last_attempt") < retry:
         return cache
     if budget is not None and budget[0] <= 0:
         return cache
@@ -3945,22 +4844,33 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
         # Re-read under the lock: that window may just have stamped or refreshed.
         cache = _read_provider_cache(pid) or cache
         if now - _num("timestamp") < _provider_refresh_seconds(config) \
-                or now - _num("last_attempt") < _PROVIDER_RETRY:
+                or now - _num("last_attempt") < retry:
+            return cache
+        # One network call per repaint: when the main usage fetch (or another
+        # optional check) has just run, wait for a later repaint. Waiting is
+        # not failing, so nothing is stamped and no budget is spent.
+        net_key = "provider:%s" % pid
+        if not _begin_net_attempt(net_key, backoff=retry):
             return cache
         if budget is not None:
             budget[0] -= 1
         cache = dict(cache)
         cache["last_attempt"] = now
         if not _write_provider_cache(pid, cache):
+            _end_net_attempt(net_key)
             return cache        # unsaved attempt: never risk one fetch per repaint
         try:
-            usage = fetch_usage(token, timeout=_PROVIDER_TIMEOUT)
+            usage = _call_bounded(
+                lambda tok=token: fetch_usage(tok, timeout=_PROVIDER_TIMEOUT),
+                _PROVIDER_FETCH_BUDGET)
             token = None
+            _end_net_attempt(net_key)
             fresh = {"timestamp": time.time(), "usage": _clean_provider_usage(usage),
                      "plan": plan or cache.get("plan"), "last_attempt": now}
             _write_provider_cache(pid, fresh)
             return fresh
         except urllib.error.HTTPError as exc:
+            _end_net_attempt(net_key)
             code = getattr(exc, "code", None)
             if code == 429:
                 retry_after = _retry_after_seconds(getattr(exc, "headers", None))
@@ -3973,6 +4883,7 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
             else:
                 cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
         except Exception:
+            _end_net_attempt(net_key)
             cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
         token = None
         _write_provider_cache(pid, cache)
@@ -4211,8 +5122,60 @@ def _minimax_env_active():
         os.environ.get("ANTHROPIC_MODEL", "").startswith("MiniMax-")
 
 
-def _read_minimax_quota(pid="minimax", now=None):
-    """MiniMax windows via ``mmx quota show`` at most every 120 s (cached)."""
+def _minimax_run_quota(exe):
+    """Run ``mmx quota show``; return its windows in Pulse's shape, or None.
+
+    npm installs mmx as a ``.cmd`` shim on Windows: a ``cmd.exe`` that starts
+    ``node.exe``. On a timeout ``subprocess.run`` kills only the shim, and with
+    pipes it then waits for end-of-file on pipes the still-running node holds,
+    for as long as MiniMax's API hangs (see ``_git`` with ``network=True``). So
+    the call gets no pipes at all: stdout goes to a temp file, stdin and stderr
+    to the null device, and ``_MINIMAX_TIMEOUT`` is a real ceiling on every OS.
+    """
+    import tempfile  # only this path needs it
+    try:
+        with tempfile.TemporaryFile() as out:
+            proc = subprocess.run(
+                [exe, "quota", "show", "--output", "json", "--quiet"],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                timeout=_MINIMAX_TIMEOUT,
+            )
+            if proc.returncode != 0:
+                return None
+            out.seek(0)
+            raw = out.read(_PROVIDER_FILE_MAX)
+        return _parse_minimax_quota(json.loads(raw)) or None
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+        return None
+
+
+def _minimax_cached_windows(cache, now=None):
+    """The cached MiniMax windows as the main bar's ``_rate_limits``.
+
+    Empty when there is nothing cached or it is older than
+    ``_PROVIDER_STALE_AFTER``: the provider row draws old numbers with a "~",
+    but the main bar has no such marker, so it shows no bars instead.
+    """
+    now = time.time() if now is None else now
+    try:
+        stamp = float((cache or {}).get("timestamp") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(stamp) or stamp <= 0 or now - stamp > _PROVIDER_STALE_AFTER:
+        return {}
+    return _clean_provider_usage((cache or {}).get("usage"), now)
+
+
+def _read_minimax_quota(pid="minimax", now=None, primary=False):
+    """MiniMax windows via ``mmx quota show`` at most every 120 s (cached).
+
+    One cache serves the provider row and the main bar of an mxclaude window,
+    so ``mmx`` (a Node start-up plus a call to MiniMax) never runs on every
+    repaint. The attempt is stamped before the call; when it cannot be stamped
+    nothing is run. Like the other optional checks it takes turns with them
+    (``_begin_net_attempt``), unless ``primary``: on an mxclaude window ``mmx``
+    is the usage bar itself, the way the usage fetch is on a Claude one.
+    """
     now = time.time() if now is None else now
     cache = _read_provider_cache(pid) or {}
     try:
@@ -4224,22 +5187,20 @@ def _read_minimax_quota(pid="minimax", now=None):
     exe = shutil.which("mmx")
     if not exe:
         return cache
+    net_key = "provider:%s" % pid
+    if not _begin_net_attempt(net_key, backoff=_MINIMAX_PROVIDER_TTL, primary=primary):
+        return cache
     cache = dict(cache)
     cache["last_attempt"] = now
-    _write_provider_cache(pid, cache)
-    try:
-        proc = subprocess.run(
-            [exe, "quota", "show", "--output", "json", "--quiet"],
-            capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL,
-        )
-        if proc.returncode == 0:
-            parsed = _parse_minimax_quota(json.loads(proc.stdout))
-            if parsed:
-                cache["usage"] = parsed
-                cache["timestamp"] = now
-    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
-        pass
-    _write_provider_cache(pid, cache)
+    if not _write_provider_cache(pid, cache):
+        _end_net_attempt(net_key)
+        return cache            # unsaved attempt: never risk one run per repaint
+    parsed = _minimax_run_quota(exe)
+    _end_net_attempt(net_key)
+    if parsed:
+        cache["usage"] = parsed
+        cache["timestamp"] = now
+        _write_provider_cache(pid, cache)
     return cache
 
 
@@ -4514,17 +5475,14 @@ def _get_anim_state_path():
 
 
 def _load_anim_state():
-    try:
-        with open(_get_anim_state_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """The animation state, or {} when the file is missing, damaged or not an object."""
+    _, data = _read_state_json(_get_anim_state_path())
+    return data if isinstance(data, dict) else {}
 
 
 def _save_anim_state(state):
     try:
-        with _secure_open_write(_get_anim_state_path()) as f:
-            json.dump(state, f)
+        _atomic_json_write(_get_anim_state_path(), state, indent=None)
     except OSError:
         pass
 
@@ -4636,6 +5594,108 @@ def _format_pace(pct, pace, style=DEFAULT_PACE_STYLE):
     return f" {colour}{glyph}{RESET}"
 
 
+def _roll_over_expired_windows(usage):
+    """Copy of *usage* where every usage window whose reset has passed reads 0 %.
+
+    Claude Code drops a window from ``rate_limits`` the moment its ``resets_at``
+    passes, so a window that is still carried (persisted stdin context, an old
+    cache.json) describes a period that is over. Drawn as it was, it showed the
+    old percentage next to "now" (F01). The same rule as ``_provider_window``:
+    0 % and no reset ("starts on next use"). Covers ``five_hour``, ``seven_day``
+    and the model-scoped ``seven_day_*`` caps; anything else, and anything not
+    a well-formed window, is returned untouched. *usage* is never mutated.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    now = time.time()
+    out = dict(usage)
+    for key, win in usage.items():
+        if not isinstance(key, str) or not isinstance(win, dict):
+            continue
+        if key not in ("five_hour", "seven_day") and not key.startswith("seven_day_"):
+            continue
+        reset = _parse_reset(win.get("resets_at"))
+        if reset is None:
+            continue
+        try:
+            expired = reset.timestamp() <= now
+        except (OverflowError, OSError, ValueError):
+            continue
+        if expired:
+            out[key] = dict(win, utilization=0.0, resets_at=None)
+    return out
+
+
+def _extra_usage_view(extra):
+    """The numbers of an ``extra_usage`` block, or None when it is off or unusable.
+
+    The block comes from the usage API or from cache.json, both untrusted, so
+    a wrong type reads as 0 instead of raising (a raise is a blank bar).
+    Amounts are minor units (cents, pence) in the API; the view holds major
+    units. ``currency`` is the ISO-4217 code the API reports, "" when it does
+    not (older payloads, always USD).
+    """
+    if not isinstance(extra, dict) or not extra.get("is_enabled"):
+        return None
+
+    def num(value):
+        n = _stdin_number(value)
+        return max(n, 0.0) if n is not None else 0.0
+
+    code = extra.get("currency")
+    code = code.strip().upper() if isinstance(code, str) else ""
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        code = ""
+    return {"pct": min(num(extra.get("utilization")), 100.0),
+            "used": num(extra.get("used_credits")) / 100,
+            "limit": num(extra.get("monthly_limit")) / 100,
+            "currency": code}
+
+
+def _extra_money(view, symbol):
+    """``(symbol, used, limit)`` to draw for an extra-usage view (F17).
+
+    A USD amount (or one with no currency) is converted into the user's
+    currency exactly like the session cost beside it. An amount the API
+    already states in another currency is never converted: it keeps the
+    user's own symbol when that is the same currency, else its ISO code.
+    """
+    code = view["currency"]
+    if code and code != "USD":
+        if _CURRENCY_TO_CODE.get(symbol) == code:
+            return symbol, view["used"], view["limit"]
+        return code + " ", view["used"], view["limit"]
+    rate, rate_code = _get_exchange_rate(symbol)
+    return ("$" if rate_code == "USD" else symbol), view["used"] * rate, view["limit"] * rate
+
+
+def _extra_age_tag(stdin_ctx, config):
+    """A dim " (3d ago)" when the extra-usage figure is overdue for a refresh.
+
+    The figure is refetched every ``model_caps_refresh_seconds``; it is old
+    only when that did not happen (offline, rate limited). main() stamps the
+    time of the last good fetch on ``stdin_ctx`` under ``_extra_fetched_at``
+    (None when none was ever recorded). Without the key nothing is known, so
+    nothing is claimed.
+    """
+    if not isinstance(stdin_ctx, dict) or "_extra_fetched_at" not in stdin_ctx:
+        return ""
+    fetched = _cache_seconds(stdin_ctx.get("_extra_fetched_at")) or None
+    if fetched is None:
+        return f" {YELLOW}(stale){RESET}"
+    age = time.time() - fetched
+    if age <= 2 * _model_caps_ttl(config):
+        return ""
+    if age < 3600:
+        label = f"{int(age // 60)}m"
+    elif age < 172800:
+        label = f"{int(age // 3600)}h"
+    else:
+        label = f"{int(age // 86400)}d"
+    colour = RED if age >= 86400 else YELLOW
+    return f" {colour}({label} ago){RESET}"
+
+
 def format_reset_time(resets_at_str):
     if not resets_at_str:
         return None
@@ -4680,14 +5740,12 @@ def _weekly_date(resets_at, clock="12h"):
     hour = local_dt.hour
     if clock == "24h":
         time_str = f"{hour:02d}:{local_dt.minute:02d}"
-    elif hour == 0:
-        time_str = "12am"
-    elif hour < 12:
-        time_str = f"{hour}am"
-    elif hour == 12:
-        time_str = "12pm"
     else:
-        time_str = f"{hour - 12}pm"
+        # Weekly resets fall on the hour in UTC, which is :30 or :45 local in
+        # half-hour zones (India, Nepal, Newfoundland...). Keep the compact
+        # "5pm" for an exact hour and spell the minutes out otherwise.
+        minutes = f":{local_dt.minute:02d}" if local_dt.minute else ""
+        time_str = f"{hour % 12 or 12}{minutes}{'am' if hour < 12 else 'pm'}"
     return f"{local_dt.strftime('%a')} {time_str}"
 
 
@@ -4721,7 +5779,9 @@ def format_weekly_reset(resets_at_str, fmt="auto", clock="12h"):
         if total_seconds < 86400:
             return _weekly_countdown(total_seconds)
         return _weekly_date(resets_at, clock=clock)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
+        # OSError: on Windows a date past the year 3000 cannot be converted to
+        # local time (astimezone raises "[Errno 22] Invalid argument").
         return None
 
 
@@ -4731,22 +5791,29 @@ def _get_history_path():
 
 
 def _read_history():
-    """Read usage history samples."""
-    try:
-        with open(_get_history_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Read usage history samples: the ones the renderer can draw, [] on a damaged file."""
+    return _load_samples(_get_history_path(), ("s", "w"))[1]
+
+
+def _window_pct(usage, key):
+    """Utilization of one usage window as a finite number; 0 when it is missing or unusable."""
+    window = usage.get(key) if isinstance(usage, dict) else None
+    if not isinstance(window, dict):
+        return 0
+    return _usage_number(window.get("utilization")) or 0
 
 
 def _append_history(usage):
     """Append a usage sample to history and prune old entries."""
-    five = usage.get("five_hour", {})
-    seven = usage.get("seven_day", {})
-    session_pct = five.get("utilization") or 0
-    weekly_pct = seven.get("utilization") or 0
+    session_pct = _window_pct(usage, "five_hour")
+    weekly_pct = _window_pct(usage, "seven_day")
 
-    samples = _read_history()
+    # Not _read_history(): that returns [] for a half-written file, and this
+    # function writes the result back. Another window's in-place write (an
+    # older version) must not turn a day of samples into one.
+    ok, samples = _load_samples(_get_history_path(), ("s", "w"))
+    if not ok:
+        return  # skip this sample; the next repaint tries again
     now = time.time()
     samples.append({"t": now, "s": session_pct, "w": weekly_pct})
 
@@ -4756,8 +5823,7 @@ def _append_history(usage):
     samples = samples[-2000:]  # prevent unbounded growth
 
     try:
-        with _secure_open_write(_get_history_path()) as f:
-            json.dump(samples, f)
+        _atomic_json_write(_get_history_path(), samples, indent=None)
     except OSError:
         pass
 
@@ -4879,8 +5945,35 @@ _CURRENCY_TO_CODE = {
     "C$": "CAD", "A$": "AUD", "NZ$": "NZD", "S$": "SGD", "HK$": "HKD",
     "R$": "BRL", "kr": "SEK", "Fr": "CHF", "\u20b9": "INR", "\u20a9": "KRW",
     "R": "ZAR", "z\u0142": "PLN", "K\u010d": "CZK", "\u20ba": "TRY",
-    "\u20b4": "UAH", "\u20b1": "PHP", "RM": "MYR", "\u20aa": "ILS",
+    "\u20b1": "PHP", "RM": "MYR", "\u20aa": "ILS",
+    # No hryvnia sign: the rate service (frankfurter) does not list UAH, so
+    # there is no rate to convert with. Left unmapped, amounts stay in dollars.
 }
+
+# ISO codes name a currency without the ambiguity of a shared symbol ("kr" is
+# the Swedish, Danish and Norwegian krone), so ``--currency DKK`` works. These
+# are the codes frankfurter's /v1/currencies lists: all of them can be priced.
+_ISO_CURRENCY_CODES = frozenset(
+    "AUD BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN "
+    "MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR".split()
+)
+# Which krone a bare "kr" means when the machine's country says so. Configs
+# saved before Denmark and Norway got their own codes still hold "kr".
+_KRONE_BY_COUNTRY = {"DK": "DKK", "NO": "NOK"}
+
+
+def _currency_code(currency_symbol):
+    """ISO code for a configured currency symbol or code; "" when there is none."""
+    if not isinstance(currency_symbol, str):
+        return ""
+    if currency_symbol == "kr":
+        return _KRONE_BY_COUNTRY.get(_locale_country(), "SEK")
+    code = _CURRENCY_TO_CODE.get(currency_symbol, "")
+    if not code:
+        iso = currency_symbol.strip().upper()
+        if iso in _ISO_CURRENCY_CODES:
+            code = iso
+    return code
 
 
 _exchange_rate_mem = {}  # in-memory cache: {code: (rate, timestamp)}
@@ -4905,7 +5998,7 @@ def _usable_rate(value):
 
 def _get_exchange_rate(currency_symbol):
     """Get USD→target exchange rate. Cached for 24h. Returns (rate, code) or (1.0, 'USD')."""
-    code = _CURRENCY_TO_CODE.get(currency_symbol, "")
+    code = _currency_code(currency_symbol)
     if not code or code == "USD":
         return 1.0, "USD"
 
@@ -4958,7 +6051,11 @@ def _get_exchange_rate(currency_symbol):
             pass
 
     # Fallback: the last real rate if there ever was one, else the hardcoded one
-    fallback = stale_rate if stale_rate is not None else _FALLBACK_RATES.get(code, 1.0)
+    fallback = stale_rate if stale_rate is not None else _FALLBACK_RATES.get(code)
+    if fallback is None:
+        # No rate of any kind: show the amount as the dollars it still is,
+        # rather than under this currency's name at a rate of 1.0.
+        return 1.0, "USD"
     _exchange_rate_mem[code] = (fallback, now)
     return fallback, code
 
@@ -4985,34 +6082,53 @@ def _get_context_history_path():
 
 
 def _read_context_history():
-    try:
-        with open(_get_context_history_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Context samples the renderer can use; [] on a damaged file."""
+    return _load_samples(_get_context_history_path(), ("c",))[1]
 
 
-def _append_context_history(context_pct):
-    if context_pct is None:
+# context_history.json is per account, but context is per session: two windows
+# at 75% and 10% sharing one series read as a jump of 65 points in seconds. So
+# each sample names its session, and the velocity of a window is computed from
+# that window's samples alone. main() announces the session once per repaint.
+_context_session_id = None
+
+
+def _set_context_session(session_id):
+    """Name the session this process is painting (None when stdin gave none)."""
+    global _context_session_id
+    _context_session_id = session_id or None
+
+
+def _context_session_key(session_id=None):
+    sid = session_id if session_id is not None else _context_session_id
+    return str(sid)[:64] if sid else ""
+
+
+def _append_context_history(context_pct, session_id=None):
+    pct = _usage_number(context_pct)
+    if pct is None:
         return
-    samples = _read_context_history()
+    # Not _read_context_history(): see _append_history.
+    ok, samples = _load_samples(_get_context_history_path(), ("c",))
+    if not ok:
+        return
     now = time.time()
-    samples.append({"t": now, "c": float(context_pct)})
+    samples.append({"t": now, "c": pct, "s": _context_session_key(session_id)})
     cutoff = now - 3600
     samples = [s for s in samples if s.get("t", 0) > cutoff][-500:]
     try:
-        with _secure_open_write(_get_context_history_path()) as f:
-            json.dump(samples, f)
+        _atomic_json_write(_get_context_history_path(), samples, indent=None)
     except OSError:
         pass
 
 
-def _compute_context_velocity():
-    samples = _read_context_history()
-    if len(samples) < 2:
-        return None
+def _compute_context_velocity(session_id=None):
+    _, samples = _load_samples(_get_context_history_path(), ("c",))
+    # Samples from before sessions were recorded carry no "s": they belong to
+    # no named session (an unnamed one, key "", still reads them).
+    key = _context_session_key(session_id)
     now = time.time()
-    recent = [s for s in samples if s.get("t", 0) > now - 300]
+    recent = [s for s in samples if s.get("s", "") == key and s["t"] > now - 300]
     if len(recent) < 2:
         return None
     dt = recent[-1]["t"] - recent[0]["t"]
@@ -5089,26 +6205,24 @@ def _get_stats_path():
 
 
 def _load_stats():
-    """Load stats from disk with defaults."""
-    try:
-        with open(_get_stats_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {
-            "first_seen": _today_local(),
-            "total_sessions": 0,
-            "daily_dates": [],
-            "current_streak": 0,
-            "longest_streak": 0,
-            "last_date": "",
-        }
+    """Load stats from disk; the defaults when the file is missing, damaged or not an object."""
+    _, data = _read_state_json(_get_stats_path())
+    if isinstance(data, dict):
+        return data
+    return {
+        "first_seen": _today_local(),
+        "total_sessions": 0,
+        "daily_dates": [],
+        "current_streak": 0,
+        "longest_streak": 0,
+        "last_date": "",
+    }
 
 
 def _save_stats(stats):
     """Save stats to disk."""
     try:
-        with _secure_open_write(_get_stats_path()) as f:
-            json.dump(stats, f, indent=2)
+        _atomic_json_write(_get_stats_path(), stats, indent=2)
     except OSError:
         pass
 
@@ -5224,65 +6338,237 @@ _WEEKLY_COST_WINDOW = 7 * 86400
 _weekly_cost_mem = {"ts": 0, "data": {}}
 
 
-def _get_cached_weekly_cost():
-    """Rolling 7-day API-equivalent cost, with the same two-tier cache as the
-    cumulative figure: in-memory for the hot path, then a 5-minute disk cache
-    so a full transcript scan runs at most twice per refresh window.
+# Reading every transcript takes seconds (tens of seconds on a big store), and
+# Claude Code cancels a status line script the moment the next update fires,
+# so a scan on the render path never finishes: the figure is only saved once
+# the scan returns, nothing records that one began, and every repaint starts
+# it over. The render path therefore never scans. It draws the last saved
+# figure, however old, and when that is out of date it starts ONE detached
+# process (_cost_refresh_worker) that scans and saves it. A claim file,
+# created with O_EXCL before the process starts, keeps every other repaint and
+# every other window from starting a second scan.
+_COST_CACHE_VERSION = 2  # bumped when the scan's sums change; older files are not drawn
+_COST_SCAN_LOCK_TTL = 300  # seconds a claim holds off a new scan (also the retry delay after a failure)
+# A claim taken by another window a moment after this one read the clock is
+# stamped slightly in this one's future. Up to this much counts as young; a
+# stamp further ahead means the clock was set back, and the claim lapses.
+_COST_SCAN_CLOCK_SLOP = 60
+_CACHE_WRITE_1H_MULTIPLIER = 2.0  # 1-hour cache writes bill at 2x the input price
+
+# Run by the detached process: load this file by path and call the worker.
+_COST_WORKER_BOOT = (
+    "import importlib.util, sys\n"
+    "spec = importlib.util.spec_from_file_location('usage_pulse_cost_worker', sys.argv[1])\n"
+    "mod = importlib.util.module_from_spec(spec)\n"
+    "sys.modules[spec.name] = mod\n"
+    "spec.loader.exec_module(mod)\n"
+    "mod._cost_refresh_worker(sys.argv[2])\n"
+)
+
+
+def _cost_kind(kind):
+    """(cache file name, in-memory cache, TTL, window in seconds) for *kind*."""
+    if kind == "weekly":
+        return ("weekly_cost_cache.json", _weekly_cost_mem,
+                _WEEKLY_COST_CACHE_TTL, _WEEKLY_COST_WINDOW)
+    if kind == "cumulative":
+        return ("cumulative_cost_cache.json", _cumulative_cost_mem,
+                _CUMULATIVE_COST_CACHE_TTL, None)
+    return None
+
+
+def _read_cost_cache(path):
+    """A saved cost figure as (timestamp, data), or None.
+
+    None covers a missing or damaged file and one written by an older scan
+    (before responses were counted once, its totals were about double): better
+    a blank for the seconds a refresh takes than a wrong figure.
     """
-    now = time.time()
-
-    if now - _weekly_cost_mem["ts"] < _WEEKLY_COST_CACHE_TTL:
-        return _weekly_cost_mem["data"]
-
-    cache_path = get_account_state_dir() / "weekly_cost_cache.json"
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if now - cached.get("timestamp", 0) < _WEEKLY_COST_CACHE_TTL:
-            _weekly_cost_mem["ts"] = now
-            _weekly_cost_mem["data"] = cached.get("data", {})
-            return _weekly_cost_mem["data"]
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(saved, dict) or saved.get("v") != _COST_CACHE_VERSION:
+        return None
+    stamp = _cache_seconds(saved.get("timestamp"))
+    data = saved.get("data")
+    if stamp is None or not isinstance(data, dict):
+        return None
+    return stamp, data
 
-    data = _scan_session_costs(since_ts=now - _WEEKLY_COST_WINDOW)
-    _weekly_cost_mem["ts"] = now
-    _weekly_cost_mem["data"] = data
+
+def _claim_cost_scan(kind, now):
+    """Take the right to scan for *kind*. False means someone else holds it.
+
+    The claim is a file created with O_EXCL, so only one process wins. It is
+    taken BEFORE any work starts: a scan that is cut short, or that crashes,
+    leaves the claim behind and nothing retries for _COST_SCAN_LOCK_TTL. A
+    claim older than that is stale and is replaced; two processes racing to
+    replace it can at worst both scan once, which is harmless.
+    """
+    path = get_account_state_dir() / ("cost_scan_%s.lock" % kind)
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue  # released while we looked: try to take it
+            if -_COST_SCAN_CLOCK_SLOP <= age < _COST_SCAN_LOCK_TTL:
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False  # no claim, no scan: the figure just stays as it was
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass  # the file exists, which is all the claim needs
+        return True
+    return False
+
+
+def _release_cost_scan(kind):
     try:
-        _atomic_json_write(cache_path, {"timestamp": now, "data": data}, indent=None)
+        (get_account_state_dir() / ("cost_scan_%s.lock" % kind)).unlink()
     except OSError:
         pass
-    return data
 
 
-def _get_cached_cumulative_cost():
-    """Return cumulative cost data with in-memory + 5-minute disk cache."""
+def _spawn_cost_worker(kind):
+    """Start the detached process that refreshes *kind*. True if it started.
+
+    It must outlive this status line process, which exits as soon as it has
+    printed (or is cancelled): its own session on POSIX, and on Windows no
+    console, a new process group and, where the job allows it, outside the
+    job object Claude Code may have put this process in.
+    """
+    if not sys.executable:
+        return False
+    # -I: no cwd or user site on sys.path, no PYTHON* variables.
+    argv = [sys.executable, "-I", "-c", _COST_WORKER_BOOT,
+            str(Path(__file__).resolve()), kind]
+    options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+               "stderr": subprocess.DEVNULL, "close_fds": True}
+    try:
+        if sys.platform == "win32":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            try:
+                subprocess.Popen(argv, creationflags=flags | breakaway, **options)
+            except OSError:
+                # The job forbids breakaway: start without it.
+                subprocess.Popen(argv, creationflags=flags, **options)
+        else:
+            subprocess.Popen(argv, start_new_session=True, **options)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _request_cost_refresh(kind, now):
+    """Have *kind*'s figure refreshed in the background, at most one at a time."""
+    try:
+        if not _claim_cost_scan(kind, now):
+            return False
+        # A claim whose process never started is kept, not released: it is the
+        # backoff that stops every repaint from trying again.
+        return _spawn_cost_worker(kind)
+    except Exception:
+        return False
+
+
+def _cost_refresh_worker(kind):
+    """Entry point of the detached process: scan, save the figure, free the claim.
+
+    A failed scan keeps its claim, so a broken store is retried after
+    _COST_SCAN_LOCK_TTL instead of by a new process on every repaint.
+    """
+    spec = _cost_kind(kind)
+    if spec is None:
+        return
+    name, _mem, _ttl, window = spec
+    try:
+        since = time.time() - window if window else None
+        data = _scan_session_costs(since_ts=since)
+        _atomic_json_write(
+            get_account_state_dir() / name,
+            {"v": _COST_CACHE_VERSION, "timestamp": time.time(), "data": data},
+            indent=None,
+        )
+    except Exception:
+        return
+    _release_cost_scan(kind)
+
+
+def _get_cached_cost(kind):
+    """The saved figure for *kind*, never scanning transcripts itself.
+
+    Fresh figures come from memory or disk. A stale one is still returned (an
+    old total beats a missing one) while a background refresh is requested; with
+    nothing saved yet the result is empty and the widget stays hidden until the
+    first refresh lands.
+    """
+    name, mem, ttl, _window = _cost_kind(kind)
     now = time.time()
 
     # In-memory cache (avoids disk I/O on hot path)
-    if now - _cumulative_cost_mem["ts"] < _CUMULATIVE_COST_CACHE_TTL:
-        return _cumulative_cost_mem["data"]
+    if now - mem["ts"] < ttl:
+        return mem["data"]
 
-    # Disk cache
-    cache_path = get_account_state_dir() / "cumulative_cost_cache.json"
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if now - cached.get("timestamp", 0) < _CUMULATIVE_COST_CACHE_TTL:
-            _cumulative_cost_mem["ts"] = now
-            _cumulative_cost_mem["data"] = cached.get("data", {})
-            return _cumulative_cost_mem["data"]
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    saved = _read_cost_cache(get_account_state_dir() / name)
+    if saved is not None:
+        stamp, data = saved
+        if 0 <= now - stamp < ttl:
+            mem["ts"] = now
+            mem["data"] = data
+            return data
+    _request_cost_refresh(kind, now)
+    return saved[1] if saved is not None else {}
 
-    data = _scan_session_costs()
-    _cumulative_cost_mem["ts"] = now
-    _cumulative_cost_mem["data"] = data
+
+def _get_cached_weekly_cost():
+    """Rolling 7-day API-equivalent cost: the last saved figure (see above)."""
+    return _get_cached_cost("weekly")
+
+
+def _get_cached_cumulative_cost():
+    """All-time API-equivalent cost: the last saved figure (see above)."""
+    return _get_cached_cost("cumulative")
+
+
+def _token_count(value):
+    """A token count from untrusted JSON as a non-negative int (0 if unusable)."""
     try:
-        _atomic_json_write(cache_path, {"timestamp": now, "data": data}, indent=None)
-    except OSError:
-        pass
-    return data
+        count = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return count if count > 0 else 0
+
+
+def _split_cache_writes(usage):
+    """(5-minute, 1-hour) cache-write tokens of one response's usage.
+
+    ``cache_creation_input_tokens`` is the total; ``cache_creation`` splits it
+    by cache lifetime. Without the split (older transcripts, other providers)
+    everything is a 5-minute write, the cheaper rate.
+    """
+    total = _token_count(usage.get("cache_creation_input_tokens"))
+    detail = usage.get("cache_creation")
+    one_hour = five = 0
+    if isinstance(detail, dict):
+        one_hour = _token_count(detail.get("ephemeral_1h_input_tokens"))
+        five = _token_count(detail.get("ephemeral_5m_input_tokens"))
+    if total and one_hour > total:
+        one_hour = total  # a part cannot exceed the whole
+    return max(total - one_hour, five), one_hour
 
 
 def _parse_transcript_ts(value):
@@ -5335,6 +6621,32 @@ def _scan_session_costs(since_ts=None):
             "session_count": 0,
             "first_seen": None,
         }
+
+    seen: dict = {}  # (message id, request id) -> the record counted for it
+
+    def tally(record, sign):
+        """Add (sign=1) or take back (sign=-1) one response's figures."""
+        nonlocal total_cost_usd, total_tokens
+        model_id, cost, inp, out, cr, cw5, cw1 = record
+        m = models.get(model_id)
+        if m is None:
+            m = models[model_id] = {
+                "cost_usd": 0.0,
+                "total_tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        tokens = inp + out + cr + cw5 + cw1
+        m["cost_usd"] += sign * cost
+        m["input"] += sign * inp
+        m["output"] += sign * out
+        m["cache_read"] += sign * cr
+        m["cache_write"] += sign * (cw5 + cw1)
+        m["total_tokens"] += sign * tokens
+        total_cost_usd += sign * cost
+        total_tokens += sign * tokens
 
     try:
         jsonl_files = projects_dir.rglob("*.jsonl")
@@ -5419,36 +6731,44 @@ def _scan_session_costs(since_ts=None):
                         inp = int(usage.get("input_tokens") or 0)
                         out = int(usage.get("output_tokens") or 0)
                         cr = int(usage.get("cache_read_input_tokens") or 0)
-                        cw = int(usage.get("cache_creation_input_tokens") or 0)
+                        # Cache writes bill at 1.25x input for the 5-minute
+                        # cache and 2x for the 1-hour one (which Claude Code
+                        # uses on subscriber plans).
+                        cw5, cw1 = _split_cache_writes(usage)
                         # Haiku 5.5 steps up above 100K prompt tokens, priced
                         # per request (no-op for every other model).
-                        pricing = _pricing_for(model_id, entry_date, inp + cr + cw) or pricing
+                        pricing = _pricing_for(
+                            model_id, entry_date, inp + cr + cw5 + cw1) or pricing
 
                         cost = (
                             inp * pricing["input"]
                             + out * pricing["output"]
                             + cr * pricing["cache_read"]
-                            + cw * pricing["cache_write"]
+                            + cw5 * pricing["cache_write"]
+                            + cw1 * pricing.get("cache_write_1h",
+                                                pricing["input"] * _CACHE_WRITE_1H_MULTIPLIER)
                         ) / 1_000_000
+                        record = (model_id, cost, inp, out, cr, cw5, cw1)
 
-                        if model_id not in models:
-                            models[model_id] = {
-                                "cost_usd": 0.0,
-                                "total_tokens": 0,
-                                "input": 0,
-                                "output": 0,
-                                "cache_read": 0,
-                                "cache_write": 0,
-                            }
-                        m = models[model_id]
-                        m["cost_usd"] += cost
-                        m["input"] += inp
-                        m["output"] += out
-                        m["cache_read"] += cr
-                        m["cache_write"] += cw
-                        m["total_tokens"] += inp + out + cr + cw
-                        total_cost_usd += cost
-                        total_tokens += inp + out + cr + cw
+                        # Claude Code writes one line per content block
+                        # (thinking, text, tool_use) of a response, each
+                        # repeating the response's id and usage, and a resumed
+                        # session copies earlier lines into a new file. Count
+                        # each response once; if a repeat reports more output
+                        # than the one kept, the fuller report replaces it.
+                        message_id = msg.get("id")
+                        if isinstance(message_id, str) and message_id:
+                            request_id = entry.get("requestId")
+                            key = (message_id, request_id if isinstance(request_id, str) else "")
+                            kept = seen.get(key)
+                            if kept is not None:
+                                if out > kept[3]:
+                                    tally(kept, -1)
+                                    tally(record, 1)
+                                    seen[key] = record
+                                continue
+                            seen[key] = record
+                        tally(record, 1)
                     except (AttributeError, KeyError, TypeError, ValueError):
                         continue
         except (OSError, PermissionError):
@@ -5643,15 +6963,32 @@ def _parse_stdin_context(raw_stdin):
     try:
         ctx = data.get("data", data).get("context_window", {})
         used_pct = ctx.get("used_percentage")
-        if used_pct is not None:
-            result["context_pct"] = float(used_pct)
         # Raw token counts for tokens display mode
         input_tok = ctx.get("total_input_tokens")
-        output_tok = ctx.get("total_output_tokens")
         ctx_size = ctx.get("context_window_size")
-        if input_tok is not None and ctx_size is not None:
-            result["context_used"] = int(input_tok) + int(output_tok or 0)
-            result["context_limit"] = int(ctx_size)
+        # Right after /compact Claude Code repaints in the same session with no
+        # percentage, `current_usage: null` and zero totals: nothing of the
+        # old context is left. The merge in main() keeps a field a payload
+        # leaves out, so the old percentage would stay on the bar (and tokens
+        # mode would read "0/1M" next to it). On a full payload that shows the
+        # context emptied, the three fields are cleared until the next API
+        # response sends real numbers (F12). A bare null percentage with no
+        # such sign still means "unchanged".
+        if (_full and used_pct is None and isinstance(ctx, dict)
+                and (("current_usage" in ctx and ctx["current_usage"] is None)
+                     or _stdin_number(input_tok) == 0)):
+            result["context_pct"] = None
+            result["context_used"] = None
+            result["context_limit"] = None
+        else:
+            if used_pct is not None:
+                result["context_pct"] = float(used_pct)
+            # used_percentage counts input tokens only (input + cache reads and
+            # writes), so the token total does too; output tokens are the last
+            # reply, not context.
+            if input_tok is not None and ctx_size is not None:
+                result["context_used"] = int(input_tok)
+                result["context_limit"] = int(ctx_size)
     except (AttributeError, KeyError, ValueError, TypeError):
         pass
 
@@ -5959,19 +7296,15 @@ def _parse_stdin_context(raw_stdin):
             # schema. Only override if stdin didn't already provide rate_limits.
             if not result.get("_rate_limits"):
                 try:
-                    # npm installs mmx as a .cmd shim on Windows, which
-                    # subprocess won't auto-resolve (only .exe) — resolve it
-                    # like _GIT_PATH/_CLAUDE_PATH above.
-                    mmx_proc = subprocess.run(
-                        [shutil.which("mmx") or "mmx",
-                         "quota", "show", "--output", "json", "--quiet"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    if mmx_proc.returncode == 0:
-                        parsed = _parse_minimax_quota(json.loads(mmx_proc.stdout))
-                        if parsed:
-                            result["_rate_limits"] = parsed
-                except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                    # Cached for _MINIMAX_PROVIDER_TTL like the provider row:
+                    # this runs on every repaint, and `mmx` is a Node start-up
+                    # plus a call to MiniMax. _read_minimax_quota resolves the
+                    # npm .cmd shim via shutil.which and runs it with no pipes.
+                    quota = _minimax_cached_windows(
+                        _read_minimax_quota("minimax", primary=True))
+                    if quota:
+                        result["_rate_limits"] = quota
+                except Exception:
                     pass  # renderer will simply not show rate bars
     except (AttributeError, KeyError, ValueError, TypeError, OSError):
         pass
@@ -5986,19 +7319,28 @@ def _get_heatmap_path():
 
 def _update_heatmap(usage):
     """Update the activity heatmap with current usage data."""
-    five = usage.get("five_hour", {})
-    seven = usage.get("seven_day", {})
-    session_pct = five.get("utilization") or 0
-    weekly_pct = seven.get("utilization") or 0
+    session_pct = _window_pct(usage, "five_hour")
+    weekly_pct = _window_pct(usage, "seven_day")
 
-    # Load existing heatmap
-    try:
-        with open(_get_heatmap_path(), "r", encoding="utf-8") as f:
-            heatmap = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    # Load existing heatmap. A file that cannot be read yet (another window may
+    # be mid-write) skips this update rather than restarting 28 days of data.
+    ok, heatmap = _read_state_json(_get_heatmap_path())
+    if not ok:
+        return
+    if not isinstance(heatmap, dict):
         heatmap = {}
 
-    hours = heatmap.get("hours", {})
+    # Keep only entries the renderer can draw: a dict per hour, numbers in it.
+    hours = {}
+    raw_hours = heatmap.get("hours")
+    if isinstance(raw_hours, dict):
+        for key, value in raw_hours.items():
+            if isinstance(value, dict):
+                hours[key] = {
+                    "session_pct": _usage_number(value.get("session_pct")) or 0,
+                    "weekly_pct": _usage_number(value.get("weekly_pct")) or 0,
+                    "samples": int(_usage_number(value.get("samples")) or 0),
+                }
 
     # Current hour key in UTC: YYYY-MM-DDTHH
     now = datetime.now(timezone.utc)
@@ -6019,8 +7361,7 @@ def _update_heatmap(usage):
     heatmap["hours"] = hours
 
     try:
-        with _secure_open_write(_get_heatmap_path()) as f:
-            json.dump(heatmap, f)
+        _atomic_json_write(_get_heatmap_path(), heatmap, indent=None)
     except OSError:
         pass
 
@@ -6053,14 +7394,12 @@ def _render_heatmap(config=None):
     intensity_chars = ["\u00b7", "\u2591", "\u2592", "\u2593", "\u2588"]  # ·, ░, ▒, ▓, █
     intensity_colors = ["", theme["low"], theme["low"], theme["mid"], theme["high"]]
 
-    # Load heatmap data
-    try:
-        with open(_get_heatmap_path(), "r", encoding="utf-8") as f:
-            heatmap = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        heatmap = {}
-
-    hours_data = heatmap.get("hours", {})
+    # Load heatmap data. The file is untrusted: a damaged or wrong-shaped one
+    # draws an empty grid rather than raising.
+    _, heatmap = _read_state_json(_get_heatmap_path())
+    hours_data = heatmap.get("hours") if isinstance(heatmap, dict) else None
+    if not isinstance(hours_data, dict):
+        hours_data = {}
 
     # Build a 7x24 grid (Mon=0 .. Sun=6, hours 0-23)
     # Use the last 7 days from today
@@ -6072,9 +7411,9 @@ def _render_heatmap(config=None):
         weekday = day.weekday()  # Mon=0, Sun=6
         for hour in range(24):
             key = day.strftime("%Y-%m-%dT") + f"{hour:02d}"
-            entry = hours_data.get(key, {})
-            pct = entry.get("session_pct", 0)
-            grid[weekday][hour] = _heatmap_intensity(pct)
+            entry = hours_data.get(key)
+            pct = _usage_number(entry.get("session_pct")) if isinstance(entry, dict) else None
+            grid[weekday][hour] = _heatmap_intensity(pct or 0)
 
     day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     lines = []
@@ -6114,13 +7453,72 @@ def _get_sessions_dir():
     return sessions_dir
 
 
-def _get_session_id():
-    return os.getppid()
+# Stale markers are cleared a bounded batch at a time (see _prune_old_json).
+SESSION_PRUNE_BATCH = 100      # stale markers removed per pass, so cleanup never stalls a repaint
+SESSION_PRUNE_INTERVAL = 60    # seconds between cleanup passes
+SESSION_PRUNE_STAMP = ".pruned"
 
 
-def _update_session_state(usage, stdin_ctx):
+def _get_session_id(stdin_ctx=None):
+    """The id of the window being painted, or None when it has no stable one.
+
+    Claude Code sends a ``session_id`` that is stable for a session and unique
+    per session. The parent pid is not: on Windows the status line runs through
+    a new Git Bash on every repaint, so it named a new marker each time. A
+    repaint without an id of its own (a fragment) takes the one main() stored
+    beside the stdin context; failing that the parent pid is used where it is
+    stable (not Windows).
+    """
+    sid = _safe_path_id((stdin_ctx or {}).get("session_id"))
+    if not sid:
+        owner = _read_json_dict(get_account_state_dir() / "stdin_ctx.json")
+        sid = _safe_path_id(owner.get("session_id"))
+    if sid:
+        return sid
+    return os.getppid() if sys.platform != "win32" else None
+
+
+def _sessions_widget_on(config=None):
     try:
-        session_id = _get_session_id()
+        if config is None:
+            config = load_config()
+        return bool(config.get("show", {}).get("sessions", False))
+    except Exception:
+        return False
+
+
+def _session_prune_due(sessions_dir, now):
+    """True (and the stamp renewed) when a cleanup pass is due: once a minute."""
+    stamp = sessions_dir / SESSION_PRUNE_STAMP
+    try:
+        if 0 <= now - stamp.stat().st_mtime < SESSION_PRUNE_INTERVAL:
+            return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    try:
+        stamp.touch()
+    except OSError:
+        return False
+    return True
+
+
+def _update_session_state(usage, stdin_ctx, config=None):
+    try:
+        now = time.time()
+        sessions_dir = get_account_state_dir() / SESSION_DIR_NAME
+        # Stale markers (windows that closed, or a backlog left by older
+        # versions) are cleared whether or not the widget is on, a bounded
+        # batch per minute.
+        if _session_prune_due(sessions_dir, now):
+            _prune_old_json(sessions_dir, SESSION_STALE_SECONDS, SESSION_PRUNE_BATCH, now)
+        # Nothing reads the markers unless the sessions widget is on.
+        if not _sessions_widget_on(config):
+            return
+        session_id = _get_session_id(stdin_ctx)
+        if session_id is None:
+            return
         sessions_dir = _get_sessions_dir()
         five = usage.get("five_hour", {}) if usage else {}
         seven = usage.get("seven_day", {}) if usage else {}
@@ -6128,7 +7526,7 @@ def _update_session_state(usage, stdin_ctx):
             "pid": session_id,
             "session_pct": five.get("utilization") or 0,
             "weekly_pct": seven.get("utilization") or 0,
-            "timestamp": time.time(),
+            "timestamp": now,
             "model": (stdin_ctx or {}).get("model_name", ""),
         }
         _atomic_json_write(sessions_dir / f"{session_id}.json", state, indent=None)
@@ -6136,32 +7534,50 @@ def _update_session_state(usage, stdin_ctx):
         pass
 
 
-def _get_active_sessions():
+def _get_active_sessions(session_id=None):
+    """The other windows' markers still fresh. *session_id* is this window's."""
     sessions_dir = _get_sessions_dir()
-    my_pid = _get_session_id()
+    if session_id is None:
+        session_id = _get_session_id()
+    mine = {str(os.getppid())}
+    if session_id is not None:
+        mine.add(str(session_id))
     now = time.time()
     active = []
+    removed = 0
+
+    def remove(entry):
+        nonlocal removed
+        try:
+            os.unlink(entry.path)
+        except OSError:
+            pass
+        removed += 1
+
     try:
-        for entry in sessions_dir.iterdir():
-            if not entry.name.endswith(".json"):
-                continue
-            try:
-                with open(entry, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if now - data.get("timestamp", 0) > SESSION_STALE_SECONDS:
-                    try:
-                        entry.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+        with os.scandir(sessions_dir) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
                     continue
-                if data.get("pid") == my_pid:
+                try:
+                    # File age first: a stale marker need not be opened to be
+                    # skipped, and a backlog is cleared a batch at a time.
+                    if now - entry.stat().st_mtime > SESSION_STALE_SECONDS:
+                        if removed < SESSION_PRUNE_BATCH:
+                            remove(entry)
+                        continue
+                    with open(entry.path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, ValueError, RecursionError):
+                    remove(entry)
+                    continue
+                stamp = _cache_seconds(data.get("timestamp")) if isinstance(data, dict) else None
+                if stamp is None or now - stamp > SESSION_STALE_SECONDS:
+                    remove(entry)
+                    continue
+                if str(data.get("pid")) in mine:
                     continue
                 active.append(data)
-            except (json.JSONDecodeError, OSError):
-                try:
-                    entry.unlink(missing_ok=True)
-                except OSError:
-                    pass
     except OSError:
         pass
     return active
@@ -6297,33 +7713,34 @@ def _cmd_pomodoro_inner(action, minutes=None):
 # ---------------------------------------------------------------------------
 
 def _check_git_drift():
-    state_dir = get_state_dir()
-    drift_cache = state_dir / GIT_DRIFT_FILE
+    key = _git_repo_key()
+    entry = _read_git_cache(GIT_DRIFT_FILE, key)
+    behind, ahead = _cache_count(entry.get("behind")), _cache_count(entry.get("ahead"))
+    if _git_cache_fresh(entry, GIT_DRIFT_CACHE_TTL):
+        return (behind, ahead)
+    # Record the attempt BEFORE git runs. A repaint cancelled mid-git leaves
+    # this stamp, so the next one shows the last answer instead of running the
+    # same slow git again (and being cancelled again).
+    _write_git_cache(GIT_DRIFT_FILE, key, {
+        "timestamp": _cache_stamp(entry, "timestamp"), "attempted": time.time(),
+        "behind": behind, "ahead": ahead})
+    new_behind = new_ahead = 0
     try:
-        with open(drift_cache, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if time.time() - cached.get("timestamp", 0) < GIT_DRIFT_CACHE_TTL:
-            return (cached.get("behind", 0), cached.get("ahead", 0))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    behind = ahead = 0
-    try:
-        result = subprocess.run([_GIT_PATH, "rev-list", "--count", "HEAD..@{upstream}"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            behind = int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        pass
-    try:
-        result = subprocess.run([_GIT_PATH, "rev-list", "--count", "@{upstream}..HEAD"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            ahead = int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        pass
-    try:
-        _atomic_json_write(drift_cache, {"timestamp": time.time(), "behind": behind, "ahead": ahead}, indent=None)
-    except OSError:
-        pass
-    return (behind, ahead)
+        # One call: "<commits only on HEAD> <commits only on upstream>".
+        result = subprocess.run(
+            [_GIT_PATH, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            capture_output=True, text=True, timeout=GIT_RENDER_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return (behind, ahead)  # no answer in time: keep the last, retry after the TTL
+    if result.returncode == 0:  # a non-zero exit means no upstream: nothing to drift from
+        try:
+            left, right = result.stdout.split()
+            new_ahead, new_behind = int(left), int(right)
+        except ValueError:
+            pass
+    _write_git_cache(GIT_DRIFT_FILE, key, {
+        "timestamp": time.time(), "behind": new_behind, "ahead": new_ahead})
+    return (new_behind, new_ahead)
 
 
 def _render_git_drift():
@@ -6346,26 +7763,24 @@ def _render_git_drift():
 # ---------------------------------------------------------------------------
 
 def _count_changed_files():
-    state_dir = get_state_dir()
-    files_cache = state_dir / FILES_CHANGED_FILE
-    try:
-        with open(files_cache, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if time.time() - cached.get("timestamp", 0) < FILES_CHANGED_CACHE_TTL:
-            return cached.get("count", 0)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    key = _git_repo_key()
+    entry = _read_git_cache(FILES_CHANGED_FILE, key)
+    last = _cache_count(entry.get("count"))
+    if _git_cache_fresh(entry, FILES_CHANGED_CACHE_TTL):
+        return last
+    # Record the attempt before git runs (see _check_git_drift).
+    _write_git_cache(FILES_CHANGED_FILE, key, {
+        "timestamp": _cache_stamp(entry, "timestamp"), "attempted": time.time(),
+        "count": last})
     count = 0
     try:
-        result = subprocess.run([_GIT_PATH, "diff", "--name-only"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+        result = subprocess.run([_GIT_PATH, "diff", "--name-only"], capture_output=True,
+                                text=True, timeout=GIT_RENDER_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
-        pass
-    try:
-        _atomic_json_write(files_cache, {"timestamp": time.time(), "count": count}, indent=None)
-    except OSError:
-        pass
+        return last  # no answer in time: keep the last count, retry after the TTL
+    if result.returncode == 0:
+        count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+    _write_git_cache(FILES_CHANGED_FILE, key, {"timestamp": time.time(), "count": count})
     return count
 
 
@@ -6418,36 +7833,51 @@ def _format_spend_amount(usd, currency, rate, code):
     return f"{symbol}{value:.2f}"
 
 
-def _shrink_bar_width(bw, config, show, usage, stdin_ctx):
-    """Narrow *bw* so every bar section fits the width budget (--bar-size auto).
+# (terminal width, row budget, bar width) of the last --bar-size auto fit. The
+# provider rows are drawn after the main line in the same run and follow its
+# bars; it is only trusted for the same width and budget.
+_SHRINK_MEMO = None
+
+
+def _shrink_bar_width(bw, config, show, usage, stdin_ctx, plan="", cache_age=None):
+    """Narrow *bw* so every row of the line fits the width budget (--bar-size auto).
+
+    The non-bar width is measured, not estimated: the line is drawn at two
+    named bar sizes and the difference gives the number of bars on each row, so
+    whatever else is on it (cost, lines, model, effort, branch, the stale label,
+    a plan name) is counted at its real width. Bars never go below two
+    characters; if the line is still too wide then, the fit drops whole widgets
+    with a marker.
 
     _detect_terminal_width tries the COLUMNS Claude Code passes, real TTYs,
     /dev/tty, then /proc on Linux. When all fail the width is unknown and the
     bars keep their size: the host clips at its own edge.
     """
+    global _SHRINK_MEMO
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
+        max_visible = _width_budget(config)
+        if not max_visible:
             return bw
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        effective_width = (term_width * max_width_pct) // 100
-        # Count the bar sections that will actually draw a bar (session,
-        # weekly, extra, context) so the width budget is split correctly.
-        num_bars = sum(1 for k in ("session", "weekly")
-                       if show.get(k, True) and show.get(f"{k}_bar", True))
-        extra = usage.get("extra_usage")
-        if extra and extra.get("is_enabled") and not config.get("extra_hidden", False):
-            num_bars += 1
-        if stdin_ctx and show.get("context", True) and show.get("context_bar", True):
-            num_bars += 1
-        # Per-bar overhead: label + space + space + pct + timer ≈ 18 chars
-        # Separators between sections: " | " = 3 chars each
-        # Trailing fixed items (model name, update/plan indicators) ≈ 15 chars
-        overhead = num_bars * 18 + max(num_bars - 1, 0) * 3 + 15
-        max_bar_width = max(2, (effective_width - overhead) // max(num_bars, 1))
-        return min(bw, max_bar_width)
+        small, medium = BAR_SIZES["small"], BAR_SIZES["small-medium"]
+        probes = []
+        for size in ("small", "small-medium"):
+            # A named size never shrinks, so the probe cannot recurse. Animation
+            # is off so the probe does not touch the saved animation state.
+            probe = dict(config, bar_size=size, animate="off")
+            probes.append(build_status_line(usage, plan, probe, stdin_ctx,
+                                            cache_age).split("\n"))
+        best = bw
+        if len(probes[0]) == len(probes[1]):
+            for row_small, row_medium in zip(*probes):
+                width_small = _visible_len(row_small)
+                bars = (_visible_len(row_medium) - width_small) // (medium - small)
+                if bars <= 0:
+                    continue
+                fixed = width_small - bars * small
+                best = min(best, (max_visible - fixed) // bars)
+        result = max(2, min(bw, best))
+        _SHRINK_MEMO = (_detect_terminal_width(), max_visible, result)
+        return result
     except Exception:
         return bw  # if width detection fails, keep the configured size
 
@@ -6489,7 +7919,7 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
     # on a window too narrow for the line, the line is truncated (--max-width)
     # or wrapped (--wrap auto) instead, so "large" always means large.
     if fit_bars:
-        bw = _shrink_bar_width(bw, config, show, usage, stdin_ctx)
+        bw = _shrink_bar_width(bw, config, show, usage, stdin_ctx, plan, cache_age)
 
     # list of ((priority, widget_id), text) tuples — sorted before joining.
     # The key carries the widget id so the two-line splitter can tell which
@@ -6653,37 +8083,39 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
             parts.append((_p, f"{_label} {bar} {pct:.0f}%{pace_str}"))
 
     # Extra usage (bonus/gifted credits)
-    extra = usage.get("extra_usage")
+    extra = _extra_usage_view(usage.get("extra_usage"))
     extra_enabled_by_user = show.get("extra", False)
     extra_explicitly_hidden = config.get("extra_hidden", False)
-    extra_has_credits = extra and extra.get("is_enabled") and (extra.get("monthly_limit") or 0) > 0
+    extra_has_credits = extra is not None and extra["limit"] > 0
     if extra_enabled_by_user or (extra_has_credits and not extra_explicitly_hidden):
         _e = _pri("extra")
         currency = _sanitize(config.get("currency", "$"))[:5]
-        if extra and extra.get("is_enabled"):
-            pct = min(extra.get("utilization") or 0, 100)
-            used = (extra.get("used_credits") or 0) / 100
-            limit = (extra.get("monthly_limit") or 0) / 100
+        if extra is not None:
+            pct = extra["pct"]
+            # Converted like the session cost beside it, and marked when the
+            # figure is overdue for a refresh (F17).
+            currency, used, limit = _extra_money(extra, currency)
+            age_tag = _extra_age_tag(stdin_ctx, config)
             extra_display = config.get("extra_display", "auto")
             if extra_display == "auto":
                 extra_display = "amount" if limit == 0 else "full"
             if extra_display == "amount":
                 if layout == "compact":
-                    parts.append((_e, f"E {currency}{used:.2f}"))
+                    parts.append((_e, f"E {currency}{used:.2f}{age_tag}"))
                 elif layout == "minimal":
-                    parts.append((_e, f"{currency}{used:.2f}"))
+                    parts.append((_e, f"{currency}{used:.2f}{age_tag}"))
                 else:
-                    parts.append((_e, f"Extra {currency}{used:.2f}"))
+                    parts.append((_e, f"Extra {currency}{used:.2f}{age_tag}"))
             else:
                 bar = make_bar(pct, theme, plain=bar_plain, width=bw, bar_style=bstyle)
                 if layout == "compact":
-                    parts.append((_e, f"E {bar} {currency}{used:.2f}/{currency}{limit:.2f}"))
+                    parts.append((_e, f"E {bar} {currency}{used:.2f}/{currency}{limit:.2f}{age_tag}"))
                 elif layout == "minimal":
-                    parts.append((_e, f"{bar} {currency}{used:.2f}"))
+                    parts.append((_e, f"{bar} {currency}{used:.2f}{age_tag}"))
                 elif layout == "percent-first":
-                    parts.append((_e, f"{currency}{used:.2f} {bar}"))
+                    parts.append((_e, f"{currency}{used:.2f} {bar}{age_tag}"))
                 else:
-                    parts.append((_e, f"Extra {bar} {currency}{used:.2f}/{currency}{limit:.2f}"))
+                    parts.append((_e, f"Extra {bar} {currency}{used:.2f}/{currency}{limit:.2f}{age_tag}"))
         elif extra_enabled_by_user:
             if layout == "minimal":
                 parts.append((_e, "n/a"))
@@ -6953,19 +8385,34 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
 
     # --- Hook-based live features ---
     hook_state = _read_hook_state()
+    # The heartbeat and the last tool describe one session. hook_state.json is a
+    # snapshot of whichever window's hook fired last, so a window reads its own
+    # counters (F40). Before its first tool call it has none, and the snapshot
+    # of another session is not shown in its place.
+    window_id = (stdin_ctx or {}).get("session_id")
+    if window_id:
+        own_beat = _read_session_heartbeat(window_id)
+        if own_beat:
+            hook_state = own_beat
+        elif isinstance(hook_state, dict) and hook_state.get("session_id") != _safe_path_id(window_id):
+            hook_state = None
     hook_fresh = _is_hook_state_fresh(hook_state)
 
     if show.get("heartbeat", False) and hook_fresh:
-        tool_count = hook_state.get("tool_count", 0)
-        session_start = hook_state.get("session_start", time.time())
-        elapsed = time.time() - session_start
+        # hook_state.json is untrusted: a count or start time that is text, a
+        # list or NaN must not blank the bar. Unusable values read as 0 tools
+        # and 0 s elapsed.
+        tool_count = _usage_number(hook_state.get("tool_count", 0))
+        tool_count = int(tool_count) if tool_count is not None else 0
+        session_start = _cache_seconds(hook_state.get("session_start")) or time.time()
+        elapsed = max(0.0, time.time() - session_start)
         frame_idx = int(time.time() * 4) % len(HEARTBEAT_SPINNER)
         spinner = HEARTBEAT_SPINNER[frame_idx]
         parts.append((_pri("heartbeat"), f"[{spinner}] {tool_count} tools {_format_elapsed(elapsed)}"))
 
     if show.get("last_tool", False) and hook_fresh:
         last_tool = hook_state.get("last_tool", "")
-        if last_tool:
+        if last_tool and isinstance(last_tool, str):
             parts.append((_pri("last_tool"), f"Last: {last_tool[:12]}"))
 
     if show.get("branch", True):
@@ -7037,13 +8484,17 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
 
     # Sort widgets by priority, then join
     parts.sort(key=lambda x: x[0])
-    line = _join_parts(parts, config)
 
-    # Staleness indicator
+    # Staleness indicator. It qualifies the numbers, so it sits right after the
+    # first (highest-priority) widget rather than at the end of the line, where
+    # a line that is too wide cuts it off first and old figures look current.
+    staleness_str = ""
     if show.get("staleness", True) and cache_age is not None:
         staleness_str = _format_staleness(cache_age)
-        if staleness_str:
-            line += staleness_str
+    if staleness_str and parts:
+        parts[0] = (parts[0][0], parts[0][1] + staleness_str)
+        staleness_str = ""
+    line = _join_parts(parts, config) + staleness_str
 
     # Animation: on = rainbow always moving, off = static theme colours
     if use_rainbow:
@@ -7161,126 +8612,258 @@ def _osc8(url, label):
     return f"{OSC8_START}{url}\a{label}{OSC8_END}"
 
 
-def _visible_len(text):
-    """Return the number of visible (non-ANSI-escape) characters in *text*."""
-    count = 0
-    i = 0
-    while i < len(text):
+try:
+    import unicodedata as _unicodedata
+except ImportError:  # pragma: no cover - a stripped-down Python
+    _unicodedata = None
+
+
+def _cell_width(ch):
+    """Terminal columns one character occupies: 0, 1 or 2.
+
+    Combining marks, format characters and the emoji selector / joiner take no
+    column of their own; East Asian wide and fullwidth characters (CJK, most
+    emoji such as the lightning bolt, flame and cup this script prints) take
+    two. Counting code points instead made a CJK name overflow its row by half
+    and over-counted every zero-width character.
+    """
+    cp = ord(ch)
+    if cp < 0xAD or _unicodedata is None:
+        return 1
+    if cp in (0xFE0F, 0x200D):
+        return 0
+    if _unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if _unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _scan(text):
+    """Yield ``(start, end, width, is_escape)`` for each escape sequence and
+    each visible character of *text*. Escape sequences have width 0."""
+    i, n = 0, len(text)
+    while i < n:
         if text[i] == "\033":
-            i = _skip_escape(text, i)
+            j = _skip_escape(text, i)
+            yield i, j, 0, True
+            i = j
+        else:
+            yield i, i + 1, _cell_width(text[i]), False
+            i += 1
+
+
+def _visible_len(text):
+    """Return the width in terminal columns of *text*, ignoring ANSI escapes."""
+    return sum(w for _s, _e, w, esc in _scan(text) if not esc)
+
+
+_ELLIPSIS = "\u2026"  # horizontal ellipsis
+_SEPARATOR = " | "
+# --wrap auto packs as many rows as the line needs, up to this many. The last
+# allowed row drops whole widgets with a trailing marker if it still overflows.
+WRAP_MAX_ROWS = 4
+
+
+def _width_budget(config):
+    """Columns one row may use: the terminal width times ``max_width``.
+
+    Returns None when the width is unknown; Claude Code always passes COLUMNS
+    and any other host clips at its own edge, so the line is then left alone.
+    """
+    term_width = _detect_terminal_width()
+    if not term_width:
+        return None
+    max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
+    if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
+        max_width_pct = DEFAULT_MAX_WIDTH_PCT
+    return (term_width * max_width_pct) // 100
+
+
+def _clip_cells(text, width, force=False):
+    """Cut *text* to *width* columns, ending in a dim ellipsis when it cut.
+
+    Never splits a wide character, closes a hyperlink it cut through (or the
+    terminal treats every following line as part of the link target) and
+    resets colour before the marker. Text that already fits comes back
+    unchanged unless *force* asks for the marker regardless.
+    """
+    if width <= 0:
+        return ""
+    if not force and _visible_len(text) <= width:
+        return text
+    keep, used, cut, in_link = width - 1, 0, len(text), False
+    for start, end, w, esc in _scan(text):
+        if esc:
+            if text.startswith(OSC8_START, start):
+                in_link = text[start:end] != OSC8_END
             continue
-        count += 1
-        i += 1
-    return count
+        if used + w > keep:
+            cut = start
+            break
+        used += w
+    return (text[:cut] + (OSC8_END if in_link else "") + RESET
+            + DIM + _ELLIPSIS + RESET)
 
 
-def _truncate_line(line, config):
-    """Clip visible characters to effective terminal width.
+def _segment_spans(line, sep=_SEPARATOR):
+    """Split *line* into widgets at its visible ``" | "`` separators.
+
+    Returns ``(start, end, width, prefix)`` per widget: raw offsets into
+    *line*, its width in columns, and the colour codes in force where it starts
+    (so a widget moved to a new row keeps its colour). Splitting on the
+    visible text rather than the raw string is what lets rainbow colouring,
+    which wraps every character (separators too) in its own escape codes, wrap
+    and truncate like any other theme.
+    """
+    chars, states, active = [], [], ""
+    for start, end, width, esc in _scan(line):
+        if esc:
+            seq = line[start:end]
+            if seq.startswith("\033[") and seq.endswith("m"):
+                if seq in ("\033[0m", "\033[m"):
+                    active = ""
+                elif len(active) > 512:
+                    active = seq
+                else:
+                    active += seq
+            continue
+        chars.append((start, end, line[start], width))
+        states.append(active)
+    text = "".join(c[2] for c in chars)
+    spans, first, seg_start, prefix = [], 0, 0, ""
+    pos = text.find(sep)
+    while pos != -1:
+        spans.append((seg_start, chars[pos][0],
+                      sum(c[3] for c in chars[first:pos]), prefix))
+        last = pos + len(sep) - 1
+        seg_start, prefix, first = chars[last][1], states[last], pos + len(sep)
+        pos = text.find(sep, first)
+    spans.append((seg_start, len(line), sum(c[3] for c in chars[first:]), prefix))
+    return spans
+
+
+def _spans_width(spans):
+    return sum(s[2] for s in spans) + len(_SEPARATOR) * (len(spans) - 1)
+
+
+def _fit_row(row, max_visible, suffix=""):
+    """Fit one row, plus a reserved *suffix* (the update badges), into
+    *max_visible* columns.
+
+    The suffix keeps its width: widgets are what give way. Whole widgets are
+    dropped from the tail (the lowest priority, since widgets are sorted by it)
+    and a dim ellipsis marks the cut; a slice of a bar or word is shown only
+    when even the first widget is wider than the row.
+    """
+    sfx = _visible_len(suffix)
+    budget = max_visible - sfx
+    if budget < 1:
+        return _clip_cells(row + suffix, max_visible)
+    if _visible_len(row) <= budget:
+        return row + suffix
+    spans = _segment_spans(row)
+    marker = 1 + len(_ELLIPSIS)                       # a space and the ellipsis
+    for keep in range(len(spans) - 1, 0, -1):
+        if _spans_width(spans[:keep]) + marker <= budget:
+            return (row[:spans[keep - 1][1]] + RESET + " " + DIM + _ELLIPSIS
+                    + RESET + suffix)
+    return _clip_cells(row[:spans[0][1]], budget, force=len(spans) > 1) + suffix
+
+
+def _truncate_line(line, config, suffix=""):
+    """Fit one row to the effective terminal width, marking what was dropped.
 
     Applied as the very last step before output so the line never spills
     into Claude Code's side notification area or wraps to the next line.
-    When the width is unknown the line is left alone: Claude Code always
-    passes COLUMNS, and any other host clips at its own edge.
+    *suffix* is appended after fitting and keeps its width (update badges).
+    When the width is unknown the line is left alone.
     """
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
-            return line
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        max_visible = (term_width * max_width_pct) // 100
-        visible_count = 0
-        cut = None
-        i = 0
-        in_link = False
-        cut_in_link = False
-        while i < len(line):
-            if line[i] == "\033":
-                nxt = _skip_escape(line, i)
-                # Track hyperlink nesting so a cut inside one can be closed.
-                if line.startswith(OSC8_START, i):
-                    in_link = line[i:nxt] != OSC8_END
-                i = nxt
-                continue
-            visible_count += 1
-            if visible_count > max_visible:
-                cut = i
-                cut_in_link = in_link
-                break
-            i += 1
-        if cut is not None:
-            # Close a hyperlink we cut through, or the terminal treats every
-            # following line as part of the link target.
-            line = line[:cut] + (OSC8_END if cut_in_link else "") + RESET
+        max_visible = _width_budget(config)
+        if max_visible is None:
+            return line + suffix
+        return _fit_row(line, max_visible, suffix)
     except Exception:
-        pass
-    return line
+        return line + suffix
 
 
-def _wrap_line(line, config):
+def _wrap_line(line, config, suffix=""):
     """Wrap at ' | ' separators when the line would overflow the terminal.
 
-    Returns one or two lines joined by newline.  If the line fits, it is
-    returned unchanged (no trailing newline added).  When wrapping is needed,
-    segments are distributed across two lines so that each stays within the
-    effective terminal width. An unknown width leaves the line alone.
+    If the line fits, it is returned unchanged. Otherwise whole widgets are
+    packed greedily into as many rows as needed, up to WRAP_MAX_ROWS; only the
+    last allowed row can still overflow, and it drops widgets with a trailing
+    marker. *suffix* (update badges) stays on the last row with its width
+    reserved. An unknown width leaves the line alone.
     """
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
-            return line
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        max_visible = (term_width * max_width_pct) // 100
+        max_visible = _width_budget(config)
+        if max_visible is None:
+            return line + suffix
+        sfx = _visible_len(suffix)
+        if _visible_len(line) + sfx <= max_visible:
+            return line + suffix
 
-        if _visible_len(line) <= max_visible:
-            return line
+        spans = _segment_spans(line)
+        if len(spans) < 2:
+            return _truncate_line(line, config, suffix)
 
-        # Split on the rendered separator
-        segments = line.split(" | ")
-        if len(segments) < 2:
-            return _truncate_line(line, config)
-
-        # Greedily fill line 1, then put the rest on line 2
-        line1_parts = [segments[0]]
-        rest = segments[1:]
-        for seg in rest:
-            candidate = " | ".join(line1_parts + [seg])
-            if _visible_len(candidate) <= max_visible:
-                line1_parts.append(seg)
+        rows, cur, cur_w = [], [], 0
+        for n, span in enumerate(spans):
+            width = span[2] + (sfx if n == len(spans) - 1 else 0)
+            if not cur:
+                cur, cur_w = [span], width
+            elif (cur_w + len(_SEPARATOR) + width > max_visible
+                    and len(rows) < WRAP_MAX_ROWS - 1):
+                rows.append(cur)
+                cur, cur_w = [span], width
             else:
-                break
-        used = len(line1_parts)
-        line2_parts = segments[used:]
+                cur.append(span)
+                cur_w += len(_SEPARATOR) + width
+        rows.append(cur)
 
-        if not line2_parts:
-            return _truncate_line(line, config)
+        def text(group):
+            return group[0][3] + line[group[0][0]:group[-1][1]]
 
-        row1 = " | ".join(line1_parts)
-        row2 = " | ".join(line2_parts)
-        # Truncate each row individually as a safety net
-        row1 = _truncate_line(row1, config)
-        row2 = _truncate_line(row2, config)
-        return row1 + RESET + "\n" + row2
+        out = [_fit_row(text(g), max_visible) + RESET for g in rows[:-1]]
+        out.append(_fit_row(text(rows[-1]), max_visible, suffix))
+        return "\n".join(out)
     except Exception:
-        return _truncate_line(line, config)
+        return _truncate_line(line, config, suffix)
 
 
-def _fit_line(line, config):
+def _fit_line(line, config, suffix=""):
     """Apply wrap or truncate depending on the user's --wrap setting.
 
     The line may already be two rows when ``line1_widgets`` / ``line2_widgets``
     are configured. Each row is fitted independently — measuring the joined
     string would count the newline as a visible column and truncate the rows
-    against a shared budget they don't actually share.
+    against a shared budget they don't actually share. *suffix* goes after the
+    last row.
     """
     if "\n" in line:
-        return "\n".join(_fit_line(row, config) for row in line.split("\n"))
+        rows = line.split("\n")
+        last = len(rows) - 1
+        return "\n".join(_fit_line(row, config, suffix if n == last else "")
+                         for n, row in enumerate(rows))
     if config.get("wrap") == "auto":
-        return _wrap_line(line, config)
-    return _truncate_line(line, config)
+        return _wrap_line(line, config, suffix)
+    return _truncate_line(line, config, suffix)
+
+
+def _finish_line(line, config, stdin_ctx=None):
+    """Add the update badges and provider rows to *line*, then fit every row.
+
+    The badges used to be appended before fitting, so a line that was too wide
+    lost them first and an update went unseen. They are now reserved width on
+    the last main row, and widgets give way instead. Provider rows follow the
+    main rows and are fitted on their own.
+    """
+    badges = append_claude_update_indicator(
+        append_update_indicator("", config), config, stdin_ctx)
+    main_rows = line.count("\n") + 1
+    rows = _append_provider_rows(line, config).split("\n")
+    fitted = _fit_line("\n".join(rows[:main_rows]), config, suffix=badges)
+    return "\n".join([fitted] + [_fit_line(row, config) for row in rows[main_rows:]])
 
 
 # ---------------------------------------------------------------------------
@@ -7322,7 +8905,7 @@ def hook_subagent(event):
     raw = ""
     try:
         if not sys.stdin.isatty():
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
     except (OSError, ValueError):
         pass
     data = {}
@@ -7940,12 +9523,16 @@ def _provider_bar_width(config, label_width):
         if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
             max_width_pct = DEFAULT_MAX_WIDTH_PCT
         effective = (term_width * max_width_pct) // 100
-        show = config.get("show", DEFAULT_SHOW)
-        # Same estimate build_status_line makes for the main line (session,
-        # weekly and the context bar a live session always has).
-        main_bars = sum(1 for k in ("session", "weekly", "context") if show.get(k, True)) or 1
-        main_overhead = main_bars * 18 + max(main_bars - 1, 0) * 3 + 15
-        main_max = max(2, (effective - main_overhead) // main_bars)
+        memo = _SHRINK_MEMO
+        if memo and memo[0] == term_width and memo[1] == effective:
+            # The main line was just fitted at this width: follow its bars.
+            main_max = memo[2]
+        else:
+            show = config.get("show", DEFAULT_SHOW)
+            # No measured main line in this run (a preview, say): estimate.
+            main_bars = sum(1 for k in ("session", "weekly", "context") if show.get(k, True)) or 1
+            main_overhead = main_bars * 18 + max(main_bars - 1, 0) * 3 + 15
+            main_max = max(2, (effective - main_overhead) // main_bars)
         row_max = max(2, (effective - (label_width + 2 * 18 + 3)) // 2)
         bw = max(2, min(bw, main_max, row_max))
     except Exception:
@@ -8228,18 +9815,11 @@ def _render_subagent_row(task, config, columns=None):
 
 
 def _clip_visible(text, width):
-    """Clip to *width* visible columns, keeping escapes intact and resetting."""
-    count = 0
-    i = 0
-    while i < len(text):
-        if text[i] == "":
-            i = _skip_escape(text, i)
-            continue
-        count += 1
-        if count > width:
-            return text[:i] + RESET
-        i += 1
-    return text
+    """Clip to *width* terminal columns, ending in a dim ellipsis when it cut.
+
+    Keeps escapes intact, resets colour and never splits a wide character.
+    """
+    return _clip_cells(text, width)
 
 
 def cmd_subagent_status_line():
@@ -8252,7 +9832,7 @@ def cmd_subagent_status_line():
     panel — which is why the whole body is defensive.
     """
     try:
-        raw = sys.stdin.read(1_000_000) if not sys.stdin.isatty() else ""
+        raw = _read_stdin_text(1_000_000) if not sys.stdin.isatty() else ""
     except (OSError, ValueError):
         return
     if not raw or not raw.strip():
@@ -8296,35 +9876,170 @@ def cmd_subagent_status_line():
 # ---------------------------------------------------------------------------
 
 def _win_portable_path(path_str):
-    """Convert a Windows absolute path to use $HOME where possible.
+    """Return a Windows absolute path spelled with forward slashes.
 
-    Claude Code v2.1.47+ invokes statusLine commands via a shell that
-    does not expand backslash paths correctly on Windows.  Using forward
-    slashes and ``$HOME`` instead of the literal home directory avoids
-    the issue.  See: https://github.com/anthropics/claude-code/issues/27057
+    Claude Code v2.1.47+ invokes statusLine commands via Git Bash, which
+    treats an unquoted backslash as an escape and drops it from the path.
+    Forward slashes survive every shell. See:
+    https://github.com/anthropics/claude-code/issues/27057
+
+    The path stays literal. It used to be rewritten to ``$HOME/...``, but
+    ``$HOME`` is whatever the *shell* says: Git Bash reads the HOME variable
+    (a corporate home drive, or one set for Emacs or ssh), and Python's
+    ``Path.home()`` ignores it, so the command pointed at a folder the
+    installer never wrote to. PowerShell needs ``$env:HOME`` spelled
+    differently anyway.
     """
     if sys.platform != "win32":
         return path_str
     path_str = str(path_str).replace("\\", "/")
-    home = str(Path.home()).replace("\\", "/")
-    if path_str.startswith(home + "/") or path_str == home:
-        path_str = "$HOME" + path_str[len(home):]
+    # Extended-length prefix (``\\?\C:\x`` / ``\\?\UNC\srv\share``) that
+    # Path.resolve() can return: no shell understands it.
+    if path_str.startswith("//?/UNC/"):
+        path_str = "//" + path_str[len("//?/UNC/"):]
+    elif path_str.startswith("//?/") and len(path_str) > 5 and path_str[5] == ":":
+        path_str = path_str[len("//?/"):]
     return path_str
 
 
-def _get_python_cmd():
-    """Return the Python command to use in hooks/settings.
+def _windows_py_launcher():
+    """``py -3`` when the Python launcher is installed and really runs Python 3.8+.
 
-    Uses sys.executable to ensure we match whatever Python is running this script.
-    On Linux this is typically 'python3', on Windows 'python'.
+    The launcher is the one Python entry point that survives upgrades: a
+    python.org install lives in a versioned folder (``Python313``), and the
+    Python install manager in ``pythoncore-3.13-64``, so a command that names
+    one of those blanks the status bar the day the old version is removed.
+    ``py`` also exists as a Microsoft Store alias that does nothing, so it is
+    only used once it has actually run Python.
     """
-    exe = _win_portable_path(sys.executable)
-    # Quote a path with spaces, and any path under $HOME: the shell expands
-    # $HOME at run time, and a home folder like "C:/Users/First Last" would
-    # otherwise split the command. Double quotes keep the expansion.
-    if " " in exe or "$HOME" in exe:
+    if sys.platform != "win32":
+        return None
+    launcher = shutil.which("py")
+    if not launcher:
+        return None
+    try:
+        result = subprocess.run(
+            [launcher, "-3", "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "py -3" if result.returncode == 0 else None
+
+
+def _windows_short_path(path):
+    """The 8.3 short form of an existing Windows path (``C:/PROGRA~1/...``), or None.
+
+    A short path has no space, so it needs no quotes and runs unchanged in
+    Git Bash and PowerShell. Volumes with 8.3 names switched off hand the long
+    name back, and the caller then falls back to quoting.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+    except (AttributeError, ImportError, OSError, ValueError):
+        return None
+    if not length or length >= len(buf):
+        return None
+    return buf.value.replace("\\", "/")
+
+
+def _git_bash_available(settings=None):
+    """True when Claude Code can run shell commands through Git Bash on Windows.
+
+    Claude Code runs a status line or hook command through Git Bash when it
+    finds it and through PowerShell when it does not, and the ``statusLine``
+    setting has no field to choose. It looks at ``CLAUDE_CODE_GIT_BASH_PATH``
+    (environment or the ``env`` block of settings.json), then the usual Git
+    for Windows locations. WSL's ``System32\\bash.exe`` is not Git Bash.
+    """
+    candidates = []
+    configured = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if not configured and isinstance(settings, dict) and isinstance(settings.get("env"), dict):
+        configured = settings["env"].get("CLAUDE_CODE_GIT_BASH_PATH")
+    if configured and isinstance(configured, str):
+        candidates.append(Path(configured))
+    for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = os.environ.get(var)
+        if base:
+            candidates.append(Path(base) / "Git" / "bin" / "bash.exe")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Programs" / "Git" / "bin" / "bash.exe")
+    git = shutil.which("git")
+    if git:
+        try:
+            git_dir = Path(git).resolve().parent
+        except (OSError, RuntimeError):
+            git_dir = Path(git).parent
+        # Git\cmd\git.exe, Git\bin\git.exe and Git\mingw64\bin\git.exe
+        candidates.append(git_dir.parent / "bin" / "bash.exe")
+        candidates.append(git_dir.parent.parent / "bin" / "bash.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _get_python_cmd():
+    """Return the interpreter part of the command written to settings.json.
+
+    On Windows the result is, in order of preference: ``py -3`` (the launcher
+    survives Python upgrades and venv removal), the interpreter's own
+    forward-slash path (a venv is swapped for the Python underneath it), its
+    8.3 short path when the long one has a space, and as a last resort the
+    quoted path. Everything but the quoted form is one plain word that Git Bash
+    and both PowerShells read the same way; ``_pulse_command`` deals with the
+    quoted one. Elsewhere it is ``sys.executable``, quoted if it has a space.
+    """
+    if sys.platform == "win32":
+        launcher = _windows_py_launcher()
+        if launcher:
+            return launcher
+        exe = sys.executable
+        if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+            exe = getattr(sys, "_base_executable", None) or exe
+        portable = _win_portable_path(exe)
+        if _SHELL_NEUTRAL_WORD.fullmatch(portable):
+            return portable
+        short = _windows_short_path(exe)
+        if short and _SHELL_NEUTRAL_WORD.fullmatch(short):
+            return short
+        return f'"{portable}"'
+    exe = sys.executable
+    if " " in exe:
         return f'"{exe}"'
     return exe
+
+
+def _pulse_command(python_cmd, script_path, flag=None, settings=None):
+    """Build the full status-line or hook command from ``_get_python_cmd()``.
+
+    Claude Code runs it through Git Bash, or through PowerShell when Git Bash
+    is absent, so on Windows the text must parse in both: a plain interpreter
+    word first, then the script path in single quotes. A quoted interpreter
+    cannot do that. Bash reads ``& "..."`` as "run in the background" and
+    PowerShell reads a line that starts with a quoted string as text to print,
+    so that one case gets the form of whichever shell will really run it.
+    """
+    tail = f" {flag}" if flag else ""
+    if sys.platform != "win32":
+        return f'{python_cmd} "{script_path}"{tail}'
+    script = str(script_path)
+    quoted_script = f'"{script}"' if "'" in script else f"'{script}'"
+    return f"{_shell_python(python_cmd, settings)} {quoted_script}{tail}"
+
+
+def _shell_python(python_cmd, settings=None):
+    """``python_cmd`` as the shell that will run it needs it written."""
+    if sys.platform == "win32" and python_cmd.startswith('"') and not _git_bash_available(settings):
+        return "& " + python_cmd    # PowerShell's call operator
+    return python_cmd
 
 
 # Refresh cadences (seconds) for `statusLine.refreshInterval`, chosen by what
@@ -8439,24 +10154,38 @@ def install_status_line():
             print(f"Error: Cannot read {settings_path}: {e}", file=sys.stderr)
             return
 
-    # Status line command — use $HOME on Windows for Claude Code compat
-    status_line = {
-        "type": "command",
-        "command": f'{python_cmd} "{script_path}"',
-    }
+    # Status line command: forward-slash literal paths on Windows, written so
+    # that both Git Bash and PowerShell read it the same way.
+    status_command = _pulse_command(python_cmd, script_path, settings=settings)
+    existing = settings.get("statusLine")
+    if isinstance(existing, dict) and "claude_status.py" in str(existing.get("command", "")):
+        # Ours already: update what we own and keep the user's other keys
+        # (such as `padding`) through every reinstall and plugin re-point.
+        status_line = existing
+        status_line["type"] = "command"
+        status_line["command"] = status_command
+    else:
+        # Absent, or another tool's: ours replaces it whole, as it always did.
+        status_line = {
+            "type": "command",
+            "command": status_command,
+        }
     # Versions up to v3.1.0 wrote `"refresh": 150` here. Claude Code has no
     # such setting, so it was silently ignored and the timed repaint never
     # happened. The real key is `refreshInterval`, in seconds.
+    status_line.pop("refresh", None)
     interval = _desired_refresh_interval(load_config())
     if interval is not None:
         status_line["refreshInterval"] = interval
+    else:
+        status_line.pop("refreshInterval", None)
     settings["statusLine"] = status_line
 
     # Render the agent-panel rows too. Claude Code falls back to its own row
     # rendering for anything we don't emit, so this can only add information.
     settings["subagentStatusLine"] = {
         "type": "command",
-        "command": f'{python_cmd} "{script_path}" --subagent-status-line',
+        "command": _pulse_command(python_cmd, script_path, "--subagent-status-line", settings),
     }
 
     # No hooks installed here — static status bar by default.
@@ -8471,7 +10200,10 @@ def install_status_line():
     if backup:
         utf8_print(f"Previous settings.json kept at {backup}")
     utf8_print("Installed subagent status line (per-agent rows in the agent panel)")
-    utf8_print(f"Command: {python_cmd} \"{script_path}\"")
+    utf8_print(f"Command: {status_command}")
+    if status_command.startswith("& "):
+        utf8_print("Note: Git for Windows (Git Bash) was not found, so the command is written for PowerShell.")
+        utf8_print("      If you install Git for Windows later, run --setup again to rewrite it.")
     if interval is not None:
         utf8_print(f"Refresh: every {interval}s (plus Claude Code's own events)")
     else:
@@ -8507,6 +10239,97 @@ def install_pulse_command():
         return
 
     utf8_print(f"Installed /pulse command to {dest}")
+
+
+def _without_pulse_entries(entries):
+    """A settings hook-event list minus every entry that runs claude_status.py.
+
+    Covers today's hooks and the flat ``{"command": ...}`` shape of old
+    versions. Other tools' entries, and their commands inside a shared entry,
+    stay.
+    """
+    kept = []
+    for entry in entries:
+        if isinstance(entry, dict) and "claude_status.py" in str(entry.get("command", "")):
+            continue
+        entry = _without_pulse_command(entry, "")   # "" is in every command: any of ours
+        if entry is not None:
+            kept.append(entry)
+    return kept
+
+
+def cmd_uninstall():
+    """``--uninstall``: take usage-pulse out of Claude Code's configuration.
+
+    Removes, from the active config dir (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``),
+    our ``statusLine`` and ``subagentStatusLine``, every hook that runs this
+    script, and the ``/pulse`` command. Another tool's status line, hooks and
+    command are left alone. A copy of settings.json is kept first. Without
+    this, deleting the install folder leaves hooks that fail after every tool
+    call. The install folder itself, and usage-pulse's own config and cache,
+    are not deleted. Returns a process exit code.
+    """
+    config_dir = _claude_config_dir()
+    settings_path = config_dir / "settings.json"
+    settings, error = _load_settings_for_write(settings_path)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    removed = []
+    for key, label in (("statusLine", "status line"),
+                       ("subagentStatusLine", "agent-panel rows")):
+        block = settings.get(key)
+        if isinstance(block, dict) and "claude_status.py" in str(block.get("command", "")):
+            del settings[key]
+            removed.append(label)
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict):
+        hook_events = []
+        for event, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = _without_pulse_entries(entries)
+            if len(kept) == len(entries) and kept == entries:
+                continue
+            hook_events.append(event)
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+        if hook_events:
+            if not hooks:
+                del settings["hooks"]
+            removed.append("hooks (" + ", ".join(sorted(hook_events)) + ")")
+
+    if removed:
+        try:
+            _backup_settings(settings_path)
+            _atomic_json_write(settings_path, settings)
+        except OSError as e:
+            print(f"Error: could not write {settings_path}: {e}", file=sys.stderr)
+            return 1
+
+    command_file = config_dir / "commands" / "pulse.md"
+    try:
+        if command_file.is_file() and "claude_status.py" in command_file.read_text(encoding="utf-8", errors="replace"):
+            command_file.unlink()
+            removed.append("/pulse command")
+    except OSError as e:
+        utf8_print(f"Note: could not remove {command_file}: {e}")
+
+    if not removed:
+        utf8_print(f"Nothing to remove: usage-pulse is not installed in {config_dir}.")
+        return 0
+    utf8_print(f"Removed from {config_dir}: " + "; ".join(removed))
+    utf8_print("usage-pulse's own settings and cache folders (\"claude-status\") were left in place.")
+    here = Path(__file__).resolve()
+    if _is_plugin_cache_path(here):
+        utf8_print("This copy is a plugin install: run /plugin uninstall usage-pulse to remove the files.")
+    else:
+        utf8_print(f"The files are still in {here.parent}; delete that folder to finish.")
+    utf8_print("Restart Claude Code for this to take effect.")
+    return 0
 
 
 def _pulse_script_in_command(command):
@@ -9983,7 +11806,12 @@ def cmd_print_config():
                         remote_ver = _sanitize(cc_cached.get("remote", "?"))
                     except Exception:
                         remote_ver = "newer"
-                    utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} available{RESET}  (run {BOLD}claude update{RESET} in a new terminal)")
+                    # Claude Code updates itself in the background: a version
+                    # that is already on disk only needs a restart.
+                    if _version_cmp(_installed_claude_version(), remote_ver) in (0, 1):
+                        utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} installed{RESET}  ({BOLD}restart Claude Code{RESET} to use it)")
+                    else:
+                        utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} available{RESET}  (run {BOLD}claude update{RESET} in a new terminal)")
                 elif cc_update is False:
                     utf8_print(f"  Claude Code:  {GREEN}{local_ver} (up to date){RESET}")
                 else:
@@ -10497,6 +12325,7 @@ CLI_FLAGS = [
     ("--setup", "[--non-interactive]", "Setup", "Guided setup: status line, hooks, providers, theme, widgets"),
     ("--install", "", "Setup", "Install the status line, agent-panel rows and /pulse (no questions)"),
     ("--update", "", "Setup", "Update a git install to the latest release"),
+    ("--uninstall", "", "Setup", "Remove the status line, hooks and /pulse from Claude Code's settings"),
     ("--help", "", "Setup", "Show this list (also -h)"),
     ("-h", "", "Setup", "Same as --help"),
     ("--theme", "<name>", "Look", "Set the colour theme (see --themes)"),
@@ -10514,12 +12343,12 @@ CLI_FLAGS = [
     ("--bar-style", "<name>", "Look", "Bar characters (classic, block, dot, braille, ...)"),
     ("--layout", "<standard|compact|minimal|percent-first>", "Look", "How labels, bars and numbers are arranged"),
     ("--max-width", "<20-100>", "Look", "Percent of the terminal width to use"),
-    ("--wrap", "<off|auto>", "Look", "Wrap onto a second row instead of truncating"),
+    ("--wrap", "<off|auto>", "Look", "Wrap onto up to 4 rows instead of truncating"),
     ("--preset", "<minimal|default>", "Look", "Apply a bundle of settings (default = factory reset)"),
     ("--show", "<parts>", "Widgets", "Turn widgets on (comma-separated)"),
     ("--hide", "<parts>", "Widgets", "Turn widgets off (comma-separated)"),
     ("--priority", "<widget=N,...>", "Widgets", "Reorder widgets (lower = further left)"),
-    ("--currency", "<symbol>", "Widgets", "Currency for cost widgets (converted from USD)"),
+    ("--currency", "<symbol|code>", "Widgets", "Currency for cost widgets: a symbol or ISO code such as DKK (converted from USD)"),
     ("--clock-format", "<12h|24h>", "Widgets", "Clock for reset times"),
     ("--effort-format", "<labeled|full|short>", "Widgets", "How reasoning effort is written"),
     ("--context-format", "<percent|tokens>", "Widgets", "Context window as a percentage or tokens"),
@@ -10582,6 +12411,54 @@ def _unknown_cli_flags(args):
             and not a.lstrip("-").replace(".", "").isdigit()]
 
 
+def _spend_limit_live(spend):
+    """True for a stdin ``spend_limit`` block whose period is still running.
+
+    Claude Code drops the block once its ``resets_at`` passes, so one carried
+    in the persisted context past that time is old news, not a gateway.
+    """
+    if not isinstance(spend, dict) or spend.get("used_percentage") is None:
+        return False
+    reset = _parse_reset(spend.get("resets_at"))
+    if reset is None:
+        return True
+    try:
+        return reset.timestamp() > time.time()
+    except (OverflowError, OSError, ValueError):
+        return True
+
+
+def _stdin_has_session_data(stdin_ctx):
+    """Does stdin give anything to draw without a usage window (F08)?"""
+    if not isinstance(stdin_ctx, dict):
+        return False
+    return (any(stdin_ctx.get(k) is not None for k in ("model_name", "context_pct", "cost_usd"))
+            or _spend_limit_live(stdin_ctx.get("spend_limit")))
+
+
+def _stdin_only_line(config, stdin_ctx):
+    """The status line for a window with session data but no usage windows.
+
+    A Claude apps gateway sends only ``spend_limit``; Bedrock, Vertex, Foundry
+    and API-key sessions send model, context and cost and no ``rate_limits``
+    at all. Nothing of theirs is a Session or Weekly reading, so those two
+    bars are left out instead of drawn as a made-up 0 %. Never reads
+    credentials and never calls the usage API (F08).
+    """
+    cfg = dict(config)
+    show = dict(config.get("show", DEFAULT_SHOW))
+    show["session"] = False
+    show["weekly"] = False
+    cfg["show"] = show
+    line = build_status_line({}, "", cfg, stdin_ctx, cache_age=None)
+    _update_session_state({}, stdin_ctx, config)
+    if stdin_ctx.get("context_pct") is not None:
+        _append_context_history(stdin_ctx["context_pct"])
+    line = append_update_indicator(line, config)
+    line = append_claude_update_indicator(line, config, stdin_ctx)
+    return _fit_line(_append_provider_rows(line, config), config)
+
+
 def main():
     # Handle SIGPIPE gracefully on Unix (e.g. when piped to head)
     if hasattr(signal, "SIGPIPE"):
@@ -10617,6 +12494,12 @@ def main():
 
     if "--sync-install-path" in args:
         code = cmd_sync_install_path()
+        if code:
+            sys.exit(code)
+        return
+
+    if "--uninstall" in args:
+        code = cmd_uninstall()
         if code:
             sys.exit(code)
         return
@@ -10853,7 +12736,7 @@ def main():
         else:
             utf8_print("Usage: --wrap <off|auto>")
             utf8_print(f"  {'off':<10} Truncate long lines (default)")
-            utf8_print(f"  {'auto':<10} Wrap to 2 lines at | separators when overflow")
+            utf8_print(f"  {'auto':<10} Wrap onto up to 4 rows at | separators when it overflows")
         return
 
     if "--bar-style" in args:
@@ -10980,7 +12863,7 @@ def main():
                 pass
             utf8_print(f"Currency symbol: {BOLD}{val}{RESET}")
         else:
-            utf8_print("Usage: --currency <symbol>  (e.g. \u00a3, $, \u20ac, \u00a5)")
+            utf8_print("Usage: --currency <symbol|code>  (e.g. \u00a3, $, \u20ac, \u00a5, DKK, NOK)")
         return
 
     if "--weekly-timer-format" in args:
@@ -11083,7 +12966,7 @@ def main():
             utf8_print("No stdin data (interactive terminal). Pipe data or use from Claude Code.")
             return
         try:
-            raw = sys.stdin.read(65536)
+            raw = _read_stdin_text(65536)
         except Exception:
             pass
         debug_path = get_state_dir() / "stdin_debug.json"
@@ -11313,7 +13196,7 @@ def main():
     raw_stdin = ""
     if not sys.stdin.isatty():
         try:
-            raw_stdin = sys.stdin.read(65536)
+            raw_stdin = _read_stdin_text(65536)
         except Exception:
             pass
     stdin_ctx = _parse_stdin_context(raw_stdin)
@@ -11351,9 +13234,15 @@ def main():
             raw_persisted = json.load(f)
         if isinstance(raw_persisted, dict):
             persisted_sid = str(raw_persisted.get("session_id") or "") or None
-            persisted = {k: _sanitize(str(v)) if isinstance(v, str) else v for k, v in raw_persisted.items() if k in _STDIN_CTX_KEYS}
+            persisted = {k: _strip_surrogates(_sanitize(str(v))) if isinstance(v, str) else v for k, v in raw_persisted.items() if k in _STDIN_CTX_KEYS}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
+    # The carried rate limits can be hours or days old (they are an account
+    # key, so a new session inherits them before its first reply). A window
+    # whose reset has passed is over: it reads 0 %, not its old percentage
+    # next to "now" (F01).
+    if isinstance(persisted.get("_rate_limits"), dict):
+        persisted["_rate_limits"] = _roll_over_expired_windows(persisted["_rate_limits"])
     if stdin_ctx:
         sid = str(stdin_ctx.get("session_id") or "") or None
         if sid and persisted_sid and sid != persisted_sid:
@@ -11367,14 +13256,30 @@ def main():
         except OSError:
             pass
     stdin_ctx = persisted
+    # Context history is kept per session (a second window's lower samples must
+    # not read as this window's context filling fast).
+    _set_context_session(stdin_ctx.get("session_id"))
 
     cache_path = get_cache_path()
     cached = read_cache(cache_path, cache_ttl)
+    # A cached window can have run out since it was written (F01): it reads
+    # 0 %, in the stdin branch below and in the cached branch after it alike.
+    if isinstance(cached, dict) and isinstance(cached.get("usage"), dict):
+        cached = dict(cached, usage=_roll_over_expired_windows(cached["usage"]))
 
     # --- Stdin rate limits (v2.1.80+): use data from Claude Code directly ---
     # This avoids calling the OAuth API entirely for basic session/weekly bars.
     # The API is only needed for extra credits and per-model caps (opus/sonnet).
     stdin_rl = stdin_ctx.get("_rate_limits")
+    # Behind a Claude apps gateway rate_limits carries only spend_limit, so
+    # there is no window above and no claude.ai login to fetch one with. The
+    # spend bar and the session widgets are drawn from stdin alone, without
+    # ever asking for credentials (F08).
+    _gateway_run = _spend_limit_live(stdin_ctx.get("spend_limit"))
+    if not stdin_rl and _gateway_run:
+        line = _stdin_only_line(config, stdin_ctx)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
+        return
     if stdin_rl:
         # Build a synthetic usage dict from stdin rate limits. Take *every*
         # window stdin offers, including the model-scoped weekly caps
@@ -11391,6 +13296,11 @@ def main():
         if cached and "usage" in cached:
             plan_from_cache = cached.get("plan", "")
             for key, value in cached["usage"].items():
+                # five_hour and seven_day always come fresh from stdin. Claude
+                # Code drops one once it resets, so refilling it from the
+                # cache brought back the old percentage next to "now" (F01).
+                if key in ("five_hour", "seven_day"):
+                    continue
                 if key not in usage_from_stdin:
                     usage_from_stdin[key] = value
                     if key.startswith("seven_day_"):
@@ -11406,9 +13316,11 @@ def main():
         # few minutes old is honest; the five-hour and weekly windows always
         # come fresh from stdin and are never overwritten here.
         _stale = _read_stale_cache(cache_path)
-        _stale_usage = (_stale or {}).get("usage")
+        _stale_usage = _roll_over_expired_windows((_stale or {}).get("usage"))
         if isinstance(_stale_usage, dict):
             for key, value in _stale_usage.items():
+                if key in ("five_hour", "seven_day"):
+                    continue   # stdin only, see above
                 if key in _USAGE_CACHE_KEYS and key not in usage_from_stdin:
                     usage_from_stdin[key] = value
                     if key.startswith("seven_day_") or key == "extra_usage":
@@ -11443,6 +13355,13 @@ def main():
         _caps_show = config.get("show", {})
         _caps_wanted = any(_caps_show.get(k, DEFAULT_SHOW.get(k, False))
                            for k in ("opus", "sonnet", "fable", "extra"))
+        # Extra usage also draws itself without being switched on, as soon as
+        # the account has credits (and unless --hide extra). Left out of this
+        # test, its figure was never refetched: the first one fetched stayed
+        # on the bar for months (F17).
+        if not _caps_wanted and not config.get("extra_hidden", False):
+            _extra_seen = _extra_usage_view(usage_from_stdin.get("extra_usage"))
+            _caps_wanted = _extra_seen is not None and _extra_seen["limit"] > 0
         # Preserve across the end-of-branch write_cache below. Without this the
         # final write drops the field, the age reads as 0 on the next repaint,
         # and the "stale" test fires every single draw — a fetch per repaint,
@@ -11464,8 +13383,10 @@ def main():
         _blocked_until = _cache_seconds(_rl_until) or 0
         _backoff_active = time.time() < _blocked_until
         _recent_attempt = (time.time() - (_cache_seconds(_caps_attempted) or 0)) < _MODEL_CAPS_RETRY
-        if (not has_core and not has_model_caps and "extra_usage" not in usage_from_stdin) or \
-                (_caps_wanted and _caps_stale and not _backoff_active and not _recent_attempt):
+        # A spend limit on stdin means a Claude apps gateway: no claude.ai
+        # login, so the usage API is never asked (F08).
+        if not _gateway_run and ((not has_core and not has_model_caps and "extra_usage" not in usage_from_stdin) or \
+                (_caps_wanted and _caps_stale and not _backoff_active and not _recent_attempt)):
             try:
                 # The kill guard is asked first. When it says no (this
                 # account's last fetch was cut short, or another window of it
@@ -11536,13 +13457,22 @@ def main():
             except Exception:
                 pass
 
+        # Whatever was carried or fetched above can have run out since (F01);
+        # nothing past its reset is drawn, recorded or written back to disk.
+        usage_from_stdin = _roll_over_expired_windows(usage_from_stdin)
+        # When the extra-usage figure was last fetched, for its age marker. Set
+        # after stdin_ctx was persisted, so it only reaches the renderer (F17).
+        stdin_ctx["_extra_fetched_at"] = _cache_seconds(_caps_ts) or None
+
         # Get plan from credentials (lightweight, no API call)
-        if not plan_from_cache:
+        if not plan_from_cache and not _gateway_run:
             _, plan_from_cache = get_credentials()
             plan_from_cache = plan_from_cache or ""
 
-        line = build_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, cache_age=0)
-        _update_session_state(usage_from_stdin, stdin_ctx)
+        # Guarded: a value in a file the renderer cannot draw must not leave a
+        # blank bar. The side effects below still run, so the damage heals.
+        line = _guarded_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, 0)
+        _update_session_state(usage_from_stdin, stdin_ctx, config)
         _append_history(usage_from_stdin)
         if stdin_ctx.get("context_pct") is not None:
             _append_context_history(stdin_ctx["context_pct"])
@@ -11554,10 +13484,8 @@ def main():
                     model_caps_attempted_at=_caps_attempted)
         _seed_active_provider_cache(usage_from_stdin, config)
 
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        line = _finish_line(line, config, stdin_ctx)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # --- Cached data (no stdin rate limits available) ---
@@ -11567,26 +13495,37 @@ def main():
         # reads as +inf (the red stale label) instead of raising here.
         cache_age = _cache_age(cached)
         if "usage" in cached:
-            line = build_status_line(cached["usage"], cached.get("plan", ""), config, stdin_ctx, cache_age=cache_age)
-            _update_session_state(cached["usage"], stdin_ctx)
+            line = _guarded_status_line(cached["usage"], cached.get("plan", ""), config,
+                                        stdin_ctx, cache_age,
+                                        fallback=cached.get("line", ""))
+            _update_session_state(cached["usage"], stdin_ctx, config)
         else:
             line = cached.get("line", "")
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        if not isinstance(line, str) or not line.strip():
+            line = _SAFE_FALLBACK_LINE   # never a blank bar
+        line = _finish_line(line, config, stdin_ctx)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # --- API fallback (first call or no stdin rate limits) ---
     token, plan = get_credentials()
     if not token:
+        # No claude.ai login, but stdin has a model, context or cost to draw
+        # (Bedrock, Vertex, Foundry, API key): draw them rather than tell a
+        # working session to log in. The message stays for when stdin gave
+        # nothing. Not cached: a cached line would be served to every window.
+        if _stdin_has_session_data(stdin_ctx):
+            line = _stdin_only_line(config, stdin_ctx)
+            if _strip_ansi(line).strip():
+                sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
+                return
         if os.environ.get("ANTHROPIC_API_KEY"):
             line = "API key detected \u2014 usage-pulse requires a Pro/Max subscription"
         else:
             line = "No credentials \u2014 run claude and /login"
         write_cache(cache_path, line)
         line = _fit_line(_append_provider_rows(line, config), config)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # Claude Code cancels a repaint that outlives its refresh interval, and a
@@ -11611,10 +13550,8 @@ def main():
             line = ""
         if not line:
             line = "Usage unavailable \u2014 retrying shortly"
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        line = _finish_line(line, config, stdin_ctx)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     try:
@@ -11680,7 +13617,7 @@ def main():
                 )
             _end_net_attempt("usage")
             line = _fit_line(_append_provider_rows(line, config), config)
-            sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+            sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
             return
         else:
             line = f"API error: {e.code}"
@@ -11715,7 +13652,7 @@ def main():
         write_cache(cache_path, line, usage, plan)
         _append_history(usage)
         _update_heatmap(usage)
-        _update_session_state(usage, stdin_ctx)
+        _update_session_state(usage, stdin_ctx, config)
         if stdin_ctx and stdin_ctx.get("context_pct") is not None:
             _append_context_history(stdin_ctx["context_pct"])
         try:
@@ -11727,10 +13664,48 @@ def main():
     else:
         # Cache error lines so we don't hammer the API on every refresh
         write_cache(cache_path, line)
-    line = append_update_indicator(line, config)
-    line = append_claude_update_indicator(line, config, stdin_ctx)
-    line = _fit_line(_append_provider_rows(line, config), config)
-    sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+    line = _finish_line(line, config, stdin_ctx)
+    sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
+
+
+def _handle_fatal_error(exc):
+    """What to do when main() raises: the ``__main__`` block calls this.
+
+    Claude Code runs the status line, the agent-panel rows and the hooks with
+    stdin piped and nobody watching, and none of them may crash it with a
+    traceback. So there the error is swallowed: the status line prints a clean
+    blank line, the rows and hooks print nothing (a hook's stdout is read as
+    context), and the process exits 0.
+
+    A command a person types (``--theme``, ``--install``, ``--stats`` ...) must
+    not hide a failure: it used to print a blank line and exit 0, so a config
+    that could not be saved looked saved. It says what went wrong on stderr and
+    exits 1. So does the bare script run at a terminal.
+    """
+    args = sys.argv[1:]
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    status_line_mode = not args
+    run_by_claude_code = status_line_mode or args[0] in {
+        row[0] for row in CLI_FLAGS if row[2] == "Internal"}
+    if run_by_claude_code and not interactive:
+        if status_line_mode:
+            try:
+                sys.stdout.buffer.write((RESET + "\n").encode("utf-8", "replace"))
+            except Exception:
+                pass
+        return
+    message = f"usage-pulse: {type(exc).__name__}: {exc}\n"
+    try:
+        sys.stderr.write(message)
+    except (UnicodeError, OSError, ValueError):
+        try:
+            sys.stderr.write(message.encode("ascii", "replace").decode("ascii"))
+        except Exception:
+            pass
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
@@ -11738,17 +13713,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         raise SystemExit(130)
-    except Exception:
-        # A status line must never crash Claude Code with a traceback. When
-        # invoked as the status line (stdin is piped, not a TTY) degrade to a
-        # clean blank line; for interactive CLI use, surface the error.
-        try:
-            interactive = sys.stdin.isatty()
-        except Exception:
-            interactive = False
-        if interactive:
-            raise
-        try:
-            sys.stdout.buffer.write((RESET + "\n").encode("utf-8"))
-        except Exception:
-            pass
+    except Exception as exc:
+        _handle_fatal_error(exc)

@@ -231,17 +231,27 @@ class BarSizeTest(unittest.TestCase):
         self.assertEqual(bars_in(self._render("small", 60)), 12)
 
     def test_auto_shrinks_to_fit(self):
-        self.assertEqual(bars_in(self._render("auto", 100)), 6)    # the two-character floor
-        self.assertEqual(bars_in(self._render("auto", 130)), 27)   # (104 - 75) // 3 = 9 each
-        self.assertEqual(bars_in(self._render("auto", 150)), 36)   # room for large again
+        # Only the three bar sections are on, so the labels and numbers around
+        # the bars are 41 columns. The line is measured, not estimated (the old
+        # flat guess of 18 columns a bar plus 15 made this line shrink to the
+        # floor at 100 columns although it fits at full size).
+        self.assertEqual(bars_in(self._render("auto", 60)), 6)     # budget 48: (48 - 41) // 3 = 2, the floor
+        self.assertEqual(bars_in(self._render("auto", 90)), 30)    # budget 72: (72 - 41) // 3 = 10 each
+        self.assertEqual(bars_in(self._render("auto", 100)), 36)   # budget 80: room for large already
         self.assertEqual(bars_in(self._render("auto", 300)), 36)
+        for columns in (60, 70, 90, 100):
+            with self.subTest(columns=columns):
+                self.assertLessEqual(len(self._render("auto", columns)), columns * 80 // 100)
 
     def test_hidden_bars_free_the_budget_in_auto(self):
         line = self._render("auto", 100, dict(self.SHOW, weekly_bar=False, context_bar=False))
         self.assertEqual(bars_in(line), 12)
 
     def test_provider_rows_follow_the_setting(self):
-        with mock.patch.object(cs, "_detect_terminal_width", return_value=100):
+        # No main line has been measured in this run (an earlier test in the
+        # same process may have left one): this pins the standalone estimate.
+        with mock.patch.object(cs, "_detect_terminal_width", return_value=100), \
+                mock.patch.object(cs, "_SHRINK_MEMO", None):
             self.assertEqual(cs._provider_bar_width({"bar_size": "large", "max_width": 80}, 15), 12)
             self.assertEqual(cs._provider_bar_width({"bar_size": "small", "max_width": 80}, 15), 4)
             self.assertLess(cs._provider_bar_width({"bar_size": "auto", "max_width": 80}, 15), 12)

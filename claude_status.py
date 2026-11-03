@@ -1319,13 +1319,98 @@ def _format_elapsed(seconds):
     return f"{mins}m"
 
 
+# What git says (branch, changed files, ahead/behind) is true of one repo
+# folder, but every window shares this state dir. Each cache is therefore a
+# small file holding one entry per repo folder, so a window never reads another
+# window's repo, and a folder that is not a repo cannot hide a branch elsewhere.
+GIT_BRANCH_FILE = "git_branch.json"
+GIT_CACHE_MAX_REPOS = 16
+# Claude Code cancels a repaint when the next update fires, so git on the
+# render path must give up fast and leave the last known answer on screen.
+GIT_RENDER_TIMEOUT = 1.5
+
+
+def _git_repo_key():
+    """The folder git runs in for this repaint, as a stable cache key."""
+    try:
+        return os.path.normcase(os.path.realpath(os.getcwd()))
+    except OSError:
+        return ""
+
+
+def _read_git_cache(name, key):
+    """Repo *key*'s entry in per-repo git cache *name*, or {} when unusable.
+
+    The file is untrusted input: wrong JSON shape, bytes that are not UTF-8
+    (a ValueError) or hand edits must read as "nothing cached", never raise.
+    """
+    try:
+        with open(get_state_dir() / name, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    repos = data.get("repos") if isinstance(data, dict) else None
+    entry = repos.get(key) if isinstance(repos, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _cache_stamp(entry, field):
+    """A time field of a git cache entry as finite seconds; 0.0 when unusable."""
+    seconds = _cache_seconds(entry.get(field)) if isinstance(entry, dict) else None
+    return seconds if seconds is not None else 0.0
+
+
+def _git_cache_fresh(entry, ttl):
+    """True when the answer, or an attempt to get one, is younger than *ttl*.
+
+    A stamp in the future (clock change, damaged file) is never fresh, so it
+    cannot pin an old answer on screen.
+    """
+    now = time.time()
+    return any(0 <= now - stamp < ttl
+               for stamp in (_cache_stamp(entry, "timestamp"), _cache_stamp(entry, "attempted"))
+               if stamp)
+
+
+def _cache_count(value):
+    """A cached count as a non-negative int; 0 when unusable."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _write_git_cache(name, key, entry):
+    """Store *entry* for repo *key*, keeping only the most recent few repos.
+
+    Best effort: a cache that cannot be written just means git runs again.
+    """
+    try:
+        path = get_state_dir() / name
+        repos = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("repos"), dict):
+                repos = data["repos"]
+        except (OSError, ValueError, RecursionError):
+            pass
+        repos.pop(key, None)
+        others = sorted(repos, key=lambda k: max(_cache_stamp(repos[k], "timestamp"),
+                                                 _cache_stamp(repos[k], "attempted")),
+                        reverse=True)[:GIT_CACHE_MAX_REPOS - 1]
+        kept = {k: repos[k] for k in others}
+        kept[key] = entry
+        _atomic_json_write(path, {"repos": kept}, indent=None)
+    except OSError:
+        pass
+
+
 def _get_git_branch():
-    hook_state = _read_hook_state()
-    if hook_state:
-        cached_branch = hook_state.get("git_branch")
-        branch_ts = hook_state.get("git_branch_ts", 0)
-        if cached_branch is not None and (time.time() - branch_ts) < GIT_BRANCH_CACHE_TTL:
-            return cached_branch if cached_branch else None
+    key = _git_repo_key()
+    entry = _read_git_cache(GIT_BRANCH_FILE, key)
+    cached_branch = entry.get("branch")
+    if isinstance(cached_branch, str) and _git_cache_fresh(entry, GIT_BRANCH_CACHE_TTL):
+        return cached_branch if cached_branch else None
     try:
         result = subprocess.run(
             [_GIT_PATH, "branch", "--show-current"],
@@ -1334,51 +1419,141 @@ def _get_git_branch():
         branch = result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         branch = ""
+    _write_git_cache(GIT_BRANCH_FILE, key, {"branch": branch, "timestamp": time.time()})
+    return branch if branch else None
+
+
+# The heartbeat (tool count and elapsed time) describes one session. Each
+# session keeps its own counters in hook_sessions/<session_id>.json beside
+# hook_state.json, and hook_state.json carries a snapshot of whichever
+# session's hook fired last, which is what the status line and the repaint
+# timer read.
+HOOK_SESSIONS_DIR = "hook_sessions"
+HOOK_SESSION_MAX_AGE = 7 * 86400   # per-session files untouched this long are removed
+HOOK_SESSION_PRUNE_BATCH = 50      # at most this many removals per hook call
+HOOK_WRITE_ATTEMPTS = 3            # Windows refuses os.replace while a reader has the file open
+# Only when a hook carries no session id: an idle gap this long starts a new count.
+HEARTBEAT_IDLE_RESET = 3600
+
+
+def _hook_sessions_dir():
+    return _get_hook_state_path().parent / HOOK_SESSIONS_DIR
+
+
+def _read_json_dict(path):
+    """A JSON file's top-level dict; {} when missing, unreadable or another shape."""
     try:
-        state = hook_state if hook_state else {}
-        state["git_branch"] = branch
-        state["git_branch_ts"] = time.time()
-        _atomic_json_write(_get_hook_state_path(), state, indent=None)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_session_heartbeat(session_id):
+    """One session's heartbeat counters ({tool_count, session_start, ...}), or None."""
+    sid = _safe_path_id(session_id)
+    if not sid:
+        return None
+    return _read_json_dict(_hook_sessions_dir() / f"{sid}.json") or None
+
+
+def _write_hook_state(path, data):
+    """Atomic write that rides out a reader briefly holding the file (Windows)."""
+    for attempt in range(HOOK_WRITE_ATTEMPTS):
+        try:
+            _atomic_json_write(path, data, indent=None)
+            return
+        except PermissionError:
+            if attempt + 1 >= HOOK_WRITE_ATTEMPTS:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
+def _prune_old_json(folder, max_age, limit, now):
+    """Remove up to *limit* ``*.json`` files in *folder* older than *max_age*.
+
+    Judged by file age alone, so nothing is opened or parsed, and bounded, so a
+    backlog is cleared over several calls instead of stalling one repaint.
+    """
+    removed = 0
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if removed >= limit:
+                    break
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    if now - entry.stat().st_mtime > max_age:
+                        os.unlink(entry.path)
+                        removed += 1
+                except OSError:
+                    continue
     except OSError:
         pass
-    return branch if branch else None
+
+
+def _beat_start(record, now):
+    """A record's session_start if it is a sane past time, else *now*."""
+    started = _cache_seconds(record.get("session_start"))
+    return started if started and started <= now else now
 
 
 def hook_refresh(tool_name_arg):
     """Handle --hook-refresh: update hook state silently (no stdout).
 
     Tool name comes from stdin JSON (PostToolUse event data), not env vars.
-    Falls back to tool_name_arg if stdin is unavailable.
+    Falls back to tool_name_arg if stdin is unavailable. The session id comes
+    from the same JSON, so each session counts its own tools and time.
     """
     # Parse tool name from stdin JSON (best practice per Claude Code docs)
     tool_name = tool_name_arg or "unknown"
+    session_id = None
     if not sys.stdin.isatty():
         try:
             raw = sys.stdin.read(65536)
             if raw.strip():
                 data = json.loads(raw)
-                tool_name = _sanitize(data.get("tool_name", tool_name))
+                if isinstance(data, dict):
+                    tool_name = _sanitize(data.get("tool_name", tool_name))
+                    session_id = _safe_path_id(data.get("session_id")) or None
         except (json.JSONDecodeError, OSError, ValueError):
             pass
 
     hook_state_path = _get_hook_state_path()
     now = time.time()
-    state = {}
-    try:
-        with open(hook_state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    if session_id:
+        session_path = _hook_sessions_dir() / f"{session_id}.json"
+        mine = _read_json_dict(session_path)
+        state = {
+            "tool_count": _cache_count(mine.get("tool_count")) + 1,
+            "session_start": _beat_start(mine, now),
+            "session_id": session_id,
+        }
+    else:
+        session_path = None
+        previous = _read_json_dict(hook_state_path)
+        idle = now - _cache_stamp(previous, "last_refresh")
+        if previous.get("session_id") or idle > HEARTBEAT_IDLE_RESET:
+            previous = {}  # another session's snapshot, or long idle: start over
+        state = {
+            "tool_count": _cache_count(previous.get("tool_count")) + 1,
+            "session_start": _beat_start(previous, now),
+        }
     state["last_tool"] = _sanitize(str(tool_name))[:50]
-    state["tool_count"] = state.get("tool_count", 0) + 1
-    if "session_start" not in state:
-        state["session_start"] = now
     state["last_refresh"] = now
-    # Fed only the activity widget, removed in 3.6.2.
-    state.pop("_call_times", None)
-    state.pop("rapid_calls", None)
+    if session_path is not None:
+        try:
+            _secure_mkdir(session_path.parent)
+            if not mine:
+                _prune_old_json(session_path.parent, HOOK_SESSION_MAX_AGE,
+                                HOOK_SESSION_PRUNE_BATCH, now)
+            _write_hook_state(session_path, state)
+        except OSError:
+            pass
     try:
-        _atomic_json_write(hook_state_path, state, indent=None)
+        _write_hook_state(hook_state_path, state)
     except OSError:
         pass
 
@@ -6114,13 +6289,72 @@ def _get_sessions_dir():
     return sessions_dir
 
 
-def _get_session_id():
-    return os.getppid()
+# Stale markers are cleared a bounded batch at a time (see _prune_old_json).
+SESSION_PRUNE_BATCH = 100      # stale markers removed per pass, so cleanup never stalls a repaint
+SESSION_PRUNE_INTERVAL = 60    # seconds between cleanup passes
+SESSION_PRUNE_STAMP = ".pruned"
 
 
-def _update_session_state(usage, stdin_ctx):
+def _get_session_id(stdin_ctx=None):
+    """The id of the window being painted, or None when it has no stable one.
+
+    Claude Code sends a ``session_id`` that is stable for a session and unique
+    per session. The parent pid is not: on Windows the status line runs through
+    a new Git Bash on every repaint, so it named a new marker each time. A
+    repaint without an id of its own (a fragment) takes the one main() stored
+    beside the stdin context; failing that the parent pid is used where it is
+    stable (not Windows).
+    """
+    sid = _safe_path_id((stdin_ctx or {}).get("session_id"))
+    if not sid:
+        owner = _read_json_dict(get_account_state_dir() / "stdin_ctx.json")
+        sid = _safe_path_id(owner.get("session_id"))
+    if sid:
+        return sid
+    return os.getppid() if sys.platform != "win32" else None
+
+
+def _sessions_widget_on(config=None):
     try:
-        session_id = _get_session_id()
+        if config is None:
+            config = load_config()
+        return bool(config.get("show", {}).get("sessions", False))
+    except Exception:
+        return False
+
+
+def _session_prune_due(sessions_dir, now):
+    """True (and the stamp renewed) when a cleanup pass is due: once a minute."""
+    stamp = sessions_dir / SESSION_PRUNE_STAMP
+    try:
+        if 0 <= now - stamp.stat().st_mtime < SESSION_PRUNE_INTERVAL:
+            return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    try:
+        stamp.touch()
+    except OSError:
+        return False
+    return True
+
+
+def _update_session_state(usage, stdin_ctx, config=None):
+    try:
+        now = time.time()
+        sessions_dir = get_account_state_dir() / SESSION_DIR_NAME
+        # Stale markers (windows that closed, or a backlog left by older
+        # versions) are cleared whether or not the widget is on, a bounded
+        # batch per minute.
+        if _session_prune_due(sessions_dir, now):
+            _prune_old_json(sessions_dir, SESSION_STALE_SECONDS, SESSION_PRUNE_BATCH, now)
+        # Nothing reads the markers unless the sessions widget is on.
+        if not _sessions_widget_on(config):
+            return
+        session_id = _get_session_id(stdin_ctx)
+        if session_id is None:
+            return
         sessions_dir = _get_sessions_dir()
         five = usage.get("five_hour", {}) if usage else {}
         seven = usage.get("seven_day", {}) if usage else {}
@@ -6128,7 +6362,7 @@ def _update_session_state(usage, stdin_ctx):
             "pid": session_id,
             "session_pct": five.get("utilization") or 0,
             "weekly_pct": seven.get("utilization") or 0,
-            "timestamp": time.time(),
+            "timestamp": now,
             "model": (stdin_ctx or {}).get("model_name", ""),
         }
         _atomic_json_write(sessions_dir / f"{session_id}.json", state, indent=None)
@@ -6136,32 +6370,50 @@ def _update_session_state(usage, stdin_ctx):
         pass
 
 
-def _get_active_sessions():
+def _get_active_sessions(session_id=None):
+    """The other windows' markers still fresh. *session_id* is this window's."""
     sessions_dir = _get_sessions_dir()
-    my_pid = _get_session_id()
+    if session_id is None:
+        session_id = _get_session_id()
+    mine = {str(os.getppid())}
+    if session_id is not None:
+        mine.add(str(session_id))
     now = time.time()
     active = []
+    removed = 0
+
+    def remove(entry):
+        nonlocal removed
+        try:
+            os.unlink(entry.path)
+        except OSError:
+            pass
+        removed += 1
+
     try:
-        for entry in sessions_dir.iterdir():
-            if not entry.name.endswith(".json"):
-                continue
-            try:
-                with open(entry, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if now - data.get("timestamp", 0) > SESSION_STALE_SECONDS:
-                    try:
-                        entry.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+        with os.scandir(sessions_dir) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
                     continue
-                if data.get("pid") == my_pid:
+                try:
+                    # File age first: a stale marker need not be opened to be
+                    # skipped, and a backlog is cleared a batch at a time.
+                    if now - entry.stat().st_mtime > SESSION_STALE_SECONDS:
+                        if removed < SESSION_PRUNE_BATCH:
+                            remove(entry)
+                        continue
+                    with open(entry.path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, ValueError, RecursionError):
+                    remove(entry)
+                    continue
+                stamp = _cache_seconds(data.get("timestamp")) if isinstance(data, dict) else None
+                if stamp is None or now - stamp > SESSION_STALE_SECONDS:
+                    remove(entry)
+                    continue
+                if str(data.get("pid")) in mine:
                     continue
                 active.append(data)
-            except (json.JSONDecodeError, OSError):
-                try:
-                    entry.unlink(missing_ok=True)
-                except OSError:
-                    pass
     except OSError:
         pass
     return active
@@ -6297,33 +6549,34 @@ def _cmd_pomodoro_inner(action, minutes=None):
 # ---------------------------------------------------------------------------
 
 def _check_git_drift():
-    state_dir = get_state_dir()
-    drift_cache = state_dir / GIT_DRIFT_FILE
+    key = _git_repo_key()
+    entry = _read_git_cache(GIT_DRIFT_FILE, key)
+    behind, ahead = _cache_count(entry.get("behind")), _cache_count(entry.get("ahead"))
+    if _git_cache_fresh(entry, GIT_DRIFT_CACHE_TTL):
+        return (behind, ahead)
+    # Record the attempt BEFORE git runs. A repaint cancelled mid-git leaves
+    # this stamp, so the next one shows the last answer instead of running the
+    # same slow git again (and being cancelled again).
+    _write_git_cache(GIT_DRIFT_FILE, key, {
+        "timestamp": _cache_stamp(entry, "timestamp"), "attempted": time.time(),
+        "behind": behind, "ahead": ahead})
+    new_behind = new_ahead = 0
     try:
-        with open(drift_cache, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if time.time() - cached.get("timestamp", 0) < GIT_DRIFT_CACHE_TTL:
-            return (cached.get("behind", 0), cached.get("ahead", 0))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    behind = ahead = 0
-    try:
-        result = subprocess.run([_GIT_PATH, "rev-list", "--count", "HEAD..@{upstream}"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            behind = int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        pass
-    try:
-        result = subprocess.run([_GIT_PATH, "rev-list", "--count", "@{upstream}..HEAD"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            ahead = int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        pass
-    try:
-        _atomic_json_write(drift_cache, {"timestamp": time.time(), "behind": behind, "ahead": ahead}, indent=None)
-    except OSError:
-        pass
-    return (behind, ahead)
+        # One call: "<commits only on HEAD> <commits only on upstream>".
+        result = subprocess.run(
+            [_GIT_PATH, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            capture_output=True, text=True, timeout=GIT_RENDER_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return (behind, ahead)  # no answer in time: keep the last, retry after the TTL
+    if result.returncode == 0:  # a non-zero exit means no upstream: nothing to drift from
+        try:
+            left, right = result.stdout.split()
+            new_ahead, new_behind = int(left), int(right)
+        except ValueError:
+            pass
+    _write_git_cache(GIT_DRIFT_FILE, key, {
+        "timestamp": time.time(), "behind": new_behind, "ahead": new_ahead})
+    return (new_behind, new_ahead)
 
 
 def _render_git_drift():
@@ -6346,26 +6599,24 @@ def _render_git_drift():
 # ---------------------------------------------------------------------------
 
 def _count_changed_files():
-    state_dir = get_state_dir()
-    files_cache = state_dir / FILES_CHANGED_FILE
-    try:
-        with open(files_cache, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if time.time() - cached.get("timestamp", 0) < FILES_CHANGED_CACHE_TTL:
-            return cached.get("count", 0)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    key = _git_repo_key()
+    entry = _read_git_cache(FILES_CHANGED_FILE, key)
+    last = _cache_count(entry.get("count"))
+    if _git_cache_fresh(entry, FILES_CHANGED_CACHE_TTL):
+        return last
+    # Record the attempt before git runs (see _check_git_drift).
+    _write_git_cache(FILES_CHANGED_FILE, key, {
+        "timestamp": _cache_stamp(entry, "timestamp"), "attempted": time.time(),
+        "count": last})
     count = 0
     try:
-        result = subprocess.run([_GIT_PATH, "diff", "--name-only"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+        result = subprocess.run([_GIT_PATH, "diff", "--name-only"], capture_output=True,
+                                text=True, timeout=GIT_RENDER_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
-        pass
-    try:
-        _atomic_json_write(files_cache, {"timestamp": time.time(), "count": count}, indent=None)
-    except OSError:
-        pass
+        return last  # no answer in time: keep the last count, retry after the TTL
+    if result.returncode == 0:
+        count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+    _write_git_cache(FILES_CHANGED_FILE, key, {"timestamp": time.time(), "count": count})
     return count
 
 

@@ -911,13 +911,15 @@ class InstallTeamHooksTest(unittest.TestCase):
         """SubagentStart cannot block, so it keeps the plain matcher form.
         SubagentStop *can* (exit 2 keeps the subagent running — hooks
         reference), so it gets the same always-exit-0 command as the team
-        events; a moved install must never pin every subagent open."""
+        events; a moved install must never pin every subagent open. The
+        non-blocking SubagentStart is pinned to exit 0 as well (F25), so a
+        moved install shows no hook error."""
         cs.install_hooks()
         hooks = self._hooks()
         start = self._pulse_entries(hooks, "SubagentStart", "--hook-subagent-start")
         self.assertEqual(len(start), 1)
         self.assertEqual(start[0]["matcher"], "")
-        self.assertTrue(start[0]["hooks"][0]["command"].endswith("--hook-subagent-start"))
+        self.assertTrue(start[0]["hooks"][0]["command"].endswith("--hook-subagent-start; exit 0"))
         stop = self._pulse_entries(hooks, "SubagentStop", "--hook-subagent-stop")
         self.assertEqual(len(stop), 1)
         self.assertNotIn("matcher", stop[0])

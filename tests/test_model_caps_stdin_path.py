@@ -149,7 +149,7 @@ class ModelCapsStdinPath(unittest.TestCase):
             self.assertIn("81%", line)
         self.assertEqual(len(self.calls), 1, "refetched inside the TTL")
 
-        cached = json.loads(self.cache.read_text())
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
         self.assertIsNotNone(cached["usage"].get("seven_day_fable"))
         self.assertTrue(cached.get("model_caps_fetched_at"))
 
@@ -176,7 +176,7 @@ class ModelCapsStdinPath(unittest.TestCase):
         self._show()
 
         self._repaint()
-        cached = json.loads(self.cache.read_text())
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
         # The last attempt happened at the same time as the last fetch.
         cached["model_caps_fetched_at"] = time.time() - cs._MODEL_CAPS_TTL - 1
         cached["model_caps_attempted_at"] = cached["model_caps_fetched_at"]
@@ -201,7 +201,7 @@ class ModelCapsStdinPath(unittest.TestCase):
         for line in lines:
             self.assertIn("Session", line, "a 429 must not blank the bar")
 
-        cached = json.loads(self.cache.read_text())
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
         remaining = cached.get("rate_limited_until", 0) - time.time()
         self.assertGreater(remaining, 3000, "Retry-After was not honoured")
 
@@ -257,7 +257,7 @@ class ModelCapsStdinPath(unittest.TestCase):
             self._repaint()
 
         self.assertEqual(len(self.calls), 1, "retried inside _MODEL_CAPS_RETRY")
-        cached = json.loads(self.cache.read_text())
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
         self.assertTrue(cached.get("model_caps_attempted_at"))
         self.assertFalse(cached.get("model_caps_fetched_at"))
 
@@ -279,7 +279,7 @@ class ModelCapsStdinPath(unittest.TestCase):
         cs.load_config = lambda: dict(pinned(), model_caps_refresh_seconds=600)
 
         self._repaint()
-        cached = json.loads(self.cache.read_text())
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
         # 7 minutes old: stale at the default 300s, fresh at the configured 600s.
         cached["model_caps_fetched_at"] = time.time() - 420
         cached["model_caps_attempted_at"] = time.time() - 420

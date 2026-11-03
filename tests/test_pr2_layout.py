@@ -371,7 +371,7 @@ class WrapTest(unittest.TestCase):
         self.assertEqual(fit(line, 400, wrap="auto"), line)
 
     def test_two_rows_when_two_are_enough(self):
-        out = fit(stock_line(), 120, wrap="auto")
+        out = fit(stock_line(), 130, wrap="auto")
         self.assertEqual(len(out.split("\n")), 2)
         self.assertNotIn(ELLIPSIS, plain(out))
 

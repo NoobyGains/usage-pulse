@@ -43,7 +43,7 @@ Save the path as SCRIPT_PATH. If no PY was found, use `python` (Windows) or `pyt
 | `bar-style <name>`, `style <name>` | `--bar-style <name>` |
 | `layout <name>` | `--layout <standard/compact/minimal/percent-first>` |
 | `wrap <off/auto>`, `max-width <20-100>` | `--wrap …`, `--max-width …` |
-| `currency <symbol>` | `--currency <symbol>` (costs are converted from USD at a daily rate) |
+| `currency <symbol>` | `--currency <symbol>` (costs are converted from USD at a daily rate; an ISO code such as DKK works too) |
 | `clock <12h/24h>` | `--clock-format <12h/24h>` |
 | `effort-format <labeled/full/short>` | `--effort-format <value>` |
 | `weekly-timer <auto/countdown/date/full>` | `--weekly-timer-format <value>` |

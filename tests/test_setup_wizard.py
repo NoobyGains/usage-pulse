@@ -236,7 +236,8 @@ class HookGroupsTest(_Sandbox):
         self.assertEqual(cs._installed_pulse_hooks(self.settings_data()), set(cs.HOOK_GROUP_NAMES))
         post = self.settings_data()["hooks"]["PostToolUse"]
         self.assertEqual(post[0]["matcher"], "")
-        self.assertTrue(post[0]["hooks"][0]["command"].endswith("--hook-refresh"))
+        # Pinned to exit 0 like every other hook command (F25).
+        self.assertTrue(post[0]["hooks"][0]["command"].endswith("--hook-refresh; exit 0"))
 
     def test_remove_keeps_other_groups_and_foreign_hooks(self):
         foreign = {"matcher": "", "hooks": [{"type": "command", "command": "lint.sh"}]}

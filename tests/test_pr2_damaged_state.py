@@ -122,16 +122,25 @@ class _Sandboxed(unittest.TestCase):
         atomic writer is still dumping into a temp sibling.
         """
         seen = []
-        real_dump = json.dump
+        real_dump, real_dumps = json.dump, json.dumps
 
-        def spy(obj, fp, *args, **kwargs):
+        def snapshot():
             try:
                 seen.append(Path(path).read_bytes())
             except OSError:
                 seen.append(None)
+
+        # Writers serialise with json.dump straight into a file, or with
+        # json.dumps first (the atomic writer); either moment will do.
+        def spy_dump(obj, fp, *args, **kwargs):
+            snapshot()
             return real_dump(obj, fp, *args, **kwargs)
 
-        with mock.patch.object(cs.json, "dump", spy):
+        def spy_dumps(obj, *args, **kwargs):
+            snapshot()
+            return real_dumps(obj, *args, **kwargs)
+
+        with mock.patch.object(cs.json, "dump", spy_dump),                 mock.patch.object(cs.json, "dumps", spy_dumps):
             write()
         self.assertTrue(seen, "nothing was dumped")
         return seen

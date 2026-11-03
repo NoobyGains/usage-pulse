@@ -13,6 +13,47 @@ Ideas, not promises:
 - Live Codex limits through its app-server instead of the last session file.
 - A `skills/` layout for the plugin.
 
+## [3.7.0] - 2026-11-03
+
+### Added
+
+- **`--uninstall`** takes usage-pulse out of Claude Code's settings: the status line, the agent-panel rows, every usage-pulse hook and the `/pulse` command. It backs up `settings.json` first and leaves other tools' entries alone. Before, deleting the script left hooks that made Claude Code report an error after every tool call.
+- **`↻ Restart Claude`** replaces `↑ Claude Update` when the newer Claude Code is already installed on disk and only a restart applies it. `--config` says to restart in that case too.
+- `--currency` takes any ISO code the rate service lists (`DKK`, `NOK`, `SEK` and so on), not just a symbol. A bare `kr` follows your machine's country: Danish kroner in Denmark, Norwegian in Norway, Swedish elsewhere.
+
+### Changed
+
+- **`--wrap auto` now uses up to four rows** instead of two, and it works with the rainbow theme and rainbow animation, which used to be cut instead. A line that still does not fit loses whole widgets from the end and finishes with a dim `…`, where it used to be cut in the middle of a word or a bar.
+- **The 7-day and all-time cost widgets are refreshed by a background process.** They show the last figure meanwhile and appear a few seconds after you first switch them on. The first redraw after updating shows no figure until that scan finishes.
+- `--bar-size auto` measures the real line, including the staleness label and plan name, so shrink-to-fit actually fits.
+- A currency with no rate source is shown in dollars instead of a dollar figure under that currency's symbol.
+
+### Fixed
+
+- **The bar no longer goes blank over a damaged file.** A wrong value in `cache.json`, a credentials file with `"rateLimitTier": null`, or a damaged `hook_state.json`, history, stats, animation or heatmap file used to blank the bar on every redraw, some of them for good. Each now reads as empty and is rewritten. Cache, history, stats and the other shared state files are written atomically, so two windows, or a redraw Claude Code cancels, can no longer leave an empty file that wipes your history or the rate-limit backoff.
+- **Accented and non-Latin names no longer come out garbled or blank the bar on Windows.** Claude Code's data is read as UTF-8 whatever the code page, so model, branch and session names show correctly, git branch names too, and a stray invalid character becomes `?` instead of emptying the line.
+- **A hand-edited `config.json` is read properly.** One saved with a byte-order mark (Notepad's "UTF-8 with BOM") was silently ignored, and one saved as UTF-16 or ANSI blanked the bar. UTF-8, UTF-8 with BOM and UTF-16 work; a file that cannot be decoded falls back to the defaults.
+- **A window that has reset no longer keeps its old percentage.** After the 5-hour or weekly reset the bar showed the old figure next to `now`, also in new sessions. It now reads 0%.
+- **The 7-day, all-time and `--stats` costs were about twice too high.** Duplicate transcript lines were counted twice and 1-hour cache writes were priced as 5-minute ones. Each response is now counted once and cache writes are priced by how long they last.
+- **After `/compact` the context bar clears** instead of keeping the old value, and tokens mode no longer shows `0/1M` next to a 92% bar.
+- **Each window shows its own numbers.** The branch, changed-file count and ahead/behind count are kept per repo folder, so a window no longer shows another repo's branch. The heartbeat shows this session's tool count and time instead of lifetime totals (`4001 tools 72h`) and stays empty until the session's first tool call. `⚠ Context ↑fast` no longer fires because a second window of the same account has a lower context.
+- **Extra-usage credits stay current.** They refresh with the per-model caps, are converted to your currency, and show `(stale)` or `(3d ago)` when the figure is old.
+- **The weekly reset keeps its minutes** in the 12-hour clock: `Fri 10:30am`, not `Fri 10am`.
+- **Danish and Norwegian costs use the right krone.** They were converted at the Swedish rate, and `DKK` and `NOK` could not be chosen.
+- **Claude apps gateway and no-login users get their bar.** They saw `No credentials — run claude and /login` instead of the spend bar, model, context and cost that Claude Code already sends.
+- `+N sessions` no longer counts a window's own redraws, and Windows no longer collects a new marker file for every redraw; markers are only written while the widget is on.
+- **A slow git no longer freezes the bar.** `git_drift` and `files_changed` note the attempt before running git, give git at most 1.5 seconds and keep showing the last answer; ahead/behind takes one git call instead of two. Plugin installs and folders that are not git installs no longer start git on every redraw.
+- **MiniMax and a second Claude account can no longer stall a redraw.** `mmx quota show` runs at most every two minutes and, on Windows, its 3-second timeout really does stop it. A second account's usage fetch waits for its own redraw instead of running beside the main fetch, and gives up after 1.5 seconds.
+- **The staleness label and the update arrows survive a narrow window.** `(5m ago)` sits next to the numbers it describes and is dropped last, and the arrows have room reserved instead of being cut first.
+- Wide characters (CJK, emoji) are measured by the terminal cells they take, and zero-width ones are no longer counted, so lines and agent-panel rows fit. The rainbow theme no longer corrupts clickable links such as the pull request badge.
+- **Windows: the bar appears on machines without Git for Windows.** The installed command was a PowerShell syntax error there. It now runs unchanged under Git Bash, PowerShell 7 and Windows PowerShell 5.1, and no longer depends on `$HOME`, which Git Bash and Windows disagree about. **If your bar never appeared for this reason, run the installer or `--setup` once more after updating:** existing commands are not rewritten automatically.
+- The plugin's `SessionStart` hook works without Git Bash, so a plugin update re-points the status line on every Windows machine. Both installers skip the Microsoft Store Python stub and use the first Python 3.8 or newer that runs. On Windows the command prefers the `py -3` launcher, so removing a venv or upgrading Python does not blank the bar.
+- **Every hook command ends in `; exit 0`,** the heartbeat and agent-start hooks too, so a moved or deleted install never makes Claude Code report a hook error after each tool call. The first redraw after a fresh install no longer deletes the heartbeat hook that setup just installed.
+- **Settings writes are safer.** On Windows they retry when another process has the file open (`WinError 5`), which stops `--setup` failing at random. A symlinked `settings.json` stays a symlink, non-ASCII text is no longer turned into `\u` escapes, and a `padding` you set on the status line survives a reinstall. A command that fails, such as one that cannot save the config, now says so and exits 1 instead of printing a blank line and looking like success.
+- **`--update` no longer wipes your edits.** It refuses a side branch, a detached checkout or uncommitted changes, only fast-forwards, and reports `ahead of main` for a checkout that already has the newest commit. It also refreshes the installed `/pulse` command.
+- **Claude Code update arrow is right.** It is shown only when the version on your release channel is newer than the running one (a newer build used to be told to update), it follows `autoUpdatesChannel` (`stable` or `latest`), and one cached request covers both channels.
+- Contributors: the tests no longer depend on your terminal width, no longer call the real usage API or read your real config when `CLAUDE_CODE_OAUTH_TOKEN` or your macOS login is present, work with `USAGE_PULSE_NONINTERACTIVE` exported, and leave no `settings.json` backups in your state folder.
+
 ## [3.6.2] - 2026-11-03
 
 ### Fixed

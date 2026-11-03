@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.6.2"
+VERSION = "3.7.0"
 
 import hashlib
 import json
@@ -1371,11 +1371,9 @@ def _get_hook_state_path():
 
 
 def _read_hook_state():
-    try:
-        with open(_get_hook_state_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
+    """The shared heartbeat snapshot, or None when missing, damaged or not an object."""
+    _, data = _read_state_json(_get_hook_state_path())
+    return data if isinstance(data, dict) else None
 
 
 def _is_hook_state_fresh(hook_state, ttl=HOOK_STATE_FRESH_TTL):
@@ -1496,7 +1494,9 @@ def _get_git_branch():
     try:
         result = subprocess.run(
             [_GIT_PATH, "branch", "--show-current"],
-            capture_output=True, text=True, timeout=3,
+            # git prints UTF-8 whatever the machine's code page is.
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=3,
         )
         branch = result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
@@ -1689,23 +1689,28 @@ _SHELL_NEUTRAL_WORD = re.compile(r"[A-Za-z0-9/][A-Za-z0-9_./:~-]*")
 
 
 def _blocking_hook_command(flag, python_cmd, script_path):
-    """Return the command for a hook whose exit code can steer the team.
+    """Return the command installed for a hook; every hook uses it.
+
+    The name is from when only the hooks whose exit code can steer the team
+    (SubagentStop and the three team events) were built this way. Now all of
+    them are, so a moved or deleted install never makes Claude Code report a
+    hook error after a tool call either.
 
     Claude Code runs a hook's command through sh, or on Windows through Git
-    Bash — or PowerShell when Git Bash isn't installed. The other hooks'
-    ``$HOME/...`` interpreter is a ParserError in both PowerShells, so there
-    they never run. An unquoted forward-slash absolute interpreter plus a
+    Bash — or PowerShell when Git Bash isn't installed. A ``$HOME/...``
+    interpreter is a ParserError in both PowerShells, so there it would never
+    run. An unquoted forward-slash absolute interpreter plus a
     single-quoted script path parses the same in all of them (checked in Git
     Bash, pwsh 7 and PowerShell 5.1, which also pass the payload through on
     stdin). A *quoted* interpreter cannot: PowerShell needs ``& "..."`` to
     run one and bash reads ``&`` as "background". So an interpreter path
     with a space (or anything else unsafe unquoted) falls back to the
-    bash-only form the other hooks use.
+    bash-only form, with ``python_cmd`` as the caller wrote it for its shell.
 
     ``; exit 0`` pins the status whichever shell runs it: Python exits 2 by
     itself when the script path is missing (a moved or deleted install), and
-    for these events exit 2 would delete every task the team creates, block
-    every completion, or keep teammates from ever going idle.
+    for the blocking events exit 2 would delete every task the team creates,
+    block every completion, or keep teammates from ever going idle.
     """
     python = Path(sys.executable).as_posix()
     script = Path(__file__).resolve().as_posix()
@@ -1716,8 +1721,9 @@ def _blocking_hook_command(flag, python_cmd, script_path):
 
 # Hook groups, installable on their own (`--install-hooks --only agents,team`,
 # and the setup wizard's hooks screen). Each entry is (event, flag, blocking):
-# a blocking event is one whose exit code 2 steers Claude Code, so its command
-# is pinned to exit 0 by _blocking_hook_command.
+# a blocking event is one whose exit code 2 steers Claude Code, and its entry
+# takes no matcher. Every command, blocking or not, is pinned to exit 0 by
+# _blocking_hook_command.
 _HOOK_GROUPS = {
     # PostToolUse drives the heartbeat spinner, tool counter and last-tool
     # widget. It runs Python after every tool call, so it is opt-in.
@@ -1923,20 +1929,24 @@ def install_hooks(groups=None):
         return False
 
     hooks = settings.setdefault("hooks", {})
+    commands = {}
     for group in HOOK_GROUP_NAMES:          # fixed order keeps the file stable
         if group not in groups:
             continue
         for event, flag, blocking in _HOOK_GROUPS[group]:
-            command = _pulse_command(python_cmd, script_path, flag, settings)
+            # Every hook command is pinned to exit 0, the non-blocking ones too:
+            # when the install is moved or deleted Python exits 2 by itself, and
+            # Claude Code would show a hook error after each tool call.
+            command = _blocking_hook_command(flag, _shell_python(python_cmd, settings),
+                                             script_path)
+            commands[event] = command
             existing = hooks.get(event)
             if not isinstance(existing, list):
                 existing = []
             kept = [k for k in (_without_pulse_command(h, flag) for h in existing)
                     if k is not None]
             if blocking:
-                kept.append({"hooks": [{"type": "command", "command":
-                                        _blocking_hook_command(flag, _shell_python(python_cmd, settings),
-                                                               script_path)}]})
+                kept.append({"hooks": [{"type": "command", "command": command}]})
             else:
                 kept.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
             hooks[event] = kept
@@ -1948,7 +1958,7 @@ def install_hooks(groups=None):
     names = ", ".join(g for g in HOOK_GROUP_NAMES if g in groups)
     utf8_print(f"{GREEN}Installed usage-pulse hooks ({names}) to {settings_path}{RESET}")
     if "heartbeat" in groups:
-        utf8_print(f"  Command: {_pulse_command(python_cmd, script_path, '--hook-refresh', settings)}")
+        utf8_print(f"  Command: {commands['PostToolUse']}")
     utf8_print(f"")
     utf8_print(f"This enables:")
     if "heartbeat" in groups:
@@ -3196,7 +3206,7 @@ def check_claude_code_update(local_version=None, *, interactive=False):
                     update_cache, cached.get("timestamp"), _sanitize(local_version),
                     remote_version, update_available, channel, tags)
             return update_available
-        # No tags (written before 3.6.3), or damaged ones: a miss.
+        # No tags (written before 3.7.0), or damaged ones: a miss.
 
     # Get the dist-tags from the npm registry: one request serves both channels.
     if not interactive and not _begin_net_attempt("claude_code_update"):
@@ -5465,11 +5475,9 @@ def _get_anim_state_path():
 
 
 def _load_anim_state():
-    try:
-        with open(_get_anim_state_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """The animation state, or {} when the file is missing, damaged or not an object."""
+    _, data = _read_state_json(_get_anim_state_path())
+    return data if isinstance(data, dict) else {}
 
 
 def _save_anim_state(state):
@@ -5783,12 +5791,8 @@ def _get_history_path():
 
 
 def _read_history():
-    """Read usage history samples."""
-    try:
-        with open(_get_history_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Read usage history samples: the ones the renderer can draw, [] on a damaged file."""
+    return _load_samples(_get_history_path(), ("s", "w"))[1]
 
 
 def _window_pct(usage, key):
@@ -6078,11 +6082,8 @@ def _get_context_history_path():
 
 
 def _read_context_history():
-    try:
-        with open(_get_context_history_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Context samples the renderer can use; [] on a damaged file."""
+    return _load_samples(_get_context_history_path(), ("c",))[1]
 
 
 # context_history.json is per account, but context is per session: two windows
@@ -6204,19 +6205,18 @@ def _get_stats_path():
 
 
 def _load_stats():
-    """Load stats from disk with defaults."""
-    try:
-        with open(_get_stats_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {
-            "first_seen": _today_local(),
-            "total_sessions": 0,
-            "daily_dates": [],
-            "current_streak": 0,
-            "longest_streak": 0,
-            "last_date": "",
-        }
+    """Load stats from disk; the defaults when the file is missing, damaged or not an object."""
+    _, data = _read_state_json(_get_stats_path())
+    if isinstance(data, dict):
+        return data
+    return {
+        "first_seen": _today_local(),
+        "total_sessions": 0,
+        "daily_dates": [],
+        "current_streak": 0,
+        "longest_streak": 0,
+        "last_date": "",
+    }
 
 
 def _save_stats(stats):
@@ -6349,6 +6349,10 @@ _weekly_cost_mem = {"ts": 0, "data": {}}
 # every other window from starting a second scan.
 _COST_CACHE_VERSION = 2  # bumped when the scan's sums change; older files are not drawn
 _COST_SCAN_LOCK_TTL = 300  # seconds a claim holds off a new scan (also the retry delay after a failure)
+# A claim taken by another window a moment after this one read the clock is
+# stamped slightly in this one's future. Up to this much counts as young; a
+# stamp further ahead means the clock was set back, and the claim lapses.
+_COST_SCAN_CLOCK_SLOP = 60
 _CACHE_WRITE_1H_MULTIPLIER = 2.0  # 1-hour cache writes bill at 2x the input price
 
 # Run by the detached process: load this file by path and call the worker.
@@ -6412,7 +6416,7 @@ def _claim_cost_scan(kind, now):
                 age = now - path.stat().st_mtime
             except OSError:
                 continue  # released while we looked: try to take it
-            if 0 <= age < _COST_SCAN_LOCK_TTL:
+            if -_COST_SCAN_CLOCK_SLOP <= age < _COST_SCAN_LOCK_TTL:
                 return False
             try:
                 path.unlink()
@@ -7390,14 +7394,12 @@ def _render_heatmap(config=None):
     intensity_chars = ["\u00b7", "\u2591", "\u2592", "\u2593", "\u2588"]  # ·, ░, ▒, ▓, █
     intensity_colors = ["", theme["low"], theme["low"], theme["mid"], theme["high"]]
 
-    # Load heatmap data
-    try:
-        with open(_get_heatmap_path(), "r", encoding="utf-8") as f:
-            heatmap = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        heatmap = {}
-
-    hours_data = heatmap.get("hours", {})
+    # Load heatmap data. The file is untrusted: a damaged or wrong-shaped one
+    # draws an empty grid rather than raising.
+    _, heatmap = _read_state_json(_get_heatmap_path())
+    hours_data = heatmap.get("hours") if isinstance(heatmap, dict) else None
+    if not isinstance(hours_data, dict):
+        hours_data = {}
 
     # Build a 7x24 grid (Mon=0 .. Sun=6, hours 0-23)
     # Use the last 7 days from today
@@ -7409,9 +7411,9 @@ def _render_heatmap(config=None):
         weekday = day.weekday()  # Mon=0, Sun=6
         for hour in range(24):
             key = day.strftime("%Y-%m-%dT") + f"{hour:02d}"
-            entry = hours_data.get(key, {})
-            pct = entry.get("session_pct", 0)
-            grid[weekday][hour] = _heatmap_intensity(pct)
+            entry = hours_data.get(key)
+            pct = _usage_number(entry.get("session_pct")) if isinstance(entry, dict) else None
+            grid[weekday][hour] = _heatmap_intensity(pct or 0)
 
     day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     lines = []
@@ -8383,6 +8385,17 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
 
     # --- Hook-based live features ---
     hook_state = _read_hook_state()
+    # The heartbeat and the last tool describe one session. hook_state.json is a
+    # snapshot of whichever window's hook fired last, so a window reads its own
+    # counters (F40). Before its first tool call it has none, and the snapshot
+    # of another session is not shown in its place.
+    window_id = (stdin_ctx or {}).get("session_id")
+    if window_id:
+        own_beat = _read_session_heartbeat(window_id)
+        if own_beat:
+            hook_state = own_beat
+        elif isinstance(hook_state, dict) and hook_state.get("session_id") != _safe_path_id(window_id):
+            hook_state = None
     hook_fresh = _is_hook_state_fresh(hook_state)
 
     if show.get("heartbeat", False) and hook_fresh:
@@ -10144,16 +10157,28 @@ def install_status_line():
     # Status line command: forward-slash literal paths on Windows, written so
     # that both Git Bash and PowerShell read it the same way.
     status_command = _pulse_command(python_cmd, script_path, settings=settings)
-    status_line = {
-        "type": "command",
-        "command": status_command,
-    }
+    existing = settings.get("statusLine")
+    if isinstance(existing, dict) and "claude_status.py" in str(existing.get("command", "")):
+        # Ours already: update what we own and keep the user's other keys
+        # (such as `padding`) through every reinstall and plugin re-point.
+        status_line = existing
+        status_line["type"] = "command"
+        status_line["command"] = status_command
+    else:
+        # Absent, or another tool's: ours replaces it whole, as it always did.
+        status_line = {
+            "type": "command",
+            "command": status_command,
+        }
     # Versions up to v3.1.0 wrote `"refresh": 150` here. Claude Code has no
     # such setting, so it was silently ignored and the timed repaint never
     # happened. The real key is `refreshInterval`, in seconds.
+    status_line.pop("refresh", None)
     interval = _desired_refresh_interval(load_config())
     if interval is not None:
         status_line["refreshInterval"] = interval
+    else:
+        status_line.pop("refreshInterval", None)
     settings["statusLine"] = status_line
 
     # Render the agent-panel rows too. Claude Code falls back to its own row
@@ -11781,7 +11806,12 @@ def cmd_print_config():
                         remote_ver = _sanitize(cc_cached.get("remote", "?"))
                     except Exception:
                         remote_ver = "newer"
-                    utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} available{RESET}  (run {BOLD}claude update{RESET} in a new terminal)")
+                    # Claude Code updates itself in the background: a version
+                    # that is already on disk only needs a restart.
+                    if _version_cmp(_installed_claude_version(), remote_ver) in (0, 1):
+                        utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} installed{RESET}  ({BOLD}restart Claude Code{RESET} to use it)")
+                    else:
+                        utf8_print(f"  Claude Code:  {BRIGHT_YELLOW}{local_ver} \u2192 {remote_ver} available{RESET}  (run {BOLD}claude update{RESET} in a new terminal)")
                 elif cc_update is False:
                     utf8_print(f"  Claude Code:  {GREEN}{local_ver} (up to date){RESET}")
                 else:
@@ -12313,12 +12343,12 @@ CLI_FLAGS = [
     ("--bar-style", "<name>", "Look", "Bar characters (classic, block, dot, braille, ...)"),
     ("--layout", "<standard|compact|minimal|percent-first>", "Look", "How labels, bars and numbers are arranged"),
     ("--max-width", "<20-100>", "Look", "Percent of the terminal width to use"),
-    ("--wrap", "<off|auto>", "Look", "Wrap onto a second row instead of truncating"),
+    ("--wrap", "<off|auto>", "Look", "Wrap onto up to 4 rows instead of truncating"),
     ("--preset", "<minimal|default>", "Look", "Apply a bundle of settings (default = factory reset)"),
     ("--show", "<parts>", "Widgets", "Turn widgets on (comma-separated)"),
     ("--hide", "<parts>", "Widgets", "Turn widgets off (comma-separated)"),
     ("--priority", "<widget=N,...>", "Widgets", "Reorder widgets (lower = further left)"),
-    ("--currency", "<symbol>", "Widgets", "Currency for cost widgets (converted from USD)"),
+    ("--currency", "<symbol|code>", "Widgets", "Currency for cost widgets: a symbol or ISO code such as DKK (converted from USD)"),
     ("--clock-format", "<12h|24h>", "Widgets", "Clock for reset times"),
     ("--effort-format", "<labeled|full|short>", "Widgets", "How reasoning effort is written"),
     ("--context-format", "<percent|tokens>", "Widgets", "Context window as a percentage or tokens"),
@@ -12421,7 +12451,7 @@ def _stdin_only_line(config, stdin_ctx):
     show["weekly"] = False
     cfg["show"] = show
     line = build_status_line({}, "", cfg, stdin_ctx, cache_age=None)
-    _update_session_state({}, stdin_ctx)
+    _update_session_state({}, stdin_ctx, config)
     if stdin_ctx.get("context_pct") is not None:
         _append_context_history(stdin_ctx["context_pct"])
     line = append_update_indicator(line, config)
@@ -12706,7 +12736,7 @@ def main():
         else:
             utf8_print("Usage: --wrap <off|auto>")
             utf8_print(f"  {'off':<10} Truncate long lines (default)")
-            utf8_print(f"  {'auto':<10} Wrap to 2 lines at | separators when overflow")
+            utf8_print(f"  {'auto':<10} Wrap onto up to 4 rows at | separators when it overflows")
         return
 
     if "--bar-style" in args:
@@ -12833,7 +12863,7 @@ def main():
                 pass
             utf8_print(f"Currency symbol: {BOLD}{val}{RESET}")
         else:
-            utf8_print("Usage: --currency <symbol>  (e.g. \u00a3, $, \u20ac, \u00a5)")
+            utf8_print("Usage: --currency <symbol|code>  (e.g. \u00a3, $, \u20ac, \u00a5, DKK, NOK)")
         return
 
     if "--weekly-timer-format" in args:
@@ -13248,7 +13278,7 @@ def main():
     _gateway_run = _spend_limit_live(stdin_ctx.get("spend_limit"))
     if not stdin_rl and _gateway_run:
         line = _stdin_only_line(config, stdin_ctx)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
     if stdin_rl:
         # Build a synthetic usage dict from stdin rate limits. Take *every*
@@ -13442,7 +13472,7 @@ def main():
         # Guarded: a value in a file the renderer cannot draw must not leave a
         # blank bar. The side effects below still run, so the damage heals.
         line = _guarded_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, 0)
-        _update_session_state(usage_from_stdin, stdin_ctx)
+        _update_session_state(usage_from_stdin, stdin_ctx, config)
         _append_history(usage_from_stdin)
         if stdin_ctx.get("context_pct") is not None:
             _append_context_history(stdin_ctx["context_pct"])
@@ -13455,7 +13485,7 @@ def main():
         _seed_active_provider_cache(usage_from_stdin, config)
 
         line = _finish_line(line, config, stdin_ctx)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # --- Cached data (no stdin rate limits available) ---
@@ -13468,13 +13498,13 @@ def main():
             line = _guarded_status_line(cached["usage"], cached.get("plan", ""), config,
                                         stdin_ctx, cache_age,
                                         fallback=cached.get("line", ""))
-            _update_session_state(cached["usage"], stdin_ctx)
+            _update_session_state(cached["usage"], stdin_ctx, config)
         else:
             line = cached.get("line", "")
         if not isinstance(line, str) or not line.strip():
             line = _SAFE_FALLBACK_LINE   # never a blank bar
         line = _finish_line(line, config, stdin_ctx)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # --- API fallback (first call or no stdin rate limits) ---
@@ -13487,7 +13517,7 @@ def main():
         if _stdin_has_session_data(stdin_ctx):
             line = _stdin_only_line(config, stdin_ctx)
             if _strip_ansi(line).strip():
-                sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+                sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
                 return
         if os.environ.get("ANTHROPIC_API_KEY"):
             line = "API key detected \u2014 usage-pulse requires a Pro/Max subscription"
@@ -13495,7 +13525,7 @@ def main():
             line = "No credentials \u2014 run claude and /login"
         write_cache(cache_path, line)
         line = _fit_line(_append_provider_rows(line, config), config)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     # Claude Code cancels a repaint that outlives its refresh interval, and a
@@ -13521,7 +13551,7 @@ def main():
         if not line:
             line = "Usage unavailable \u2014 retrying shortly"
         line = _finish_line(line, config, stdin_ctx)
-        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
         return
 
     try:
@@ -13587,7 +13617,7 @@ def main():
                 )
             _end_net_attempt("usage")
             line = _fit_line(_append_provider_rows(line, config), config)
-            sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+            sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
             return
         else:
             line = f"API error: {e.code}"
@@ -13622,7 +13652,7 @@ def main():
         write_cache(cache_path, line, usage, plan)
         _append_history(usage)
         _update_heatmap(usage)
-        _update_session_state(usage, stdin_ctx)
+        _update_session_state(usage, stdin_ctx, config)
         if stdin_ctx and stdin_ctx.get("context_pct") is not None:
             _append_context_history(stdin_ctx["context_pct"])
         try:
@@ -13635,7 +13665,47 @@ def main():
         # Cache error lines so we don't hammer the API on every refresh
         write_cache(cache_path, line)
     line = _finish_line(line, config, stdin_ctx)
-    sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+    sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
+
+
+def _handle_fatal_error(exc):
+    """What to do when main() raises: the ``__main__`` block calls this.
+
+    Claude Code runs the status line, the agent-panel rows and the hooks with
+    stdin piped and nobody watching, and none of them may crash it with a
+    traceback. So there the error is swallowed: the status line prints a clean
+    blank line, the rows and hooks print nothing (a hook's stdout is read as
+    context), and the process exits 0.
+
+    A command a person types (``--theme``, ``--install``, ``--stats`` ...) must
+    not hide a failure: it used to print a blank line and exit 0, so a config
+    that could not be saved looked saved. It says what went wrong on stderr and
+    exits 1. So does the bare script run at a terminal.
+    """
+    args = sys.argv[1:]
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    status_line_mode = not args
+    run_by_claude_code = status_line_mode or args[0] in {
+        row[0] for row in CLI_FLAGS if row[2] == "Internal"}
+    if run_by_claude_code and not interactive:
+        if status_line_mode:
+            try:
+                sys.stdout.buffer.write((RESET + "\n").encode("utf-8", "replace"))
+            except Exception:
+                pass
+        return
+    message = f"usage-pulse: {type(exc).__name__}: {exc}\n"
+    try:
+        sys.stderr.write(message)
+    except (UnicodeError, OSError, ValueError):
+        try:
+            sys.stderr.write(message.encode("ascii", "replace").decode("ascii"))
+        except Exception:
+            pass
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
@@ -13643,17 +13713,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         raise SystemExit(130)
-    except Exception:
-        # A status line must never crash Claude Code with a traceback. When
-        # invoked as the status line (stdin is piped, not a TTY) degrade to a
-        # clean blank line; for interactive CLI use, surface the error.
-        try:
-            interactive = sys.stdin.isatty()
-        except Exception:
-            interactive = False
-        if interactive:
-            raise
-        try:
-            sys.stdout.buffer.write((RESET + "\n").encode("utf-8"))
-        except Exception:
-            pass
+    except Exception as exc:
+        _handle_fatal_error(exc)

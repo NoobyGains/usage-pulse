@@ -3414,6 +3414,11 @@ _CODEX_TAIL_BYTES = 2_000_000     # rollouts reach ~100 MB; read only the tail
 _CODEX_DAY_DIRS = 2
 _CODEX_MAX_FILES = 3
 _MINIMAX_PROVIDER_TTL = 120
+_MINIMAX_TIMEOUT = 3              # seconds; hard ceiling on one `mmx quota show`
+# Hard wall-clock ceiling on a second Claude account's usage fetch. Kept at the
+# render path's fetch budget so it fits inside the shortest refresh interval.
+_PROVIDER_FETCH_BUDGET = _NET_FETCH_BUDGET
+_PROVIDER_RETRY_JITTER = 8        # seconds; spread so accounts' retries differ
 _GEMINI_BUCKETS = {
     "gemini": ("gemini-5h", "gemini-weekly"),
     "3p": ("3p-5h", "3p-weekly"),   # Claude/GPT-OSS models inside Antigravity
@@ -3913,6 +3918,45 @@ def _read_other_claude_token(config_dir, now=None):
     return token, plan
 
 
+def _provider_retry_seconds(pid):
+    """Minimum gap between two refresh attempts for *pid*.
+
+    ``_PROVIDER_RETRY`` plus a small offset taken from the id: it is stable for
+    one account but differs between accounts, so their retries (and the main
+    fetch's, which keeps the plain 60 s) stop falling due on the same repaint.
+    """
+    return _PROVIDER_RETRY + sum(str(pid).encode("utf-8", "replace")) % _PROVIDER_RETRY_JITTER
+
+
+def _call_bounded(fn, budget):
+    """Return ``fn()``, giving up after *budget* seconds of wall-clock time.
+
+    A socket timeout restarts for every address and ``getaddrinfo`` has none at
+    all, so neither promises a ceiling (see ``_fetch_bounded``). ``fn`` runs on
+    a daemon thread that is simply abandoned at the ceiling: the process exits
+    moments later and takes it along, and a late answer is dropped. What ``fn``
+    raises is raised here (a ``BaseException`` too); running out of time raises
+    ``TimeoutError``.
+    """
+    outcome = []
+
+    def work():
+        try:
+            outcome.append((True, fn()))
+        except BaseException as exc:  # handed back to the caller below
+            outcome.append((False, exc))
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()          # RuntimeError (no thread to spare) is the caller's error
+    worker.join(budget)
+    if not outcome:
+        raise TimeoutError("no answer within %.1fs" % budget)
+    ok, value = outcome[0]
+    if ok:
+        return value
+    raise value
+
+
 def _refresh_claude_provider(entry, config, now=None, budget=None):
     """Return the cache for a non-active Claude account, refreshing it if due.
 
@@ -3920,11 +3964,15 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
     is made only when all of these hold: the data is older than
     ``providers_refresh_seconds``; no 429 / auth / error backoff is running;
     the last *attempt* is over 60 s old; the account has an unexpired token on
-    disk; and ``budget`` (a one-item list shared by one repaint) still allows
-    a network call. The attempt is stamped before the request.
+    disk; ``budget`` (a one-item list shared by one repaint) still allows
+    a network call; and the repaint has not already made one (the main usage
+    fetch or any other check: ``_begin_net_attempt`` lets the optional checks
+    take turns, so this one simply waits for a later repaint). The attempt is
+    stamped before the request, and the request has a hard wall-clock ceiling.
     """
     now = time.time() if now is None else now
     pid = entry["id"]
+    retry = _provider_retry_seconds(pid)
     cache = _read_provider_cache(pid) or {}
 
     def _num(key):
@@ -3938,7 +3986,7 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
     if now < _num("rate_limited_until") or now < _num("auth_failed_until") \
             or now < _num("error_until"):
         return cache
-    if now - _num("last_attempt") < _PROVIDER_RETRY:
+    if now - _num("last_attempt") < retry:
         return cache
     if budget is not None and budget[0] <= 0:
         return cache
@@ -3955,22 +4003,33 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
         # Re-read under the lock: that window may just have stamped or refreshed.
         cache = _read_provider_cache(pid) or cache
         if now - _num("timestamp") < _provider_refresh_seconds(config) \
-                or now - _num("last_attempt") < _PROVIDER_RETRY:
+                or now - _num("last_attempt") < retry:
+            return cache
+        # One network call per repaint: when the main usage fetch (or another
+        # optional check) has just run, wait for a later repaint. Waiting is
+        # not failing, so nothing is stamped and no budget is spent.
+        net_key = "provider:%s" % pid
+        if not _begin_net_attempt(net_key, backoff=retry):
             return cache
         if budget is not None:
             budget[0] -= 1
         cache = dict(cache)
         cache["last_attempt"] = now
         if not _write_provider_cache(pid, cache):
+            _end_net_attempt(net_key)
             return cache        # unsaved attempt: never risk one fetch per repaint
         try:
-            usage = fetch_usage(token, timeout=_PROVIDER_TIMEOUT)
+            usage = _call_bounded(
+                lambda tok=token: fetch_usage(tok, timeout=_PROVIDER_TIMEOUT),
+                _PROVIDER_FETCH_BUDGET)
             token = None
+            _end_net_attempt(net_key)
             fresh = {"timestamp": time.time(), "usage": _clean_provider_usage(usage),
                      "plan": plan or cache.get("plan"), "last_attempt": now}
             _write_provider_cache(pid, fresh)
             return fresh
         except urllib.error.HTTPError as exc:
+            _end_net_attempt(net_key)
             code = getattr(exc, "code", None)
             if code == 429:
                 retry_after = _retry_after_seconds(getattr(exc, "headers", None))
@@ -3983,6 +4042,7 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
             else:
                 cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
         except Exception:
+            _end_net_attempt(net_key)
             cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
         token = None
         _write_provider_cache(pid, cache)
@@ -4221,8 +4281,60 @@ def _minimax_env_active():
         os.environ.get("ANTHROPIC_MODEL", "").startswith("MiniMax-")
 
 
-def _read_minimax_quota(pid="minimax", now=None):
-    """MiniMax windows via ``mmx quota show`` at most every 120 s (cached)."""
+def _minimax_run_quota(exe):
+    """Run ``mmx quota show``; return its windows in Pulse's shape, or None.
+
+    npm installs mmx as a ``.cmd`` shim on Windows: a ``cmd.exe`` that starts
+    ``node.exe``. On a timeout ``subprocess.run`` kills only the shim, and with
+    pipes it then waits for end-of-file on pipes the still-running node holds,
+    for as long as MiniMax's API hangs (see ``_git`` with ``network=True``). So
+    the call gets no pipes at all: stdout goes to a temp file, stdin and stderr
+    to the null device, and ``_MINIMAX_TIMEOUT`` is a real ceiling on every OS.
+    """
+    import tempfile  # only this path needs it
+    try:
+        with tempfile.TemporaryFile() as out:
+            proc = subprocess.run(
+                [exe, "quota", "show", "--output", "json", "--quiet"],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                timeout=_MINIMAX_TIMEOUT,
+            )
+            if proc.returncode != 0:
+                return None
+            out.seek(0)
+            raw = out.read(_PROVIDER_FILE_MAX)
+        return _parse_minimax_quota(json.loads(raw)) or None
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+        return None
+
+
+def _minimax_cached_windows(cache, now=None):
+    """The cached MiniMax windows as the main bar's ``_rate_limits``.
+
+    Empty when there is nothing cached or it is older than
+    ``_PROVIDER_STALE_AFTER``: the provider row draws old numbers with a "~",
+    but the main bar has no such marker, so it shows no bars instead.
+    """
+    now = time.time() if now is None else now
+    try:
+        stamp = float((cache or {}).get("timestamp") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(stamp) or stamp <= 0 or now - stamp > _PROVIDER_STALE_AFTER:
+        return {}
+    return _clean_provider_usage((cache or {}).get("usage"), now)
+
+
+def _read_minimax_quota(pid="minimax", now=None, primary=False):
+    """MiniMax windows via ``mmx quota show`` at most every 120 s (cached).
+
+    One cache serves the provider row and the main bar of an mxclaude window,
+    so ``mmx`` (a Node start-up plus a call to MiniMax) never runs on every
+    repaint. The attempt is stamped before the call; when it cannot be stamped
+    nothing is run. Like the other optional checks it takes turns with them
+    (``_begin_net_attempt``), unless ``primary``: on an mxclaude window ``mmx``
+    is the usage bar itself, the way the usage fetch is on a Claude one.
+    """
     now = time.time() if now is None else now
     cache = _read_provider_cache(pid) or {}
     try:
@@ -4234,22 +4346,20 @@ def _read_minimax_quota(pid="minimax", now=None):
     exe = shutil.which("mmx")
     if not exe:
         return cache
+    net_key = "provider:%s" % pid
+    if not _begin_net_attempt(net_key, backoff=_MINIMAX_PROVIDER_TTL, primary=primary):
+        return cache
     cache = dict(cache)
     cache["last_attempt"] = now
-    _write_provider_cache(pid, cache)
-    try:
-        proc = subprocess.run(
-            [exe, "quota", "show", "--output", "json", "--quiet"],
-            capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL,
-        )
-        if proc.returncode == 0:
-            parsed = _parse_minimax_quota(json.loads(proc.stdout))
-            if parsed:
-                cache["usage"] = parsed
-                cache["timestamp"] = now
-    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
-        pass
-    _write_provider_cache(pid, cache)
+    if not _write_provider_cache(pid, cache):
+        _end_net_attempt(net_key)
+        return cache            # unsaved attempt: never risk one run per repaint
+    parsed = _minimax_run_quota(exe)
+    _end_net_attempt(net_key)
+    if parsed:
+        cache["usage"] = parsed
+        cache["timestamp"] = now
+        _write_provider_cache(pid, cache)
     return cache
 
 
@@ -6200,19 +6310,15 @@ def _parse_stdin_context(raw_stdin):
             # schema. Only override if stdin didn't already provide rate_limits.
             if not result.get("_rate_limits"):
                 try:
-                    # npm installs mmx as a .cmd shim on Windows, which
-                    # subprocess won't auto-resolve (only .exe) — resolve it
-                    # like _GIT_PATH/_CLAUDE_PATH above.
-                    mmx_proc = subprocess.run(
-                        [shutil.which("mmx") or "mmx",
-                         "quota", "show", "--output", "json", "--quiet"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    if mmx_proc.returncode == 0:
-                        parsed = _parse_minimax_quota(json.loads(mmx_proc.stdout))
-                        if parsed:
-                            result["_rate_limits"] = parsed
-                except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                    # Cached for _MINIMAX_PROVIDER_TTL like the provider row:
+                    # this runs on every repaint, and `mmx` is a Node start-up
+                    # plus a call to MiniMax. _read_minimax_quota resolves the
+                    # npm .cmd shim via shutil.which and runs it with no pipes.
+                    quota = _minimax_cached_windows(
+                        _read_minimax_quota("minimax", primary=True))
+                    if quota:
+                        result["_rate_limits"] = quota
+                except Exception:
                     pass  # renderer will simply not show rate bars
     except (AttributeError, KeyError, ValueError, TypeError, OSError):
         pass

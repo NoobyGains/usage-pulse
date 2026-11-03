@@ -483,6 +483,7 @@ class RetryAfterOnProviderRowTest(unittest.TestCase):
                     cache_file.unlink()
                 except OSError:
                     pass
+                self.sb.next_repaint()   # each case is its own repaint's turn
                 writes = []
 
                 def spy(pid, data):

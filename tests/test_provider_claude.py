@@ -136,6 +136,7 @@ class ClaudeProviderTest(unittest.TestCase):
         now = time.time()
         with mock.patch.object(cs, "fetch_usage", return_value=dict(API_USAGE)):
             cs._refresh_claude_provider(self.entry, self.config, now=now - 1000)
+        self.sb.next_repaint()   # the refresh took this repaint's turn on the network
         with mock.patch.object(cs, "fetch_usage", side_effect=_http_error(429)):
             c = cs._refresh_claude_provider(self.entry, self.config, now=now)
         self.assertEqual(c["usage"]["five_hour"]["utilization"], 34.0)
@@ -162,6 +163,7 @@ class ClaudeProviderTest(unittest.TestCase):
             rows = cs._collect_provider_rows(config)
             self.assertEqual(fetch.call_count, 1)
             self.assertEqual(len(rows), 2)
+            self.sb.next_repaint()   # the first refresh took the last repaint's turn
             cs._collect_provider_rows(config)
             self.assertEqual(fetch.call_count, 2)  # the other one, next repaint
 

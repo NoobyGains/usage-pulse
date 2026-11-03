@@ -1151,14 +1151,21 @@ def load_config():
     repo_path = Path(__file__).parent / "config.json"
 
     # User config takes priority, fall back to repo template
+    # The README tells people to hand-edit this file, and Windows editors save
+    # it in whatever they like. json.loads() on bytes detects UTF-8 (with or
+    # without a BOM), UTF-16 and UTF-32. A file it cannot decode (ANSI with a
+    # pound sign), cannot parse, cannot open, or that is not a JSON object is
+    # skipped like a missing one: a raise here is a blank bar on every repaint.
     data = {}
     for path in (user_path, repo_path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            break
-        except (FileNotFoundError, json.JSONDecodeError):
+            with open(path, "rb") as f:
+                loaded = json.loads(f.read())
+        except (OSError, ValueError, RecursionError):
             continue
+        if isinstance(loaded, dict):
+            data = loaded
+            break
 
     # Clean up removed settings
     data.pop("rainbow_bars", None)
@@ -1303,9 +1310,15 @@ def _read_hook_state():
 
 
 def _is_hook_state_fresh(hook_state, ttl=HOOK_STATE_FRESH_TTL):
-    if not hook_state:
+    # The file is untrusted: valid JSON of the wrong shape (a list, a number) or
+    # a stamp that is text, null, NaN or absurdly far ahead all read as stale
+    # instead of raising, which would blank the bar on every repaint.
+    if not isinstance(hook_state, dict) or not hook_state:
         return False
-    return (time.time() - hook_state.get("last_refresh", 0)) < ttl
+    refreshed = _cache_seconds(hook_state.get("last_refresh"))
+    if refreshed is None:
+        return False
+    return abs(time.time() - refreshed) < ttl
 
 
 def _format_elapsed(seconds):
@@ -2896,11 +2909,219 @@ def _model_caps_ttl(config):
     return max(_MODEL_CAPS_MIN_TTL, ttl)
 
 
+# --- Untrusted state files ---------------------------------------------------
+#
+# Every file under the state dir can be damaged (a hand edit, a disk or
+# antivirus fault, another version's format) or caught mid-write by a window
+# that still writes in place. A raise on the render path is a blank bar on
+# every repaint, and an empty read written straight back erases the data. The
+# helpers below turn a file into only what the renderer can use.
+
+def _usage_number(value):
+    """*value* as a finite float, or None: text, bool, NaN, Infinity, an int too big."""
+    try:
+        return _stdin_number(value)
+    except OverflowError:   # an int past the float range
+        return None
+
+
+_USAGE_WINDOW_KEYS = ("five_hour", "seven_day", "seven_day_opus",
+                      "seven_day_sonnet", "seven_day_fable")
+_EXTRA_USAGE_NUMBERS = ("monthly_limit", "used_credits", "utilization")
+
+
+def _clean_usage(usage):
+    """The part of an untrusted usage dict that the renderer can draw.
+
+    A window is kept only if it is a dict whose utilization is a finite number
+    (or null, which the API sends and the renderer reads as 0); its reset time
+    must be text or null. Anything else is dropped, so that window draws as
+    missing instead of raising. The extra_usage numbers are coerced the same
+    way, to null. A window the plan lacks (null) is kept as null.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    clean = {}
+    for key in _USAGE_WINDOW_KEYS:
+        if key not in usage:
+            continue
+        window = usage[key]
+        if window is None:
+            clean[key] = None
+            continue
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if utilization is not None and _usage_number(utilization) is None:
+            continue
+        window = dict(window)
+        resets_at = window.get("resets_at")
+        if resets_at is not None and not isinstance(resets_at, str):
+            window["resets_at"] = None
+        clean[key] = window
+    extra = usage.get("extra_usage")
+    if isinstance(extra, dict):
+        extra = dict(extra)
+        for key in _EXTRA_USAGE_NUMBERS:
+            if extra.get(key) is not None and _usage_number(extra[key]) is None:
+                extra[key] = None
+        clean["extra_usage"] = extra
+    elif "extra_usage" in usage and extra is None:
+        clean["extra_usage"] = None
+    return clean
+
+
+def _clean_cache_entry(cached):
+    """Make a cache dict read from disk safe to draw from (in place); returns it.
+
+    Usage is cleaned; if nothing in it is usable it is removed, so the caller
+    falls back to the cached line instead of drawing zeros. A line or plan that
+    is not text is removed.
+    """
+    if "usage" in cached:
+        if isinstance(cached["usage"], dict):
+            cleaned = _clean_usage(cached["usage"])
+            if cleaned or not cached["usage"]:
+                cached["usage"] = cleaned
+            else:
+                del cached["usage"]
+        else:
+            del cached["usage"]
+    for key in ("line", "plan"):
+        if key in cached and not isinstance(cached[key], str):
+            del cached[key]
+    return cached
+
+
+_SAFE_FALLBACK_LINE = "Usage unavailable \u2014 retrying shortly"
+
+
+def _guarded_status_line(usage, plan, config, stdin_ctx, cache_age, fallback=""):
+    """build_status_line that never raises, so a bad file never means a blank bar.
+
+    First the data as given; then the data cleaned down to what the renderer can
+    draw; then the cached line, if there is one; then a short message. Only
+    Exception is caught, so Claude Code cancelling a repaint still works.
+    """
+    try:
+        return build_status_line(usage, plan, config, stdin_ctx, cache_age=cache_age)
+    except Exception:
+        pass
+    try:
+        return build_status_line(_clean_usage(usage), plan, config, stdin_ctx,
+                                 cache_age=cache_age)
+    except Exception:
+        pass
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback
+    return _SAFE_FALLBACK_LINE
+
+
+# How long a state file that cannot be parsed is left alone before it is
+# treated as damaged for good. A window that still writes in place leaves the
+# file empty or half-written for a few milliseconds; another window must not
+# take that for "no data" and write a one-sample file over a day of history.
+_DAMAGED_STATE_GRACE = 10
+
+
+# While another window swaps a state file in with os.replace, Windows makes
+# open() on it fail for a moment with PermissionError (measured: a third of
+# the reads in a tight loop against a writer, about one in fifty at a write per
+# 10 ms). Read as "no data" that erased the 429 backoff, so the read is tried
+# again a couple of times first. A PermissionError that persists is real.
+_STATE_READ_TRIES = 3
+_STATE_READ_PAUSE = 0.005
+
+
+def _read_state_file(path, binary=False):
+    """Contents of a state file (bytes if *binary*, else UTF-8 text)."""
+    for attempt in range(_STATE_READ_TRIES):
+        try:
+            if binary:
+                with open(path, "rb") as f:
+                    return f.read()
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except PermissionError:
+            if attempt == _STATE_READ_TRIES - 1:
+                raise
+            time.sleep(_STATE_READ_PAUSE)
+
+
+def _read_state_json(path):
+    """Read a JSON state file ahead of a read-modify-write: ``(ok, data)``.
+
+    A missing file is ``(True, None)``. A file that cannot be parsed or decoded
+    is ``(False, None)`` while it was changed within _DAMAGED_STATE_GRACE
+    seconds (the caller skips this write) and ``(True, None)`` once it has sat
+    that way (the caller starts again from empty, which heals it). A file that
+    cannot be opened at all is ``(False, None)``.
+    """
+    try:
+        return True, json.loads(_read_state_file(path, binary=True))
+    except FileNotFoundError:
+        return True, None
+    except (ValueError, RecursionError):
+        # Not UTF-8, not JSON (a truncated write), or an int past the digit limit.
+        try:
+            recent = abs(time.time() - os.stat(path).st_mtime) <= _DAMAGED_STATE_GRACE
+        except OSError:
+            recent = True
+        return (not recent), None
+    except OSError:
+        return False, None
+
+
+def _load_samples(path, numeric_keys):
+    """``(ok, samples)`` from a history-style file: a list of dicts with a numeric ``t``.
+
+    An entry is kept only if its ``t`` and every key in *numeric_keys* that it
+    carries are finite numbers. A file of any other shape holds no samples.
+    ``ok`` is False when the caller should skip its write (see _read_state_json).
+    """
+    ok, raw = _read_state_json(path)
+    if not ok or not isinstance(raw, list):
+        return ok, []
+    samples = []
+    for sample in raw:
+        if not isinstance(sample, dict) or _usage_number(sample.get("t")) is None:
+            continue
+        if any(key in sample and _usage_number(sample[key]) is None for key in numeric_keys):
+            continue
+        samples.append(sample)
+    return True, samples
+
+
+# Orphans from atomic writes that were killed between the temp file and the
+# rename are named <file>.<pid>-<8 hex>.tmp (see _atomic_json_write). A write
+# takes milliseconds, so anything this old belongs to no live writer.
+_TMP_ORPHAN_RE = re.compile(r"\.\d+-[0-9a-f]{8}\.tmp$")
+_TMP_ORPHAN_AGE = 600
+_TMP_SWEEP_ODDS = 0.02   # about one cache write in fifty
+
+
+def _sweep_stale_tmp_files(directory, max_age=_TMP_ORPHAN_AGE):
+    """Delete this script's own leftover temp files older than *max_age* seconds."""
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+    cutoff = time.time() - max_age
+    for entry in entries:
+        if not _TMP_ORPHAN_RE.search(entry.name):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and \
+                    entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path)
+        except OSError:
+            pass
+
+
 def read_cache(cache_path, ttl):
     """Return the full cache dict if fresh, else None."""
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached = json.loads(_read_state_file(cache_path))
         # The file is ours, but it is still untrusted input: a truncated write,
         # a disk error, or a hand-edit can leave valid JSON of the wrong shape.
         # Anything other than a dict is treated as a cache miss rather than
@@ -2914,7 +3135,7 @@ def read_cache(cache_path, ttl):
         # exactly the retry storm the backoff exists to prevent.
         blocked_until = _cache_seconds(cached.get("rate_limited_until")) or 0
         if blocked_until and time.time() < blocked_until:
-            return cached
+            return _clean_cache_entry(cached)
         # Error-only entries expire faster, except rate limit errors which back off longer
         if "usage" in cached:
             effective_ttl = ttl
@@ -2926,7 +3147,7 @@ def read_cache(cache_path, ttl):
         if timestamp is None:
             return None  # unusable timestamp — treat as a miss
         if time.time() - timestamp < effective_ttl:
-            return cached
+            return _clean_cache_entry(cached)
     except (OSError, ValueError, RecursionError, KeyError):
         # Missing or unreadable (OSError); not UTF-8, not JSON, or an int past
         # the int/str digit limit (each a ValueError); nested past the parser's
@@ -2943,13 +3164,15 @@ def _read_stale_cache(cache_path):
     before any usage data has been cached.
     """
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
+        cached = json.loads(_read_state_file(cache_path))
         # Same untrusted-shape rule as read_cache. This one feeds the 429
         # fallback, where raising means no status line is printed at all:
         # a cache file containing bare `42` made `"usage" in cached` raise.
         if not isinstance(cached, dict):
             return None
+        # Values the renderer cannot draw are dropped here too, so the 429
+        # branch and the stdin merge never carry them forward.
+        _clean_cache_entry(cached)
         if "usage" in cached or "line" in cached:
             return cached
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
@@ -2995,8 +3218,14 @@ def write_cache(cache_path, line, usage=None, plan=None,
             data["model_caps_fetched_at"] = model_caps_fetched_at
         if model_caps_attempted_at:
             data["model_caps_attempted_at"] = model_caps_attempted_at
-        with _secure_open_write(cache_path) as f:
-            json.dump(data, f)
+        # Atomic, like stdin_ctx.json: written in place, the file is empty for
+        # most of each write, and a second window that read it then took that
+        # for a miss and wrote it back without the 429 backoff and the caps. A
+        # replace that fails (Windows refuses while a reader holds the file
+        # open) is OSError: skip this write, the next repaint writes again.
+        _atomic_json_write(cache_path, data, indent=None)
+        if random.random() < _TMP_SWEEP_ODDS:
+            _sweep_stale_tmp_files(Path(cache_path).parent)
     except OSError:
         pass
 
@@ -3117,6 +3346,17 @@ def _authorized_request(url, token, headers=None, data=None, method=None, timeou
     req = urllib.request.Request(url, headers=hdrs, data=data, method=method)
     return _safe_opener.open(req, timeout=timeout)
 
+def _oauth_section(data):
+    """The ``claudeAiOauth`` dict of a credentials file, or {} for anything else.
+
+    The file is not ours to validate: an explicit ``null`` (or a list, or text)
+    in place of the section is valid JSON, and ``.get('claudeAiOauth', {})``
+    only supplies its default when the key is missing, not when it is null.
+    """
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    return oauth if isinstance(oauth, dict) else {}
+
+
 def _read_credential_data():
     """Read raw credential data from file or macOS Keychain. Returns (dict, source)."""
     # 1. File-based (~/.claude/.credentials.json)
@@ -3124,9 +3364,12 @@ def _read_credential_data():
     try:
         with open(creds_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("claudeAiOauth", {}).get("accessToken"):
+        if _oauth_section(data).get("accessToken"):
             return data, "file"
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    except (OSError, ValueError, RecursionError):
+        # Missing, locked or unreadable (OSError); not UTF-8 or not JSON (each
+        # a ValueError). Any of them means no credentials here, not a raise on
+        # the render path.
         pass
 
     # 2. macOS Keychain fallback
@@ -3139,7 +3382,7 @@ def _read_credential_data():
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout.strip())
-                if data.get("claudeAiOauth", {}).get("accessToken"):
+                if _oauth_section(data).get("accessToken"):
                     return data, "keychain"
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError, ValueError):
             pass
@@ -3149,13 +3392,13 @@ def _read_credential_data():
 
 def _extract_credentials(data):
     """Extract token and plan from credential data dict."""
-    if not data:
-        return None, None
-    oauth = data.get("claudeAiOauth", {})
+    oauth = _oauth_section(data)
     token = oauth.get("accessToken")
-    tier = oauth.get("rateLimitTier", "")
-    if not token:
+    tier = oauth.get("rateLimitTier")
+    if not token or not isinstance(token, str):
         return None, None
+    if not isinstance(tier, str):
+        tier = ""   # an explicit null (or any non-text) tier means no plan name
     plan = PLAN_NAMES.get(tier, _sanitize(tier.replace("default_claude_", "").replace("_", " ").title()))
     return token, plan
 
@@ -4523,8 +4766,7 @@ def _load_anim_state():
 
 def _save_anim_state(state):
     try:
-        with _secure_open_write(_get_anim_state_path()) as f:
-            json.dump(state, f)
+        _atomic_json_write(_get_anim_state_path(), state, indent=None)
     except OSError:
         pass
 
@@ -4721,7 +4963,9 @@ def format_weekly_reset(resets_at_str, fmt="auto", clock="12h"):
         if total_seconds < 86400:
             return _weekly_countdown(total_seconds)
         return _weekly_date(resets_at, clock=clock)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
+        # OSError: on Windows a date past the year 3000 cannot be converted to
+        # local time (astimezone raises "[Errno 22] Invalid argument").
         return None
 
 
@@ -4739,14 +4983,25 @@ def _read_history():
         return []
 
 
+def _window_pct(usage, key):
+    """Utilization of one usage window as a finite number; 0 when it is missing or unusable."""
+    window = usage.get(key) if isinstance(usage, dict) else None
+    if not isinstance(window, dict):
+        return 0
+    return _usage_number(window.get("utilization")) or 0
+
+
 def _append_history(usage):
     """Append a usage sample to history and prune old entries."""
-    five = usage.get("five_hour", {})
-    seven = usage.get("seven_day", {})
-    session_pct = five.get("utilization") or 0
-    weekly_pct = seven.get("utilization") or 0
+    session_pct = _window_pct(usage, "five_hour")
+    weekly_pct = _window_pct(usage, "seven_day")
 
-    samples = _read_history()
+    # Not _read_history(): that returns [] for a half-written file, and this
+    # function writes the result back. Another window's in-place write (an
+    # older version) must not turn a day of samples into one.
+    ok, samples = _load_samples(_get_history_path(), ("s", "w"))
+    if not ok:
+        return  # skip this sample; the next repaint tries again
     now = time.time()
     samples.append({"t": now, "s": session_pct, "w": weekly_pct})
 
@@ -4756,8 +5011,7 @@ def _append_history(usage):
     samples = samples[-2000:]  # prevent unbounded growth
 
     try:
-        with _secure_open_write(_get_history_path()) as f:
-            json.dump(samples, f)
+        _atomic_json_write(_get_history_path(), samples, indent=None)
     except OSError:
         pass
 
@@ -4992,27 +5246,49 @@ def _read_context_history():
         return []
 
 
-def _append_context_history(context_pct):
-    if context_pct is None:
+# context_history.json is per account, but context is per session: two windows
+# at 75% and 10% sharing one series read as a jump of 65 points in seconds. So
+# each sample names its session, and the velocity of a window is computed from
+# that window's samples alone. main() announces the session once per repaint.
+_context_session_id = None
+
+
+def _set_context_session(session_id):
+    """Name the session this process is painting (None when stdin gave none)."""
+    global _context_session_id
+    _context_session_id = session_id or None
+
+
+def _context_session_key(session_id=None):
+    sid = session_id if session_id is not None else _context_session_id
+    return str(sid)[:64] if sid else ""
+
+
+def _append_context_history(context_pct, session_id=None):
+    pct = _usage_number(context_pct)
+    if pct is None:
         return
-    samples = _read_context_history()
+    # Not _read_context_history(): see _append_history.
+    ok, samples = _load_samples(_get_context_history_path(), ("c",))
+    if not ok:
+        return
     now = time.time()
-    samples.append({"t": now, "c": float(context_pct)})
+    samples.append({"t": now, "c": pct, "s": _context_session_key(session_id)})
     cutoff = now - 3600
     samples = [s for s in samples if s.get("t", 0) > cutoff][-500:]
     try:
-        with _secure_open_write(_get_context_history_path()) as f:
-            json.dump(samples, f)
+        _atomic_json_write(_get_context_history_path(), samples, indent=None)
     except OSError:
         pass
 
 
-def _compute_context_velocity():
-    samples = _read_context_history()
-    if len(samples) < 2:
-        return None
+def _compute_context_velocity(session_id=None):
+    _, samples = _load_samples(_get_context_history_path(), ("c",))
+    # Samples from before sessions were recorded carry no "s": they belong to
+    # no named session (an unnamed one, key "", still reads them).
+    key = _context_session_key(session_id)
     now = time.time()
-    recent = [s for s in samples if s.get("t", 0) > now - 300]
+    recent = [s for s in samples if s.get("s", "") == key and s["t"] > now - 300]
     if len(recent) < 2:
         return None
     dt = recent[-1]["t"] - recent[0]["t"]
@@ -5107,8 +5383,7 @@ def _load_stats():
 def _save_stats(stats):
     """Save stats to disk."""
     try:
-        with _secure_open_write(_get_stats_path()) as f:
-            json.dump(stats, f, indent=2)
+        _atomic_json_write(_get_stats_path(), stats, indent=2)
     except OSError:
         pass
 
@@ -5986,19 +6261,28 @@ def _get_heatmap_path():
 
 def _update_heatmap(usage):
     """Update the activity heatmap with current usage data."""
-    five = usage.get("five_hour", {})
-    seven = usage.get("seven_day", {})
-    session_pct = five.get("utilization") or 0
-    weekly_pct = seven.get("utilization") or 0
+    session_pct = _window_pct(usage, "five_hour")
+    weekly_pct = _window_pct(usage, "seven_day")
 
-    # Load existing heatmap
-    try:
-        with open(_get_heatmap_path(), "r", encoding="utf-8") as f:
-            heatmap = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    # Load existing heatmap. A file that cannot be read yet (another window may
+    # be mid-write) skips this update rather than restarting 28 days of data.
+    ok, heatmap = _read_state_json(_get_heatmap_path())
+    if not ok:
+        return
+    if not isinstance(heatmap, dict):
         heatmap = {}
 
-    hours = heatmap.get("hours", {})
+    # Keep only entries the renderer can draw: a dict per hour, numbers in it.
+    hours = {}
+    raw_hours = heatmap.get("hours")
+    if isinstance(raw_hours, dict):
+        for key, value in raw_hours.items():
+            if isinstance(value, dict):
+                hours[key] = {
+                    "session_pct": _usage_number(value.get("session_pct")) or 0,
+                    "weekly_pct": _usage_number(value.get("weekly_pct")) or 0,
+                    "samples": int(_usage_number(value.get("samples")) or 0),
+                }
 
     # Current hour key in UTC: YYYY-MM-DDTHH
     now = datetime.now(timezone.utc)
@@ -6019,8 +6303,7 @@ def _update_heatmap(usage):
     heatmap["hours"] = hours
 
     try:
-        with _secure_open_write(_get_heatmap_path()) as f:
-            json.dump(heatmap, f)
+        _atomic_json_write(_get_heatmap_path(), heatmap, indent=None)
     except OSError:
         pass
 
@@ -6956,16 +7239,20 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
     hook_fresh = _is_hook_state_fresh(hook_state)
 
     if show.get("heartbeat", False) and hook_fresh:
-        tool_count = hook_state.get("tool_count", 0)
-        session_start = hook_state.get("session_start", time.time())
-        elapsed = time.time() - session_start
+        # hook_state.json is untrusted: a count or start time that is text, a
+        # list or NaN must not blank the bar. Unusable values read as 0 tools
+        # and 0 s elapsed.
+        tool_count = _usage_number(hook_state.get("tool_count", 0))
+        tool_count = int(tool_count) if tool_count is not None else 0
+        session_start = _cache_seconds(hook_state.get("session_start")) or time.time()
+        elapsed = max(0.0, time.time() - session_start)
         frame_idx = int(time.time() * 4) % len(HEARTBEAT_SPINNER)
         spinner = HEARTBEAT_SPINNER[frame_idx]
         parts.append((_pri("heartbeat"), f"[{spinner}] {tool_count} tools {_format_elapsed(elapsed)}"))
 
     if show.get("last_tool", False) and hook_fresh:
         last_tool = hook_state.get("last_tool", "")
-        if last_tool:
+        if last_tool and isinstance(last_tool, str):
             parts.append((_pri("last_tool"), f"Last: {last_tool[:12]}"))
 
     if show.get("branch", True):
@@ -11367,6 +11654,9 @@ def main():
         except OSError:
             pass
     stdin_ctx = persisted
+    # Context history is kept per session (a second window's lower samples must
+    # not read as this window's context filling fast).
+    _set_context_session(stdin_ctx.get("session_id"))
 
     cache_path = get_cache_path()
     cached = read_cache(cache_path, cache_ttl)
@@ -11541,7 +11831,9 @@ def main():
             _, plan_from_cache = get_credentials()
             plan_from_cache = plan_from_cache or ""
 
-        line = build_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, cache_age=0)
+        # Guarded: a value in a file the renderer cannot draw must not leave a
+        # blank bar. The side effects below still run, so the damage heals.
+        line = _guarded_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, 0)
         _update_session_state(usage_from_stdin, stdin_ctx)
         _append_history(usage_from_stdin)
         if stdin_ctx.get("context_pct") is not None:
@@ -11567,10 +11859,14 @@ def main():
         # reads as +inf (the red stale label) instead of raising here.
         cache_age = _cache_age(cached)
         if "usage" in cached:
-            line = build_status_line(cached["usage"], cached.get("plan", ""), config, stdin_ctx, cache_age=cache_age)
+            line = _guarded_status_line(cached["usage"], cached.get("plan", ""), config,
+                                        stdin_ctx, cache_age,
+                                        fallback=cached.get("line", ""))
             _update_session_state(cached["usage"], stdin_ctx)
         else:
             line = cached.get("line", "")
+        if not isinstance(line, str) or not line.strip():
+            line = _SAFE_FALLBACK_LINE   # never a blank bar
         line = append_update_indicator(line, config)
         line = append_claude_update_indicator(line, config, stdin_ctx)
         line = _fit_line(_append_provider_rows(line, config), config)

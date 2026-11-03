@@ -7,6 +7,11 @@ answers 403, and the updater used to stop with "Could not reach GitHub API"
 although the network was fine. A failed API call now falls back to
 ``git ls-remote``, which GitHub serves without that limit.
 
+The API call goes through ``_fetch_bounded`` (a hard wall-clock ceiling, see
+"Render-path networking" in claude_status.py), so these tests fake its network
+seam, ``_open_and_read``. Faking ``urllib.request.urlopen`` would miss it and
+let the tests reach the real GitHub API.
+
 Run: ``python tests/test_remote_commit.py``
 """
 import io
@@ -27,19 +32,6 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 LS_REMOTE = f"{SHA}\trefs/heads/main"
 
 
-class _Resp:
-    def __init__(self, body):
-        self.body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self, n=-1):
-        return self.body
-
 
 def _rate_limited(*a, **k):
     raise urllib.error.HTTPError("https://api.github.com/x", 403, "rate limit exceeded",
@@ -48,13 +40,13 @@ def _rate_limited(*a, **k):
 
 class RemoteCommitTest(unittest.TestCase):
     def test_api_answer_wins_and_git_never_runs(self):
-        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp(SHA.encode())), \
+        with mock.patch.object(cs, "_open_and_read", return_value=SHA.encode()), \
                 mock.patch.object(cs, "_git") as git:
             self.assertEqual(cs.get_remote_commit(), SHA)
         git.assert_not_called()
 
     def test_rate_limited_api_falls_back_to_git_ls_remote(self):
-        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=_rate_limited), \
+        with mock.patch.object(cs, "_open_and_read", side_effect=_rate_limited), \
                 mock.patch.object(cs, "_git", return_value=LS_REMOTE) as git:
             self.assertEqual(cs.get_remote_commit(), SHA)
         args, kwargs = git.call_args
@@ -63,24 +55,24 @@ class RemoteCommitTest(unittest.TestCase):
                          "the fallback must never wait on a credential prompt")
 
     def test_html_error_page_from_the_api_falls_back_too(self):
-        with mock.patch.object(cs.urllib.request, "urlopen",
-                               return_value=_Resp(b"<html>rate limited</html>")), \
+        with mock.patch.object(cs, "_open_and_read",
+                               return_value=b"<html>rate limited</html>"), \
                 mock.patch.object(cs, "_git", return_value=LS_REMOTE):
             self.assertEqual(cs.get_remote_commit(), SHA)
 
     def test_both_sources_failing_gives_none(self):
-        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=_rate_limited), \
+        with mock.patch.object(cs, "_open_and_read", side_effect=_rate_limited), \
                 mock.patch.object(cs, "_git", return_value=None):
             self.assertIsNone(cs.get_remote_commit())
 
     def test_garbage_from_git_gives_none(self):
         for out in ("", "fatal: not a git repository", "deadbeef\trefs/heads/main"):
-            with mock.patch.object(cs.urllib.request, "urlopen", side_effect=_rate_limited), \
+            with mock.patch.object(cs, "_open_and_read", side_effect=_rate_limited), \
                     mock.patch.object(cs, "_git", return_value=out):
                 self.assertIsNone(cs.get_remote_commit(), out)
 
     def test_spent_deadline_runs_nothing(self):
-        with mock.patch.object(cs.urllib.request, "urlopen",
+        with mock.patch.object(cs, "_open_and_read",
                                side_effect=AssertionError("network used")) as net, \
                 mock.patch.object(cs, "_git", side_effect=AssertionError("git used")) as git:
             self.assertIsNone(cs.get_remote_commit(deadline=time.time() - 1))
@@ -92,12 +84,12 @@ class RemoteCommitTest(unittest.TestCase):
         must be capped by it, not by its own fixed timeout."""
         seen = {}
 
-        def fake_git(*args, timeout=2, deadline=None, env=None):
+        def fake_git(*args, timeout=2, deadline=None, env=None, **_kwargs):
             seen["deadline"] = deadline
             return LS_REMOTE
 
         deadline = time.time() + 2.0
-        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=_rate_limited), \
+        with mock.patch.object(cs, "_open_and_read", side_effect=_rate_limited), \
                 mock.patch.object(cs, "_git", side_effect=fake_git):
             self.assertEqual(cs.get_remote_commit(deadline=deadline), SHA)
         self.assertEqual(seen["deadline"], deadline)

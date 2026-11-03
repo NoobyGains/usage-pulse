@@ -11,8 +11,10 @@ import random
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -1815,6 +1817,358 @@ def _capped_timeout(default, deadline):
     return min(default, remaining)
 
 
+# ---------------------------------------------------------------------------
+# Render-path networking — a fetch may fail, but it may never hold up the bar
+# ---------------------------------------------------------------------------
+#
+# Claude Code cancels an in-flight status line script whenever the next update
+# fires, and with `refreshInterval` set that is every N seconds (--install
+# writes 2 while animation is on). A repaint that blocks on the network past
+# that is killed before it prints — and, left to itself, before it can record
+# that it tried, so the next repaint walks into the same stall and the bar
+# never renders again. Seen in the wild on a network that advertises IPv6 but
+# black-holes it: registry.npmjs.org publishes 12 AAAA + 12 A records and
+# urllib's timeout applies *per address*, so a "3 second" check took 36.
+
+_NET_FETCH_BUDGET = 1.5  # seconds; hard wall-clock ceiling on one fetch
+_NET_CONNECT_ATTEMPT = 0.5  # seconds; cap on each attempt of the quick pass
+_NET_QUICK_CANDIDATES = 4  # addresses the quick pass tries (two per family)
+_NET_PATIENT_ATTEMPT = 3.0  # seconds; cap on each attempt of the patient pass
+_NET_RETRY_BACKOFF = 600  # seconds before a failed or cut-short check retries
+_USAGE_KILL_GUARD = 60  # seconds a cut-short usage fetch keeps the next one away
+_NET_MIN_SPACING = 5  # seconds between optional checks: one per repaint, not a stack
+
+
+_own_stamps = {}  # key -> the stamp value this process wrote
+
+
+def _stamp_path(key):
+    """Where *key*'s stamp lives.
+
+    "usage" guards one account's fetch, with that account's token, feeding
+    that account's cache, so it sits beside get_cache_path(): another
+    account's cut-short fetch must not hold this one's off. The default
+    account's dir is the shared one, so its stamp has not moved. Every other
+    key, "_last" above all, is about this machine's network and stays shared:
+    the turn-taking is per machine on purpose.
+    """
+    base = get_account_state_dir() if key == "usage" else get_state_dir()
+    return base / ("net_attempt_%s.stamp" % re.sub(r"[^A-Za-z0-9_-]", "_", key))
+
+
+def _read_stamp(key):
+    try:
+        with open(_stamp_path(key), "r", encoding="utf-8") as f:
+            return float(f.read(64).strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _write_stamp(key, value):
+    """Write one stamp, in a file of its own.
+
+    Sessions share the state dir. With every stamp in one JSON file, a session
+    that read the file before another wrote to it would write the other's
+    stamp back out of existence. One file per key leaves nothing to clobber;
+    the temp name carries the pid so two writers can't collide on it either.
+    """
+    path = _stamp_path(key)
+    tmp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    try:
+        with _secure_open_write(tmp) as f:
+            f.write(repr(float(value)))
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _begin_net_attempt(key, backoff=None, primary=False):
+    """Record that *key* is about to touch the network. False means: don't.
+
+    The stamp is written BEFORE the network call on purpose. A repaint that
+    Claude Code kills mid-fetch gets no chance to note the failure afterwards,
+    so the note has to already be on disk; the next repaint then sees a recent
+    attempt and renders straight away instead of repeating the stall.
+
+    Each check fits inside a refresh interval, but two back to back do not, so
+    the optional ones also take turns: after any attempt the rest wait
+    _NET_MIN_SPACING for a later repaint. Waiting is not failing — it leaves no
+    stamp. *primary* (the usage fetch: the bar itself) never waits.
+    """
+    now = time.time()
+    if backoff is None:
+        backoff = _NET_RETRY_BACKOFF
+    if 0 <= now - _read_stamp(key) < backoff:
+        return False
+    if not primary and 0 <= now - _read_stamp("_last") < _NET_MIN_SPACING:
+        return False
+    try:
+        _write_stamp(key, now)
+    except OSError:
+        # No stamp means a kill during this fetch would leave no trace and
+        # loop forever. Skipping one check is the cheaper failure.
+        return False
+    _own_stamps[key] = float(now)
+    try:
+        _write_stamp("_last", now)
+    except OSError:
+        pass  # only the turn-taking; the kill guard above is what matters
+    return True
+
+
+def _end_net_attempt(key):
+    """Lift this process's stamp for *key*: the call came back, one way or another.
+
+    For callers that already remember their own failures and only need the
+    stamp to survive a kill. Only a stamp this process wrote is lifted — by
+    the time a slow request returns, another session may have armed its own.
+    Best effort: a stamp left behind just means one backoff window of cache.
+    """
+    mine = _own_stamps.pop(key, None)
+    if mine is None or _read_stamp(key) != mine:
+        return
+    try:
+        _stamp_path(key).unlink()
+    except OSError:
+        pass
+
+
+def _interleave_families(infos):
+    """Alternate address families, keeping the resolver's order within each.
+
+    The resolver hands back every IPv6 address before the first IPv4 one, so
+    trying them in order pays one timeout per address of a dead family before
+    reaching a live one. Alternating (RFC 8305 §4) caps that at one attempt.
+    """
+    queues = {}
+    for info in infos:
+        queues.setdefault(info[0], []).append(info)
+    ordered = []
+    pending = list(queues.values())
+    while pending:
+        for queue in pending:
+            ordered.append(queue.pop(0))
+        pending = [queue for queue in pending if queue]
+    return ordered
+
+
+def _bounded_connector(deadline):
+    """Build a drop-in for ``socket.create_connection`` that honours *deadline*.
+
+    ``create_connection`` applies its timeout to each address in turn, so the
+    real ceiling is timeout x address count. Here the whole connect stops at
+    *deadline*, in two passes:
+
+    quick    a few interleaved addresses, a short cap each — steps past a dead
+             family in half a second instead of a full timeout per address.
+    patient  only if that found nothing and the caller allowed more time:
+             every address again with a generous cap, so a link that is merely
+             slow still connects. IPv4 leads this pass — by now something is
+             wrong, and a black-holed IPv6 is the usual culprit.
+
+    The DNS lookup is held to *deadline* too. ``getaddrinfo`` has no timeout
+    of its own, and a VPN whose DNS servers have gone away can hang it for
+    many seconds, so with a deadline it runs on a daemon thread that is simply
+    abandoned when the time is up: socket.timeout, an OSError, which urllib
+    reports as a URLError like any failed connect. No socket exists yet to
+    leak, and a daemon thread can't keep the process alive. Without a
+    deadline the lookup runs right here, as in ``create_connection``.
+
+    *timeout* is read the way ``create_connection`` reads it, and becomes the
+    socket's timeout for everything after the connect (the TLS handshake and
+    the response): a number is the timeout per operation, None blocks, and
+    the default sentinel leaves the process default
+    (``socket.getdefaulttimeout()``). With a deadline, whichever of those
+    applies is capped once, when the connect succeeds, at the time left, so
+    even "no timeout" never leaves one operation blocked for good. That cap
+    is per operation, not a wall-clock limit: the handshake, each send and
+    each read get it afresh, so a slow peer can still carry the whole
+    request past *deadline*. The connect attempts themselves always use the
+    caps above.
+
+    The hard wall-clock ceiling lives elsewhere: ``_fetch_bounded`` gives
+    the optional fetches one. The token requests through ``_safe_opener``
+    have none, and for the primary usage fetch that is deliberate: a hard
+    cap there could starve the per-model bars (Fable and the rest) on a slow
+    but working network. A repaint cut short mid-fetch is caught by the
+    write-ahead stamp (``_begin_net_attempt``) instead.
+    """
+    def resolve(host, port):
+        if deadline is None:
+            return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        budget = _capped_timeout(float("inf"), deadline)
+        if budget is None:
+            raise socket.timeout("no time left to look up %s" % host)
+        answer = []
+
+        def lookup():
+            try:
+                answer.append((True, socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)))
+            except BaseException as exc:  # handed to the caller below
+                answer.append((False, exc))
+
+        worker = threading.Thread(target=lookup, name="usage-pulse-dns", daemon=True)
+        try:
+            worker.start()
+        except RuntimeError as exc:  # no thread to be had: fail the fetch, don't hang it
+            raise OSError("could not look up %s: %s" % (host, exc)) from None
+        worker.join(budget)
+        if not answer:
+            raise socket.timeout("looking up %s took too long" % host)
+        found, value = answer[0]
+        if found:
+            return value
+        raise value
+
+    def after_connect(timeout):
+        """The socket timeout for the TLS handshake and the response."""
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            timeout = socket.getdefaulttimeout()
+        if deadline is None:
+            return timeout
+        left = _capped_timeout(float("inf"), deadline)
+        if left is None:
+            raise socket.timeout("connect budget exhausted")
+        return left if timeout is None else min(timeout, left)
+
+    def attempt(info, cap, timeout, source_address):
+        family, socktype, proto, _canon, sockaddr = info
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(cap)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            # From here each operation (handshake, send, read) may block for at
+            # most the time the deadline had left at connect, not the remainder.
+            sock.settimeout(after_connect(timeout))
+        except BaseException:
+            sock.close()
+            raise
+        return sock
+
+    def connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None,
+                **_kwargs):
+        host, port = address
+        infos = _interleave_families(resolve(host, port))
+        passes = (
+            (infos[:_NET_QUICK_CANDIDATES], _NET_CONNECT_ATTEMPT),
+            (sorted(infos, key=lambda info: info[0] != socket.AF_INET),
+             _NET_PATIENT_ATTEMPT),
+        )
+        last_error = None
+        for candidates, cap in passes:
+            for info in candidates:
+                capped = _capped_timeout(cap, deadline)
+                if capped is None:
+                    raise last_error or OSError("connect budget exhausted")
+                try:
+                    return attempt(info, capped, timeout, source_address)
+                except OSError as exc:
+                    last_error = exc
+        raise last_error or OSError("no addresses to connect to")
+    return connect
+
+
+if hasattr(urllib.request, "HTTPSHandler"):
+    class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
+        """HTTPS whose TCP connect goes through ``_bounded_connector``.
+
+        Only the connect is replaced. ``https_open`` is the stock one, so the
+        connection gets exactly the TLS settings a stock handler gives it on
+        this Python: on 3.12+ the context the handler built when it was made
+        (so ``_safe_opener``, made at import, keeps the trust it started with,
+        and a later change to ``ssl._create_default_https_context`` can't
+        reach it); on 3.8-3.11 context and check_hostname as given, which by
+        default leaves the connection to build a default context, as stock
+        does there. Certificate verification, hostname checks and proxy
+        tunnelling stay exactly as the standard library does them.
+        """
+
+        def __init__(self, deadline=None):
+            super().__init__()
+            self._deadline = deadline
+
+        def do_open(self, http_class, req, **http_conn_args):
+            deadline = self._deadline
+            if deadline is None and isinstance(req.timeout, (int, float)):
+                deadline = time.time() + req.timeout  # a shared opener: per request
+            connect = _bounded_connector(deadline)
+
+            def connection(host, **kwargs):
+                conn = http_class(host, **kwargs)
+                conn._create_connection = connect  # the seam http.client connects through
+                return conn
+
+            return super().do_open(connection, req, **http_conn_args)
+else:
+    _BoundedHTTPSHandler = None  # Python built without ssl: urllib has no HTTPS at all
+
+
+def _open_and_read(req, max_bytes, deadline):
+    """Fetch *req* and return up to *max_bytes* of the body. Raises on failure.
+
+    An error status comes out as urllib's HTTPError, which is also the still
+    open response: the caller reads it or closes it. Without ssl there is no
+    HTTPS handler to bound; the plain opener then fails an https URL as a
+    URLError, as 3.6.0 did, rather than the module failing to load.
+    """
+    timeout = _capped_timeout(_NET_FETCH_BUDGET, deadline)
+    if timeout is None:
+        return None
+    if _BoundedHTTPSHandler is not None:
+        opener = urllib.request.build_opener(_BoundedHTTPSHandler(deadline))
+    else:
+        opener = urllib.request.build_opener()
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read(max_bytes)
+
+
+def _fetch_bounded(req, max_bytes, budget=None):
+    """Fetch *req*, returning up to *max_bytes* of the body, or None on failure.
+
+    Never takes longer than *budget* seconds of wall-clock time, whatever the
+    network does. Socket timeouts alone can't promise that: ``getaddrinfo``
+    has no timeout at all, and a VPN whose DNS servers have gone away can hang
+    it for many seconds. So the fetch runs on a daemon thread and is simply
+    abandoned at the ceiling — the process exits moments later and takes the
+    thread with it.
+
+    An error answer is closed on that thread, even one that lands after the
+    ceiling: nothing reads it, and left to garbage collection it would hold
+    its socket until then. A body that is read is closed by
+    ``_open_and_read`` itself.
+    """
+    if budget is None:
+        budget = _NET_FETCH_BUDGET
+    deadline = time.time() + budget
+    result = []
+
+    def work():
+        try:
+            result.append(_open_and_read(req, max_bytes, deadline))
+        except urllib.error.HTTPError as exc:
+            # "No answer", but still a live response with an unread body.
+            try:
+                exc.close()
+            except Exception:
+                pass  # 3.8/3.9: one made without a body has nothing to close
+        except Exception:
+            pass  # any other failure is simply "no answer"
+
+    worker = threading.Thread(target=work, daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        return None
+    worker.join(budget)
+    return result[0] if result else None
+
+
 def get_local_commit(deadline=None):
     """Get the local git HEAD commit hash (short). Returns None on failure."""
     timeout = _capped_timeout(2, deadline)
@@ -1861,7 +2215,7 @@ def _on_default_branch(deadline=None):
         return None
 
 
-def get_remote_commit(deadline=None):
+def get_remote_commit(deadline=None, leg=None):
     """Latest commit hash of upstream main. Returns None on failure.
 
     Asks the GitHub API first: one small request, no git process. The API
@@ -1869,10 +2223,19 @@ def get_remote_commit(deadline=None):
     machine running several tools can use them all, so a failed or odd API
     answer falls back to ``git ls-remote`` against origin, which GitHub serves
     without that limit. Callers verify that origin is the upstream repo first.
+
+    That chain is for ``--update`` and ``--config``. Two network operations in
+    a row don't fit in one repaint, so the status line asks for one *leg*
+    instead: "api" or "git", each held to _NET_FETCH_BUDGET, and
+    check_for_update runs the git leg on a later repaint.
     """
-    timeout = _capped_timeout(3, deadline)
-    if timeout is None:
+    if leg not in (None, "api", "git"):
+        raise ValueError("leg must be None, 'api' or 'git', not %r" % (leg,))
+    budget = _capped_timeout(_NET_FETCH_BUDGET, deadline)
+    if budget is None:
         return None
+    if leg == "git":
+        return _git_remote_commit(deadline=time.time() + budget)
     sha = ""
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/main"
@@ -1880,28 +2243,40 @@ def get_remote_commit(deadline=None):
             "Accept": "application/vnd.github.sha",
             "User-Agent": "usage-pulse-update-checker",
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            sha = resp.read(1024).decode().strip()
+        body = _fetch_bounded(req, 1024, budget=budget)
+        sha = body.decode().strip() if body is not None else ""
     except Exception:
         sha = ""
     if re.fullmatch(r'[0-9a-f]{40}', sha):
         return sha
+    if leg == "api":
+        return None  # the status line asks git on a later repaint
     # Not a SHA (rate-limited, error page, offline): ask git instead.
     return _git_remote_commit(deadline=deadline)
 
 
 def _git_remote_commit(deadline=None):
     """``git ls-remote origin refs/heads/main`` as a 40-hex SHA, or None."""
+    timeout = 8
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"   # never hang on a credential prompt
-    out = _git("ls-remote", "origin", "refs/heads/main", timeout=8, deadline=deadline, env=env)
+    # A timed-out call abandons git, but its HTTPS helper can outlive it, hung
+    # on the remote. Have curl drop a transfer stuck under 1 byte/s for as long
+    # as this call could wait anyway: that never cuts short an answer a caller
+    # is still waiting for, and it ends the helper instead of leaving that to
+    # the remote. (Connect and TLS fall under curl's own 300s connect timeout.)
+    # Values already in the environment win.
+    env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1")
+    env.setdefault("GIT_HTTP_LOW_SPEED_TIME", str(timeout))
+    out = _git("ls-remote", "origin", "refs/heads/main", timeout=timeout,
+               deadline=deadline, env=env, network=True)
     if not out:
         return None
     sha = out.split()[0]
     return sha if re.fullmatch(r'[0-9a-f]{40}', sha) else None
 
 
-def _git(*args, timeout=2, deadline=None, env=None):
+def _git(*args, timeout=2, deadline=None, env=None, network=False):
     """Run git in the install dir, returning stripped stdout or None.
 
     The default timeout is deliberately short: these calls sit behind the
@@ -1909,6 +2284,13 @@ def _git(*args, timeout=2, deadline=None, env=None):
     hung git could otherwise stall a repaint for tens of seconds. *deadline*
     caps it further to whatever remains of the caller's overall budget.
     *env* replaces the child's environment (None inherits ours).
+
+    *network* is for a call that talks to a remote. git hands that to a helper
+    (git-remote-https, ssh) that inherits the child's stdio, and on a timeout
+    subprocess.run kills only git; on Windows it then waits for end-of-file on
+    pipes the helper still holds, for as long as the remote hangs. So such a
+    call gets no pipes at all: stdout goes to a temp file, stdin and stderr to
+    the null device, and the timeout is a real ceiling on every OS.
     """
     timeout = _capped_timeout(timeout, deadline)
     if timeout is None:
@@ -1916,6 +2298,18 @@ def _git(*args, timeout=2, deadline=None, env=None):
     repo_dir = Path(__file__).resolve().parent
     extra = {"env": env} if env is not None else {}
     try:
+        if network:
+            import tempfile  # only this path needs it
+            with tempfile.TemporaryFile() as out:
+                result = subprocess.run(
+                    [_GIT_PATH, *args],
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                    timeout=timeout, cwd=str(repo_dir), **extra,
+                )
+                if result.returncode != 0:
+                    return None
+                out.seek(0)
+                return out.read(65536).decode("utf-8", "replace").strip()
         result = subprocess.run(
             [_GIT_PATH, *args],
             capture_output=True, text=True, timeout=timeout,
@@ -1972,22 +2366,46 @@ def _remote_is_ancestor(remote, deadline=None):
     return None  # any other status means git could not answer
 
 
+def _cache_seconds(value):
+    """A cache file's time field as finite seconds, or None when unusable.
+
+    The file is untrusted input. Besides text and null, valid JSON can hold an
+    int too big for a float (float() raises OverflowError, which is not a
+    ValueError), Infinity, whose arithmetic reads as fresh (or as an active
+    backoff) forever, or NaN, which compares false to everything and crashes
+    the staleness label (int() of NaN raises ValueError).
+    """
+    try:
+        seconds = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return seconds if math.isfinite(seconds) else None
+
+
 def _cache_age(cached):
     """Age in seconds of a cache dict, or +inf when its timestamp is unusable.
 
     Returning infinity makes a corrupt entry look infinitely stale, so callers
-    naturally fall through to a fresh check instead of raising on the subtraction.
+    naturally fall through to a fresh check instead of raising on the subtraction,
+    and the staleness label (when shown) marks it red.
     """
     try:
-        return time.time() - float(cached.get("timestamp", 0) or 0)
-    except (AttributeError, TypeError, ValueError):
+        timestamp = _cache_seconds(cached.get("timestamp", 0))
+    except AttributeError:
         return float("inf")
+    return float("inf") if timestamp is None else time.time() - timestamp
 
 
-def check_for_update():
+def check_for_update(*, interactive=False):
     """Check if a newer version is available on GitHub. Returns True/False/None.
 
     Cached for 1 hour. Fully silent on any error — never blocks the status line.
+
+    *interactive* is for a command the user runs (``--config``): nobody cancels
+    it mid-check, so it skips the status line's turn-taking and backoff and
+    runs the full API-then-git chain inside _UPDATE_CHECK_BUDGET. Its verdict
+    lands in the same cache. Keyword-only, so a stray positional True can't
+    skip the status line's gates.
     """
     state_dir = get_state_dir()
     update_cache = state_dir / "update_check.json"
@@ -2002,18 +2420,70 @@ def check_for_update():
     except OSError:
         script_mtime = None
 
+    # The cache is ours but still untrusted input. Missing, unreadable, not
+    # UTF-8, not JSON, nested past the parser's limit, not an object, or a
+    # verdict that isn't a boolean: every one of those is a miss, never an
+    # error (--config calls this outside any handler).
     cached = None
     try:
         with open(update_cache, "r", encoding="utf-8") as f:
             cached = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError, RecursionError):
         cached = None
-    if not isinstance(cached, dict):
+    if not (isinstance(cached, dict)
+            and isinstance(cached.get("update_available"), bool)):
         cached = None
+    # _cache_age turns an unusable timestamp into +inf: stale, never an error.
+    fresh = cached is not None and _cache_age(cached) < UPDATE_CHECK_TTL
 
-    if cached and _cache_age(cached) < UPDATE_CHECK_TTL:
-        if script_mtime is not None and cached.get("script_mtime") == script_mtime:
-            return cached.get("update_available", False)
+    if fresh and script_mtime is not None and cached.get("script_mtime") == script_mtime:
+        return cached["update_available"]
+
+    # On the status line one round of this check is spread over repaints,
+    # because a repaint gets one network operation (see "Render-path
+    # networking"): the GitHub API on one, then, only if that brought no SHA,
+    # git ls-remote alone on a later repaint with a free turn. Each is held to
+    # _NET_FETCH_BUDGET. The "update_check" stamp marks when a round began;
+    # no new round starts until it is _NET_RETRY_BACKOFF old.
+    #
+    # Every new round starts with the API again. It is the light path (one
+    # request, no git process, no credentials), and GitHub's quota is hourly
+    # while a new round comes an hour after a verdict (UPDATE_CHECK_TTL) or a
+    # backoff after a failure. So a quota that is still used up costs one fast
+    # 403 per round, and git still answers a repaint later.
+    #
+    # The round stamp is also the git leg's only backoff: one git leg per
+    # round, whenever in the round it ran, so a late leg in one round doesn't
+    # push the next round's later too.
+    #
+    # Until the network leg is about to run, the stamps are only peeked at.
+    # A repaint that ends up answering from the cache (the script rewritten at
+    # the same commit) or stopping at the branch or fork check must not spend
+    # the round's git leg, or the turn another check in this repaint could use.
+    # And a repaint with no leg it could run returns before spawning any git,
+    # unless a fresh cache may still answer once git names the commit.
+    leg = "api"
+    round_began = 0.0
+    if not interactive:
+        round_began = _read_stamp("update_check")
+        if 0 <= time.time() - round_began < _NET_RETRY_BACKOFF:
+            leg = "git"
+
+    def leg_can_run():
+        """Peek, never take: could this repaint run its leg? Writes nothing."""
+        now = time.time()
+        if 0 <= now - _read_stamp("_last") < _NET_MIN_SPACING:
+            return False  # another check has this repaint's network turn
+        if leg == "git":
+            # A git stamp from this round means its git leg ran, or was cut
+            # short, already. One from the future (the clock was set back)
+            # says nothing about this round, so like _begin_net_attempt it
+            # is ignored rather than allowed to hold every round's leg off.
+            return not round_began <= _read_stamp("update_check_git") <= now
+        return True
+
+    if not interactive and not fresh and not leg_can_run():
+        return None  # nothing to try on this repaint, and no cache to answer
 
     # Cache is stale or unverifiable — now it's worth asking git. Everything
     # from here is bounded by _UPDATE_CHECK_BUDGET: the deadline is threaded
@@ -2026,10 +2496,11 @@ def check_for_update():
     if not local:
         return None  # not a git install, skip silently
 
-    if (cached
-            and _cache_age(cached) < UPDATE_CHECK_TTL
-            and cached.get("local") == local[:8]):
-        return cached.get("update_available", False)
+    if fresh and cached.get("local") == local[:8]:
+        return cached["update_available"]
+
+    if not interactive and not leg_can_run():
+        return None  # the cache was for another commit, and nothing is free to ask
 
     # Only a main/master checkout gets the nag; topic and preview branches are
     # developers, usually ahead of upstream. Cache the verdict — returning
@@ -2064,7 +2535,18 @@ def check_for_update():
     # Perform the check
     if time.time() > _deadline:
         return None
-    remote = get_remote_commit(deadline=_deadline)
+    if interactive:
+        remote = get_remote_commit(deadline=_deadline)
+    else:
+        # Only now is the turn taken, its stamp written ahead of the network
+        # so that a repaint killed mid-leg still counts as having tried. The
+        # git leg passes backoff=0: the round check above is its backoff.
+        if leg == "git":
+            if not leg_can_run() or not _begin_net_attempt("update_check_git", backoff=0):
+                return None  # another session ran it, or took the turn, meanwhile
+        elif not _begin_net_attempt("update_check"):
+            return None  # a check just failed or was cut short — don't pile on
+        remote = get_remote_commit(deadline=_deadline, leg=leg)
     if not remote:
         return None  # network error, skip silently
 
@@ -2116,10 +2598,15 @@ def append_update_indicator(line, config=None):
     return line
 
 
-def check_claude_code_update(local_version=None):
+def check_claude_code_update(local_version=None, *, interactive=False):
     """Check if a newer Claude Code version is available on npm. Returns True/False/None.
 
     Cached for 1 hour. Fully silent on any error — never blocks the status line.
+
+    *interactive* is for a command the user runs (``--config``): it skips the
+    status line's turn-taking and backoff, may use the whole
+    _UPDATE_CHECK_BUDGET, and still writes the shared cache. Keyword-only, so
+    ``check_claude_code_update(version, True)`` can't skip those gates.
 
     *local_version* is the running version, which Claude Code reports on stdin.
     Passing it matters for latency: resolving it by shelling out to
@@ -2147,24 +2634,36 @@ def check_claude_code_update(local_version=None):
         except Exception:
             return None
 
-    # Read cached result — skip if local version changed (e.g. after claude update)
+    # Read cached result — skip if local version changed (e.g. after claude update).
+    # Untrusted input, as in check_for_update: anything unreadable or of the
+    # wrong shape (a list, a non-numeric timestamp, a non-boolean verdict) is
+    # a miss, never an error.
+    cached = None
     try:
         with open(update_cache, "r", encoding="utf-8") as f:
             cached = json.load(f)
-        if (time.time() - cached.get("timestamp", 0) < UPDATE_CHECK_TTL
-                and cached.get("local") == _sanitize(local_version)):
-            return cached.get("update_available", False)
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        pass
+    except (OSError, ValueError, RecursionError):
+        cached = None
+    if not (isinstance(cached, dict)
+            and isinstance(cached.get("update_available"), bool)):
+        cached = None
+    fresh = cached is not None and _cache_age(cached) < UPDATE_CHECK_TTL
+    if fresh and cached.get("local") == _sanitize(local_version):
+        return cached["update_available"]
 
     # Get latest version from npm registry
+    if not interactive and not _begin_net_attempt("claude_code_update"):
+        return None  # a check just failed or was cut short — don't pile on
     try:
         req = urllib.request.Request(
             "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
             headers={"User-Agent": "usage-pulse-update-checker"},
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read(100_000).decode("utf-8"))
+        body = _fetch_bounded(req, 100_000,
+                              budget=_UPDATE_CHECK_BUDGET if interactive else None)
+        if body is None:
+            return None
+        data = json.loads(body.decode("utf-8"))
         remote_version = _sanitize(str(data.get("version", "")))
         if not remote_version:
             return None
@@ -2406,10 +2905,6 @@ def read_cache(cache_path, ttl):
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             cached = json.load(f)
-        # Same untrusted-shape rule as read_cache: this feeds the 429 fallback,
-        # where a raise means no status line at all.
-        if not isinstance(cached, dict):
-            return None
         # The file is ours, but it is still untrusted input: a truncated write,
         # a disk error, or a hand-edit can leave valid JSON of the wrong shape.
         # Anything other than a dict is treated as a cache miss rather than
@@ -2421,10 +2916,7 @@ def read_cache(cache_path, ttl):
         # have until the backoff expires. Without this, a rate-limited session
         # that still had usable cached usage re-hit the API on every refresh —
         # exactly the retry storm the backoff exists to prevent.
-        try:
-            blocked_until = float(cached.get("rate_limited_until") or 0)
-        except (TypeError, ValueError):
-            blocked_until = 0
+        blocked_until = _cache_seconds(cached.get("rate_limited_until")) or 0
         if blocked_until and time.time() < blocked_until:
             return cached
         # Error-only entries expire faster, except rate limit errors which back off longer
@@ -2434,13 +2926,15 @@ def read_cache(cache_path, ttl):
             effective_ttl = _RATE_LIMIT_CACHE_TTL
         else:
             effective_ttl = _ERROR_CACHE_TTL
-        try:
-            age = time.time() - float(cached.get("timestamp", 0) or 0)
-        except (TypeError, ValueError):
+        timestamp = _cache_seconds(cached.get("timestamp", 0))
+        if timestamp is None:
             return None  # unusable timestamp — treat as a miss
-        if age < effective_ttl:
+        if time.time() - timestamp < effective_ttl:
             return cached
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
+    except (OSError, ValueError, RecursionError, KeyError):
+        # Missing or unreadable (OSError); not UTF-8, not JSON, or an int past
+        # the int/str digit limit (each a ValueError); nested past the parser's
+        # depth (RecursionError). Every one is a miss: a raise blanks the bar.
         pass
     return None
 
@@ -2462,8 +2956,8 @@ def _read_stale_cache(cache_path):
             return None
         if "usage" in cached or "line" in cached:
             return cached
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError, TypeError):
-        pass
+    except (OSError, ValueError, RecursionError, KeyError, TypeError):
+        pass  # the same misses as read_cache
     return None
 
 
@@ -2514,6 +3008,10 @@ def write_cache(cache_path, line, usage=None, plan=None,
 _RATE_LIMIT_BACKOFF_BASE = 60    # seconds for the first 429
 _RATE_LIMIT_BACKOFF_MAX = 900    # cap at 15 minutes
 _RATE_LIMIT_JITTER = 10          # spread concurrent sessions out
+# The data time a rewrite records when the real one is unknown: the first
+# second of the epoch, which every reader takes as long stale. Not 0, which
+# write_cache treats as "now".
+_UNKNOWN_DATA_TIME = 1.0
 
 
 def _rate_limit_backoff(fail_count):
@@ -2525,13 +3023,44 @@ def _rate_limit_backoff(fail_count):
     """
     try:
         fails = max(0, int(fail_count or 0)) + 1
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # cache.json is untrusted: int() raises OverflowError for an
+        # Infinity, which json reads as a float. Unusable restarts the count.
         fails = 1
     # Cap the shift before computing the power: 2 ** a large fail count would
     # build a huge int before min() ever saw it.
     delay = _RATE_LIMIT_BACKOFF_BASE * (2 ** min(fails - 1, 8))
     delay = min(delay, _RATE_LIMIT_BACKOFF_MAX)
     return delay + random.uniform(0, _RATE_LIMIT_JITTER), fails
+
+
+def _retry_after_seconds(headers):
+    """Seconds a 429's Retry-After header asks us to wait, or 0.0 if unusable.
+
+    Only a plain non-negative number of seconds counts: RFC 9110 section
+    10.2.3 delay-seconds, plus a decimal fraction, which earlier releases
+    honoured too. Anthropic documents seconds, so an HTTP-date falls back like
+    any other shape (as it always did). The wait is capped at six hours, the
+    default ceiling of urllib3 and other popular HTTP clients: far above the
+    multi-thousand-second values the usage endpoint really sends, yet a bad
+    value can no longer park the caller for good. A bare float() let "inf",
+    "1e9" or a long run of digits write an endless rate_limited_until.
+    Callers take max() with their exponential schedule, so 0.0 leaves that
+    schedule in charge.
+    """
+    try:
+        value = headers.get("retry-after")
+    except (AttributeError, TypeError):
+        return 0.0
+    if not isinstance(value, str):
+        return 0.0
+    value = value.strip()
+    # [0-9] is ASCII only: str.isdigit() would pass superscripts, which
+    # float() then rejects. A long digit run parses to inf, which the cap
+    # turns into the ceiling, as a huge delay-seconds deserves.
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]*)?", value):
+        return 0.0
+    return min(float(value), 6 * 60 * 60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2544,29 +3073,45 @@ _TOKEN_ALLOWED_DOMAINS = frozenset({"api.anthropic.com", "console.anthropic.com"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Block HTTP redirects to prevent tokens from leaking to third-party domains."""
+    """Block HTTP redirects to prevent tokens from leaking to third-party domains.
+
+    Only https on an allowed domain is followed. The stdlib copies every header
+    onto the redirected request, Authorization included, so an http:// target,
+    even on an allowed host, would re-send the token in plain text.
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        target_domain = urlparse(newurl).hostname
-        if target_domain not in _TOKEN_ALLOWED_DOMAINS:
+        target = urlparse(newurl)
+        if target.scheme != "https" or target.hostname not in _TOKEN_ALLOWED_DOMAINS:
             raise urllib.error.HTTPError(
                 newurl, code, f"Redirect to non-allowed domain blocked", headers, fp
             )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_safe_opener = urllib.request.build_opener(_NoRedirectHandler)
+# Bounded connect: a dead address family costs one short attempt instead of the
+# whole request timeout (see "Render-path networking"). A Python without ssl has
+# no HTTPS to bound, and its token requests fail as a URLError, as they did.
+if _BoundedHTTPSHandler is not None:
+    _safe_opener = urllib.request.build_opener(_NoRedirectHandler, _BoundedHTTPSHandler())
+else:
+    _safe_opener = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def _authorized_request(url, token, headers=None, data=None, method=None, timeout=10):
     """Make an HTTP request with an auth token, but ONLY to allowed Anthropic domains.
 
-    Raises ValueError if the URL domain is not in the allowlist.
-    This prevents tokens from ever being sent to third-party servers,
+    Raises ValueError if the URL is not https or its domain is not in the
+    allowlist, before the token is put on anything.
+    This prevents tokens from ever being sent to third-party servers, or in
+    plain text (a token refresh carries the refresh token in its body),
     even if the code is modified or a URL is misconfigured.
-    Redirects to non-allowed domains are blocked to prevent token exfiltration.
+    Redirects are held to the same rule to prevent token exfiltration.
     """
-    domain = urlparse(url).hostname
+    parts = urlparse(url)
+    if parts.scheme != "https":  # urlparse lowercases it: HTTPS:// is https
+        raise ValueError("Token request blocked: the URL is not https")
+    domain = parts.hostname
     if domain not in _TOKEN_ALLOWED_DOMAINS:
         raise ValueError(f"Token request blocked: {_sanitize(domain)} is not an allowed domain")
     hdrs = dict(headers) if headers else {}
@@ -3422,10 +3967,7 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
         except urllib.error.HTTPError as exc:
             code = getattr(exc, "code", None)
             if code == 429:
-                try:
-                    retry_after = float(exc.headers.get("retry-after") or 0)
-                except (TypeError, ValueError, AttributeError):
-                    retry_after = 0.0
+                retry_after = _retry_after_seconds(getattr(exc, "headers", None))
                 delay, fails = _rate_limit_backoff(cache.get("rate_limit_fails"))
                 cache["rate_limited_until"] = now + max(delay, retry_after)
                 cache["rate_limit_fails"] = fails
@@ -4362,40 +4904,44 @@ def _get_exchange_rate(currency_symbol):
 
     # Check disk cache
     cache_path = get_state_dir() / "exchange_rate.json"
+    stale_rate = None
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             cached = json.load(f)
-        if (now - cached.get("timestamp", 0) < _EXCHANGE_RATE_TTL
-                and code in cached.get("rates", {})):
+        if code in cached.get("rates", {}):
             rate = cached["rates"][code]
-            _exchange_rate_mem[code] = (rate, now)
-            return rate, code
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+            if now - cached.get("timestamp", 0) < _EXCHANGE_RATE_TTL:
+                _exchange_rate_mem[code] = (rate, now)
+                return rate, code
+            stale_rate = float(rate)
+    except (FileNotFoundError, json.JSONDecodeError, OSError,
+            AttributeError, TypeError, ValueError):
         pass
 
     # Fetch from frankfurter.app (free, no API key)
-    try:
-        url = f"https://api.frankfurter.dev/v1/latest?from=USD&to={code}"
-        req = urllib.request.Request(url, headers={"User-Agent": "usage-pulse"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read(10000))
-        rate = data.get("rates", {}).get(code)
-        if rate:
-            # Cache all fetched rates
-            try:
-                _atomic_json_write(cache_path, {
-                    "timestamp": time.time(),
-                    "rates": data["rates"],
-                }, indent=None)
-            except OSError:
-                pass
-            _exchange_rate_mem[code] = (float(rate), now)
-            return float(rate), code
-    except Exception:
-        pass
+    if _begin_net_attempt(f"exchange_rate:{code}"):
+        try:
+            url = f"https://api.frankfurter.dev/v1/latest?from=USD&to={code}"
+            req = urllib.request.Request(url, headers={"User-Agent": "usage-pulse"})
+            body = _fetch_bounded(req, 10000)
+            data = json.loads(body) if body is not None else {}
+            rate = data.get("rates", {}).get(code)
+            if rate:
+                # Cache all fetched rates
+                try:
+                    _atomic_json_write(cache_path, {
+                        "timestamp": time.time(),
+                        "rates": data["rates"],
+                    }, indent=None)
+                except OSError:
+                    pass
+                _exchange_rate_mem[code] = (float(rate), now)
+                return float(rate), code
+        except Exception:
+            pass
 
-    # Fallback to hardcoded rate
-    fallback = _FALLBACK_RATES.get(code, 1.0)
+    # Fallback: the last real rate if there ever was one, else the hardcoded one
+    fallback = stale_rate if stale_rate is not None else _FALLBACK_RATES.get(code, 1.0)
     _exchange_rate_mem[code] = (fallback, now)
     return fallback, code
 
@@ -9398,7 +9944,7 @@ def cmd_print_config():
     # Update check
     local = get_local_commit()
     if local:
-        update = check_for_update()
+        update = check_for_update(interactive=True)
         if update:
             utf8_print(f"  Update:       {BRIGHT_YELLOW}available{RESET}  (run {BOLD}/pulse update{RESET} or {BOLD}--update{RESET})")
         elif update is False:
@@ -9414,7 +9960,7 @@ def cmd_print_config():
             )
             if result.returncode == 0:
                 local_ver = _sanitize(result.stdout.strip().split()[0])
-                cc_update = check_claude_code_update()
+                cc_update = check_claude_code_update(local_ver, interactive=True)
                 if cc_update:
                     # Read cached remote version
                     try:
@@ -10870,7 +11416,11 @@ def main():
         # widget was enabled and simply starved of data. Same starvation gave
         # "Extra: n/a" and the "check failed" credits line.
         has_core = "five_hour" in usage_from_stdin or "seven_day" in usage_from_stdin
-        _caps_age = time.time() - float((_stale or {}).get("model_caps_fetched_at") or 0)
+        # The stale cache is untrusted input. A time field it cannot use (text,
+        # an int too big for a float, Infinity, NaN) counts as absent: caps
+        # stale, no backoff active, no recent attempt. A raise here is a blank
+        # bar on every repaint, and Infinity would freeze the caps for good.
+        _caps_age = time.time() - (_cache_seconds((_stale or {}).get("model_caps_fetched_at")) or 0)
         _caps_stale = _caps_age > _model_caps_ttl(config)
         # Only refresh if a widget that consumes this data is actually on
         # screen. The per-model bars are opt-in (DEFAULT_SHOW has them off)
@@ -10889,55 +11439,76 @@ def main():
         # Same reason: the end-of-branch write must not erase 429 backoff.
         _rl_until = (_stale or {}).get("rate_limited_until") or None
         _rl_fails = (_stale or {}).get("rate_limit_fails") or None
-        _blocked_until = float((_stale or {}).get("rate_limited_until") or 0)
+        # An unusable stamp is not carried, though: written back, it would
+        # crash or freeze every later repaint the same way. A usable one is
+        # carried exactly as it was written.
+        if _cache_seconds(_caps_ts) is None:
+            _caps_ts = None
+        if _cache_seconds(_caps_attempted) is None:
+            _caps_attempted = None
+        if _cache_seconds(_rl_until) is None:
+            _rl_until = None
+        _blocked_until = _cache_seconds(_rl_until) or 0
         _backoff_active = time.time() < _blocked_until
-        _recent_attempt = (time.time() - float(_caps_attempted or 0)) < _MODEL_CAPS_RETRY
+        _recent_attempt = (time.time() - (_cache_seconds(_caps_attempted) or 0)) < _MODEL_CAPS_RETRY
         if (not has_core and not has_model_caps and "extra_usage" not in usage_from_stdin) or \
                 (_caps_wanted and _caps_stale and not _backoff_active and not _recent_attempt):
             try:
-                # Stamp the attempt before the request so a run that Claude
-                # Code cancels mid-flight (or one that times out) still holds
-                # the next attempt off for _MODEL_CAPS_RETRY seconds.
-                _caps_attempted = time.time()
-                write_cache(cache_path, "", usage=usage_from_stdin,
-                            plan=plan_from_cache,
-                            model_caps_fetched_at=_caps_ts,
-                            rate_limited_until=_rl_until,
-                            rate_limit_fails=_rl_fails,
-                            model_caps_attempted_at=_caps_attempted)
-                token, api_plan = get_credentials()
-                if token:
-                    api_usage = fetch_usage(token, timeout=_MODEL_CAPS_TIMEOUT)
-                    for key, value in api_usage.items():
-                        # Model caps refresh in place: an expired carried-over
-                        # value must be replaced, not kept. five_hour and
-                        # seven_day still come from stdin and are left alone.
-                        if key not in _USAGE_CACHE_KEYS:
-                            continue
-                        if key in ("five_hour", "seven_day") and key in usage_from_stdin:
-                            continue
-                        usage_from_stdin[key] = value
-                    if api_plan:
-                        plan_from_cache = api_plan
-                    _caps_ts = time.time()
-                    _rl_until = None   # success clears the backoff
-                    _rl_fails = None
-                    write_cache(cache_path, "", usage=usage_from_stdin,
-                                plan=plan_from_cache,
-                                model_caps_fetched_at=_caps_ts,
-                                model_caps_attempted_at=_caps_attempted)
+                # The kill guard is asked first. When it says no (this
+                # account's last fetch was cut short, or another window of it
+                # is mid-fetch) nothing is sent, so nothing is recorded either:
+                # the next repaint asks again instead of waiting out a
+                # _MODEL_CAPS_RETRY it never used.
+                if _begin_net_attempt("usage", _USAGE_KILL_GUARD, primary=True):
+                    try:
+                        # Stamp the attempt before the request so a run that
+                        # Claude Code cancels mid-flight (or one that times
+                        # out, or finds no token) still holds the next attempt
+                        # off for _MODEL_CAPS_RETRY seconds.
+                        _caps_attempted = time.time()
+                        write_cache(cache_path, "", usage=usage_from_stdin,
+                                    plan=plan_from_cache,
+                                    model_caps_fetched_at=_caps_ts,
+                                    rate_limited_until=_rl_until,
+                                    rate_limit_fails=_rl_fails,
+                                    model_caps_attempted_at=_caps_attempted)
+                        token, api_plan = get_credentials()
+                        if token:
+                            api_usage = fetch_usage(token, timeout=_MODEL_CAPS_TIMEOUT)
+                    except Exception:
+                        _end_net_attempt("usage")
+                        raise
+                    _end_net_attempt("usage")
+                    if token:
+                        for key, value in api_usage.items():
+                            # Model caps refresh in place: an expired
+                            # carried-over value must be replaced, not kept.
+                            # five_hour and seven_day still come from stdin
+                            # and are left alone.
+                            if key not in _USAGE_CACHE_KEYS:
+                                continue
+                            if key in ("five_hour", "seven_day") and key in usage_from_stdin:
+                                continue
+                            usage_from_stdin[key] = value
+                        if api_plan:
+                            plan_from_cache = api_plan
+                        _caps_ts = time.time()
+                        _rl_until = None   # success clears the backoff
+                        _rl_fails = None
+                        write_cache(cache_path, "", usage=usage_from_stdin,
+                                    plan=plan_from_cache,
+                                    model_caps_fetched_at=_caps_ts,
+                                    model_caps_attempted_at=_caps_attempted)
             except urllib.error.HTTPError as exc:
                 # A 429 here must set the shared backoff. Without it this path
                 # retried on every repaint: each draw saw no timestamp, judged
                 # the caps stale, and called again — which is exactly how a
                 # burst of repaints earns a multi-thousand-second retry-after
                 # from the endpoint. Honour Retry-After when the server sends
-                # one, else fall back to the existing exponential schedule.
+                # a usable one (capped, see _retry_after_seconds), else fall
+                # back to the existing exponential schedule.
                 if getattr(exc, "code", None) == 429:
-                    try:
-                        _ra = float(exc.headers.get("retry-after") or 0)
-                    except (TypeError, ValueError):
-                        _ra = 0
+                    _ra = _retry_after_seconds(getattr(exc, "headers", None))
                     _delay, _fails = _rate_limit_backoff(
                         (_stale or {}).get("rate_limit_fails"))
                     _delay = max(_delay, _ra)
@@ -10978,7 +11549,10 @@ def main():
 
     # --- Cached data (no stdin rate limits available) ---
     if cached is not None:
-        cache_age = time.time() - cached.get("timestamp", time.time())
+        # During a 429 backoff read_cache returns the cache without checking
+        # its timestamp, and float() accepts numeric text: an unusable one
+        # reads as +inf (the red stale label) instead of raising here.
+        cache_age = _cache_age(cached)
         if "usage" in cached:
             line = build_status_line(cached["usage"], cached.get("plan", ""), config, stdin_ctx, cache_age=cache_age)
             _update_session_state(cached["usage"], stdin_ctx)
@@ -10998,6 +11572,34 @@ def main():
         else:
             line = "No credentials \u2014 run claude and /login"
         write_cache(cache_path, line)
+        line = _fit_line(_append_provider_rows(line, config), config)
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
+        return
+
+    # Claude Code cancels a repaint that outlives its refresh interval, and a
+    # cancelled repaint can't note that its request was slow. So the stamp goes
+    # down first and is lifted once there is a line to print; finding it still
+    # there means the last repaint died in here — draw what we have instead of
+    # walking into the same request again.
+    if not _begin_net_attempt("usage", _USAGE_KILL_GUARD, primary=True):
+        # The stale cache is whatever JSON object is on disk — read_cache's
+        # shape checks have not run on it — and nothing below sits inside the
+        # fetch error handlers, so a raise here would be an empty stdout.
+        line = ""
+        try:
+            stale = _read_stale_cache(cache_path) or {}
+            if isinstance(stale.get("usage"), dict) and stale["usage"]:
+                line = build_status_line(stale["usage"], stale.get("plan", plan),
+                                         config, stdin_ctx,
+                                         cache_age=_cache_age(stale))
+            elif isinstance(stale.get("line"), str):
+                line = stale["line"]
+        except Exception:
+            line = ""
+        if not line:
+            line = "Usage unavailable \u2014 retrying shortly"
+        line = append_update_indicator(line, config)
+        line = append_claude_update_indicator(line, config, stdin_ctx)
         line = _fit_line(_append_provider_rows(line, config), config)
         sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
         return
@@ -11029,16 +11631,32 @@ def main():
             retry_at = time.time() + delay
 
             stale_usage = stale.get("usage") if stale else None
-            if stale_usage:
+            line = None
+            if isinstance(stale_usage, dict) and stale_usage:
+                # This runs before the backoff is written, so a raise here
+                # also lost the backoff and the next repaint called the API
+                # again. A value the renderer cannot draw (the file is
+                # untrusted) falls through to the message below, whose
+                # rewrite drops it. An unusable, missing or zero timestamp
+                # reads as long stale here, and the rewrite records it as
+                # _UNKNOWN_DATA_TIME so it stays stale on later repaints.
+                stale_age = _cache_age(stale)
+                stale_ts = stale.get("timestamp")
+                if not _cache_seconds(stale_ts):
+                    stale_ts = _UNKNOWN_DATA_TIME
+                try:
+                    line = build_status_line(
+                        stale_usage, stale.get("plan", plan), config, stdin_ctx,
+                        cache_age=stale_age,
+                    )
+                except Exception:
+                    line = None
+            if line is not None:
                 usage = stale_usage
-                stale_age = time.time() - stale.get("timestamp", time.time())
-                line = build_status_line(
-                    usage, stale.get("plan", plan), config, stdin_ctx, cache_age=stale_age
-                )
                 write_cache(
                     cache_path, line, usage, stale.get("plan", plan),
                     rate_limited_until=retry_at, rate_limit_fails=fails,
-                    data_timestamp=stale.get("timestamp"),
+                    data_timestamp=stale_ts,
                 )
             else:
                 mins = max(1, int(delay // 60))
@@ -11047,6 +11665,7 @@ def main():
                     cache_path, line,
                     rate_limited_until=retry_at, rate_limit_fails=fails,
                 )
+            _end_net_attempt("usage")
             line = _fit_line(_append_provider_rows(line, config), config)
             sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
             return
@@ -11077,6 +11696,7 @@ def main():
     except Exception as e:
         usage = None
         line = f"Usage unavailable: {type(e).__name__}"
+    _end_net_attempt("usage")
 
     if usage is not None:
         write_cache(cache_path, line, usage, plan)

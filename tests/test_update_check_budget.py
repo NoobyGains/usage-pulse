@@ -41,17 +41,38 @@ class UpdateCheckBudgetTest(unittest.TestCase):
         whatever timeout they are granted. Returns (verdict, elapsed)."""
         clock = _FakeClock()
 
-        def fake_run(cmd, capture_output=None, text=None, timeout=None, cwd=None):
-            clock.now += timeout * op_cost_fraction
+        def fake_run(cmd, **kwargs):
+            # subprocess.run's real surface: any keyword argument, with the
+            # output delivered wherever stdout points (a pipe, or the temp file
+            # network git writes to). A call with no timeout at all is charged
+            # an hour: nothing stops it blocking that long.
+            timeout = kwargs.get("timeout")
+            clock.now += (3600 if timeout is None else timeout) * op_cost_fraction
             if "symbolic-ref" in cmd:
-                out = "main"
+                returncode, out = 0, "main"
             elif "rev-parse" in cmd:
-                out = LOCAL_SHA
+                returncode, out = 0, LOCAL_SHA
             elif "get-url" in cmd:
-                out = f"https://github.com/{cs.GITHUB_REPO}"
+                returncode, out = 0, f"https://github.com/{cs.GITHUB_REPO}"
+            elif "ls-remote" in cmd:
+                # Never a real remote: upstream's tip, as the API reports it.
+                returncode, out = 0, f"{REMOTE_SHA}\trefs/heads/main\n"
+            elif any(sub in cmd for sub in ("fetch", "pull", "clone", "push")):
+                returncode, out = 128, ""  # no other network git is scripted
             else:  # cat-file / merge-base
-                out = ""
-            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+                returncode, out = 0, ""
+            text = any(kwargs.get(k) for k in ("text", "universal_newlines",
+                                               "encoding", "errors"))
+            dest = kwargs.get("stdout")
+            if hasattr(dest, "write"):
+                dest.write(out.encode("utf-8"))
+                out = None
+            elif kwargs.get("capture_output") or dest is cs.subprocess.PIPE:
+                out = out if text else out.encode("utf-8")
+            else:
+                out = None  # not captured: it would have gone to our own stdout
+            err = ("" if text else b"") if kwargs.get("capture_output") else None
+            return SimpleNamespace(returncode=returncode, stdout=out, stderr=err)
 
         class _FakeResponse:
             def __enter__(self):
@@ -67,10 +88,15 @@ class UpdateCheckBudgetTest(unittest.TestCase):
             clock.now += timeout * op_cost_fraction
             return _FakeResponse()
 
+        def fake_fetch(req, max_bytes, budget=None):
+            clock.now += budget * op_cost_fraction
+            return REMOTE_SHA.encode()
+
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(cs, "time", clock), \
                 mock.patch.object(cs.subprocess, "run", fake_run), \
                 mock.patch.object(cs.urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(cs, "_fetch_bounded", fake_fetch), \
                 mock.patch.object(cs, "get_state_dir", lambda: Path(td)):
             start = clock.time()
             verdict = cs.check_for_update()
@@ -105,17 +131,33 @@ class UpdateBranchGateTest(unittest.TestCase):
         import tempfile
         network_calls = []
 
-        def fake_run(cmd, capture_output=None, text=None, timeout=None, cwd=None):
-            if "symbolic-ref" in cmd:
-                return SimpleNamespace(returncode=branch_rc,
-                                       stdout=branch_stdout, stderr="")
-            if "rev-parse" in cmd:
-                return SimpleNamespace(returncode=0, stdout=LOCAL_SHA, stderr="")
-            if "get-url" in cmd:
-                return SimpleNamespace(
-                    returncode=0, stdout=f"https://github.com/{cs.GITHUB_REPO}",
-                    stderr="")
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        def fake_run(cmd, **kwargs):
+            # subprocess.run's real surface: any keyword argument, with the
+            # output delivered wherever stdout points (a pipe, or the temp file
+            # network git writes to).
+            if any(sub in cmd for sub in ("ls-remote", "fetch", "pull", "clone", "push")):
+                network_calls.append(cmd)  # git reaching for the network counts
+                returncode, out = 128, ""  # and never gets an answer
+            elif "symbolic-ref" in cmd:
+                returncode, out = branch_rc, branch_stdout
+            elif "rev-parse" in cmd:
+                returncode, out = 0, LOCAL_SHA
+            elif "get-url" in cmd:
+                returncode, out = 0, f"https://github.com/{cs.GITHUB_REPO}"
+            else:
+                returncode, out = 1, ""
+            text = any(kwargs.get(k) for k in ("text", "universal_newlines",
+                                               "encoding", "errors"))
+            dest = kwargs.get("stdout")
+            if hasattr(dest, "write"):
+                dest.write(out.encode("utf-8"))
+                out = None
+            elif kwargs.get("capture_output") or dest is cs.subprocess.PIPE:
+                out = out if text else out.encode("utf-8")
+            else:
+                out = None  # not captured: it would have gone to our own stdout
+            err = ("" if text else b"") if kwargs.get("capture_output") else None
+            return SimpleNamespace(returncode=returncode, stdout=out, stderr=err)
 
         class _FakeResponse:
             def __enter__(self):
@@ -131,9 +173,14 @@ class UpdateBranchGateTest(unittest.TestCase):
             network_calls.append(req)
             return _FakeResponse()
 
+        def fake_fetch(req, max_bytes, budget=None):
+            network_calls.append(req)
+            return REMOTE_SHA.encode()
+
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(cs.subprocess, "run", fake_run), \
                 mock.patch.object(cs.urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(cs, "_fetch_bounded", fake_fetch), \
                 mock.patch.object(cs, "get_state_dir", lambda: Path(td)):
             verdict = cs.check_for_update()
         return verdict, network_calls

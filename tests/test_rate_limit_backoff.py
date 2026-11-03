@@ -11,6 +11,7 @@ Run: ``python tests/test_rate_limit_backoff.py``
 """
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -66,7 +67,11 @@ class RateLimitedRefreshKeepsUsageAgeTest(unittest.TestCase):
             rendered["cache_age"] = cache_age
             return "line"
 
+        # CLAUDE_CONFIG_DIR: main() syncs statusLine.refreshInterval in Claude
+        # Code's settings.json — with load_config mocked empty, a run against
+        # the developer's real config dir strips it from their live settings.
         with tempfile.TemporaryDirectory() as state_td, \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": state_td}), \
                 mock.patch.object(sys, "argv", ["claude_status.py"]), \
                 mock.patch.object(sys, "stdin", fake_stdin), \
                 mock.patch.object(cs, "get_state_dir", lambda: Path(state_td)), \
@@ -100,6 +105,26 @@ class RateLimitedRefreshKeepsUsageAgeTest(unittest.TestCase):
             self.assertEqual(data["rate_limit_fails"], 1)
             # The render during the 429 itself must also see the true age.
             self.assertAlmostEqual(rendered["cache_age"], 600, delta=30)
+
+
+class BackoffScheduleTest(unittest.TestCase):
+    def test_unusable_fail_count_restarts_the_schedule(self):
+        """cache.json is untrusted input, and json reads Infinity as a float.
+        int() of an infinite count raises OverflowError, which the except did
+        not name, so the 429 handlers crashed before they wrote the backoff:
+        a blank bar, and the next repaint called the API again."""
+        base = cs._RATE_LIMIT_BACKOFF_BASE
+        for bad in (float("inf"), float("-inf"), float("nan"), "soon", [1], None):
+            with self.subTest(fail_count=repr(bad)):
+                delay, fails = cs._rate_limit_backoff(bad)
+                self.assertEqual(fails, 1)
+                self.assertTrue(base <= delay <= base + cs._RATE_LIMIT_JITTER, delay)
+
+    def test_huge_finite_fail_count_waits_the_longest(self):
+        delay, fails = cs._rate_limit_backoff(10 ** 400)
+        self.assertEqual(fails, 10 ** 400 + 1)
+        self.assertTrue(cs._RATE_LIMIT_BACKOFF_MAX <= delay
+                        <= cs._RATE_LIMIT_BACKOFF_MAX + cs._RATE_LIMIT_JITTER, delay)
 
 
 if __name__ == "__main__":

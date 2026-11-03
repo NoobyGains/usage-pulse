@@ -843,10 +843,16 @@ class InstallTeamHooksTest(unittest.TestCase):
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
         self.settings = Path(self._td.name) / "settings.json"
+        # install_hooks backs settings.json up into the state dir the second
+        # time it runs: that must be this test's own dir, not the contributor's.
+        state = Path(self._td.name) / "state"
         for patch in (mock.patch.object(cs, "_claude_config_dir", lambda: Path(self._td.name)),
+                      mock.patch.object(cs, "get_state_dir", lambda: state),
                       mock.patch.object(cs, "utf8_print", lambda *a, **k: None)):
             patch.start()
             self.addCleanup(patch.stop)
+        cs._settings_backed_up.clear()
+        self.addCleanup(cs._settings_backed_up.clear)
 
     def _hooks(self):
         return json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]
@@ -855,6 +861,29 @@ class InstallTeamHooksTest(unittest.TestCase):
         return [h for h in hooks.get(event, [])
                 if any("claude_status.py" in i.get("command", "") and flag in i.get("command", "")
                        for i in h.get("hooks", []))]
+
+    def test_settings_backups_stay_inside_the_test_sandbox(self):
+        """The second install over an existing settings.json takes a backup in
+        the state dir. Unpatched, that is the contributor's real state dir, and
+        every run left tmpXXXX-settings.json.<stamp> files there (each temp-dir
+        prefix is unique, so retention never prunes them)."""
+        taken = []
+        real = cs._backup_settings
+
+        def spy(settings_path):
+            dest = real(settings_path)
+            taken.append(dest)
+            return dest
+
+        with mock.patch.object(cs, "_backup_settings", spy):
+            cs.install_hooks()
+            cs.install_hooks()
+        written = [d for d in taken if d is not None]
+        self.assertTrue(written, "the second install took no backup, so this checks nothing")
+        sandbox = Path(self._td.name).resolve()
+        for dest in written:
+            self.assertIn(sandbox, Path(dest).resolve().parents,
+                          "a settings backup was written outside the sandbox: %s" % dest)
 
     def test_adds_exactly_one_entry_per_team_event(self):
         cs.install_hooks()

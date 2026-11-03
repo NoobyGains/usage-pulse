@@ -24,7 +24,6 @@
     "model": true,
     "branch": true,
     "heartbeat": false,
-    "activity": false,
     "update": true,
     "claude_update": true,
     "opus": false,

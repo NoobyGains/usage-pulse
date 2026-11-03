@@ -331,7 +331,6 @@ def _model_short_name(model_id):
 # ---------------------------------------------------------------------------
 HEARTBEAT_SPINNER = ["|", "/", "-", "\\"]  # Classic ASCII spinner — renders on every terminal
 HOOK_STATE_FRESH_TTL = 300  # 5 minutes — keeps heartbeat visible between interactions
-RAPID_CALL_WINDOW = 10
 GIT_BRANCH_CACHE_TTL = 60
 
 # ---------------------------------------------------------------------------
@@ -554,7 +553,7 @@ WIDGET_PRIORITY = {
     "weekly_cost": 73, "lines": 75, "plan": 90,
     "streak": 100, "model": 110, "effort": 120, "fast_mode": 122,
     "thinking": 124, "agent": 126, "worktree": 130,
-    "heartbeat": 140, "activity": 150, "last_tool": 160, "branch": 170,
+    "heartbeat": 140, "last_tool": 160, "branch": 170,
     "pr": 175,
     "subagents": 178, "team": 179, "sessions": 180, "budget": 185, "pomodoro": 190, "git_drift": 200,
     "files_changed": 210,
@@ -645,7 +644,6 @@ DEFAULT_SHOW = {
     # on. Leaving them off by default also means a stock config asks for no
     # repaint timer at all.
     "heartbeat": False,
-    "activity": False,
     "update": True,
     "claude_update": True,
     # Per-model caps (show when available)
@@ -1204,6 +1202,7 @@ def load_config():
         data["currency"] = _detect_default_currency()
     show = data.get("show", {})
     show.pop("peak", None)  # v3.2.0 — widget removed
+    show.pop("activity", None)  # v3.6.2 — widget removed
     for key, default in DEFAULT_SHOW.items():
         show.setdefault(key, default)
     data["show"] = show
@@ -1375,11 +1374,9 @@ def hook_refresh(tool_name_arg):
     if "session_start" not in state:
         state["session_start"] = now
     state["last_refresh"] = now
-    call_times = state.get("_call_times", [])
-    call_times.append(now)
-    call_times = [t for t in call_times if t > now - RAPID_CALL_WINDOW]
-    state["_call_times"] = call_times
-    state["rapid_calls"] = len(call_times)
+    # Fed only the activity widget, removed in 3.6.2.
+    state.pop("_call_times", None)
+    state.pop("rapid_calls", None)
     try:
         _atomic_json_write(hook_state_path, state, indent=None)
     except OSError:
@@ -1433,8 +1430,8 @@ def _blocking_hook_command(flag, python_cmd, script_path):
 # a blocking event is one whose exit code 2 steers Claude Code, so its command
 # is pinned to exit 0 by _blocking_hook_command.
 _HOOK_GROUPS = {
-    # PostToolUse drives the heartbeat spinner, tool counter, activity flag and
-    # last-tool widget. It runs Python after every tool call, so it is opt-in.
+    # PostToolUse drives the heartbeat spinner, tool counter and last-tool
+    # widget. It runs Python after every tool call, so it is opt-in.
     "heartbeat": (("PostToolUse", "--hook-refresh", False),),
     # SubagentStart / SubagentStop drive the live agent counter. They carry
     # agent_id and agent_type, so no polling is needed. SubagentStop is
@@ -1666,7 +1663,6 @@ def install_hooks(groups=None):
     utf8_print(f"This enables:")
     if "heartbeat" in groups:
         utf8_print(f"  {BOLD}Heartbeat{RESET}    — live spinner with tool count & elapsed time")
-        utf8_print(f"  {BOLD}Activity{RESET}     — {BRIGHT_YELLOW}⚡ Active{RESET} indicator during rapid tool calls")
         utf8_print(f"  {BOLD}Last tool{RESET}    — shows last tool used (opt-in: --show last_tool)")
         utf8_print(f"  {BOLD}Git branch{RESET}   — current branch name")
     if "agents" in groups:
@@ -4890,6 +4886,23 @@ _CURRENCY_TO_CODE = {
 _exchange_rate_mem = {}  # in-memory cache: {code: (rate, timestamp)}
 
 
+def _usable_rate(value):
+    """An exchange rate as a positive finite float, or None when unusable.
+
+    The cache file and the API reply are untrusted input. Besides text and
+    null, valid JSON can hold an int too big for a float (float() raises
+    OverflowError, which is not a ValueError), NaN, Infinity, zero or a
+    negative number: none of them can price a cost.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return rate if math.isfinite(rate) and rate > 0 else None
+
+
 def _get_exchange_rate(currency_symbol):
     """Get USD→target exchange rate. Cached for 24h. Returns (rate, code) or (1.0, 'USD')."""
     code = _CURRENCY_TO_CODE.get(currency_symbol, "")
@@ -4909,11 +4922,15 @@ def _get_exchange_rate(currency_symbol):
         with open(cache_path, "r", encoding="utf-8") as f:
             cached = json.load(f)
         if code in cached.get("rates", {}):
-            rate = cached["rates"][code]
-            if now - cached.get("timestamp", 0) < _EXCHANGE_RATE_TTL:
-                _exchange_rate_mem[code] = (rate, now)
-                return rate, code
-            stale_rate = float(rate)
+            rate = _usable_rate(cached["rates"][code])
+            if rate is not None:
+                # A damaged or future timestamp is not fresh: refetch instead
+                # of trusting the rate until a date that may never come.
+                timestamp = _cache_seconds(cached.get("timestamp", 0))
+                if timestamp is not None and 0 <= now - timestamp < _EXCHANGE_RATE_TTL:
+                    _exchange_rate_mem[code] = (rate, now)
+                    return rate, code
+                stale_rate = rate
     except (FileNotFoundError, json.JSONDecodeError, OSError,
             AttributeError, TypeError, ValueError):
         pass
@@ -4925,8 +4942,8 @@ def _get_exchange_rate(currency_symbol):
             req = urllib.request.Request(url, headers={"User-Agent": "usage-pulse"})
             body = _fetch_bounded(req, 10000)
             data = json.loads(body) if body is not None else {}
-            rate = data.get("rates", {}).get(code)
-            if rate:
+            rate = _usable_rate(data.get("rates", {}).get(code))
+            if rate is not None:
                 # Cache all fetched rates
                 try:
                     _atomic_json_write(cache_path, {
@@ -4935,8 +4952,8 @@ def _get_exchange_rate(currency_symbol):
                     }, indent=None)
                 except OSError:
                     pass
-                _exchange_rate_mem[code] = (float(rate), now)
-                return float(rate), code
+                _exchange_rate_mem[code] = (rate, now)
+                return rate, code
         except Exception:
             pass
 
@@ -6945,10 +6962,6 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
         frame_idx = int(time.time() * 4) % len(HEARTBEAT_SPINNER)
         spinner = HEARTBEAT_SPINNER[frame_idx]
         parts.append((_pri("heartbeat"), f"[{spinner}] {tool_count} tools {_format_elapsed(elapsed)}"))
-
-    if show.get("activity", False) and hook_fresh:
-        if hook_state.get("rapid_calls", 0) > 3:
-            parts.append((_pri("activity"), f"\u26a1 Active"))
 
     if show.get("last_tool", False) and hook_fresh:
         last_tool = hook_state.get("last_tool", "")

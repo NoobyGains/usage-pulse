@@ -297,6 +297,81 @@ class ExchangeRateTrapTest(unittest.TestCase):
         self.assertEqual(len(net.calls), 2)
 
 
+OVERFLOWING = "1" + "0" * 400  # a 401-digit int: valid JSON, too big for a float
+
+
+def _write_fx_cache(state_dir, rate_json, timestamp_json):
+    """Write exchange_rate.json as raw JSON text, so NaN, Infinity and huge
+    ints land exactly as a damaged file would hold them."""
+    (state_dir / "exchange_rate.json").write_text(
+        '{"timestamp": %s, "rates": {"GBP": %s}}' % (timestamp_json, rate_json),
+        encoding="utf-8",
+    )
+
+
+class DamagedExchangeRateCacheTest(unittest.TestCase):
+    """exchange_rate.json is untrusted input. A damaged value must never reach
+    the cost widget, where it raises (blanking every repaint) or prints
+    nonsense such as £nan or a negative cost."""
+
+    def test_expired_overflowing_rate_does_not_blank_the_cost_widget(self):
+        clock = _FakeClock()
+        with _sandbox(_Network(["fail"]), clock=clock) as state:
+            _write_fx_cache(state, OVERFLOWING, clock.now - cs._EXCHANGE_RATE_TTL - 1)
+            self.assertEqual(
+                cs._format_cost({"cost_usd": 1.0}, {"currency": GBP}),
+                f"{GBP}{cs._FALLBACK_RATES['GBP']:.2f}",
+            )
+
+    def test_fresh_overflowing_rate_is_a_cache_miss(self):
+        clock = _FakeClock()
+        net = _Network([FX_LATEST])
+        with _sandbox(net, clock=clock) as state:
+            _write_fx_cache(state, OVERFLOWING, clock.now)
+            self.assertEqual(cs._get_exchange_rate(GBP), (0.5, "GBP"))
+        self.assertEqual(len(net.calls), 1)
+
+    def test_unusable_fresh_rates_are_cache_misses(self):
+        for bad in ("NaN", "Infinity", "-Infinity", "0", "-0.8", '"abc"',
+                    "true", "null", "[0.8]"):
+            with self.subTest(rate=bad):
+                clock = _FakeClock()
+                with _sandbox(_Network([FX_LATEST]), clock=clock) as state:
+                    _write_fx_cache(state, bad, clock.now)
+                    self.assertEqual(cs._get_exchange_rate(GBP), (0.5, "GBP"))
+
+    def test_unusable_stale_rates_fall_back_to_the_built_in_rate(self):
+        for bad in ("NaN", "Infinity", "0", "-0.8", OVERFLOWING):
+            with self.subTest(rate=bad[:12]):
+                clock = _FakeClock()
+                with _sandbox(_Network(["fail"]), clock=clock) as state:
+                    _write_fx_cache(state, bad, clock.now - cs._EXCHANGE_RATE_TTL - 1)
+                    self.assertEqual(cs._get_exchange_rate(GBP),
+                                     (cs._FALLBACK_RATES["GBP"], "GBP"))
+
+    def test_damaged_or_future_timestamp_is_not_fresh(self):
+        for stamp in ("Infinity", OVERFLOWING, "NaN", '"yesterday"', "null", "future"):
+            with self.subTest(timestamp=stamp[:12]):
+                clock = _FakeClock()
+                net = _Network([FX_LATEST])
+                with _sandbox(net, clock=clock) as state:
+                    if stamp == "future":
+                        stamp = repr(clock.now + 30 * 86400)
+                    _write_fx_cache(state, "0.6", stamp)
+                    self.assertEqual(cs._get_exchange_rate(GBP), (0.5, "GBP"))
+                self.assertEqual(len(net.calls), 1)
+
+    def test_unusable_fetched_rate_is_neither_used_nor_cached(self):
+        for body in (b'{"rates": {"GBP": -1}}', b'{"rates": {"GBP": NaN}}',
+                     b'{"rates": {"GBP": "abc"}}'):
+            with self.subTest(body=body):
+                with _sandbox(_Network([body])) as state:
+                    self.assertEqual(cs._get_exchange_rate(GBP),
+                                     (cs._FALLBACK_RATES["GBP"], "GBP"))
+                    self.assertFalse((state / "exchange_rate.json").exists(),
+                                     "a rate that cannot price a cost was cached")
+
+
 class PulseUpdateCheckTrapTest(unittest.TestCase):
     def test_killed_check_is_not_retried_by_the_next_repaint(self):
         net = _Network(["kill"])

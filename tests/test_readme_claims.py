@@ -163,6 +163,12 @@ check("example uses a current model",
 print("\n== no removed features referenced ==")
 for gone in ("--peak-hours", "peak_hours", "In Peak", "Off-Peak"):
     check(f"'{gone}' absent", gone not in readme)
+# 3.6.2 removed the activity widget (⚡ Active).
+check("'⚡ Active' absent", "⚡ Active" not in readme)
+check("no `activity` widget row", "| `activity` |" not in readme)
+valid_parts = next((l for l in pulse_md.split("\n") if l.startswith("Valid parts:")), "")
+check("pulse.md does not offer activity",
+      "activity" not in re.split(r"[ ,:]+", valid_parts), valid_parts[:80])
 
 print("\n== removed functions not referenced ==")
 check("_check_peak_hours gone from code", not hasattr(cs, "_check_peak_hours"))

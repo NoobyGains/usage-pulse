@@ -300,7 +300,6 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `git_drift` | off | Commits behind and ahead of upstream |
 | `files_changed` | off | Count of uncommitted files |
 | `heartbeat` | off | Spinner, tool count and elapsed time. Needs the [heartbeat hook](#agents-and-teams) |
-| `activity` | off | `⚡ Active` during a burst of tool calls. Needs the heartbeat hook |
 | `last_tool` | off | The last tool Claude used. Needs the heartbeat hook |
 
 </details>
@@ -335,7 +334,7 @@ python3 ~/.usage-pulse/claude_status.py --install-hooks --only agents,team    # 
 |---|---|---|---|
 | `agents` | SubagentStart, SubagentStop | The live agent counter, `agents 3 live · 47/200` | A short Python run when a subagent starts or stops |
 | `team` | TeammateIdle, TaskCreated, TaskCompleted | The agent-team segment, `team 3 · tasks 4/7` | A short Python run on each of those events |
-| `heartbeat` | PostToolUse | The spinner and tool count, plus `activity` and `last_tool` | A Python run after **every** tool call, and it keeps the repaint timer alive, which is why it is off by default |
+| `heartbeat` | PostToolUse | The spinner and tool count, plus `last_tool` | A Python run after **every** tool call, and it keeps the repaint timer alive, which is why it is off by default |
 
 The agent panel rows need no hook: `--setup` registers `subagentStatusLine`, and Claude Code then asks Usage Pulse to draw each subagent's row with its status, model, effort, a context bar and elapsed time. `--limits subagent_spawns=200,subagent_concurrent=20,web_searches=200` sets the denominators, since Claude Code enforces those caps but does not report them.
 

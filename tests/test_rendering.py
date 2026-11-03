@@ -210,6 +210,29 @@ class CorruptStateResilienceTest(unittest.TestCase):
                 p.write_text(junk, encoding="utf-8")
                 self.assertIsNone(cs.read_cache(p, 60), junk)
 
+    def test_read_cache_treats_an_out_of_range_timestamp_as_a_miss(self):
+        """An int too big for a float made float() raise OverflowError, which
+        the ValueError handlers miss, so main() died before drawing anything.
+        Infinity read as fresh, or as a backoff, forever."""
+        import tempfile
+        import time
+        huge = "1" + "0" * 400
+        hour_ago = repr(time.time() - 3600)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.json"
+            for junk in ('{"timestamp": %s, "usage": {}}' % huge,
+                         '{"timestamp": -%s, "usage": {}}' % huge,
+                         '{"timestamp": Infinity, "usage": {}}',
+                         '{"timestamp": NaN, "usage": {}}',
+                         '{"timestamp": "1e999", "usage": {}}',
+                         '{"rate_limited_until": %s, "timestamp": %s, "usage": {}}'
+                         % (huge, hour_ago),
+                         '{"rate_limited_until": Infinity, "timestamp": %s, "usage": {}}'
+                         % hour_ago):
+                with self.subTest(cache=junk[:60]):
+                    p.write_text(junk, encoding="utf-8")
+                    self.assertIsNone(cs.read_cache(p, 60))
+
     def test_write_cache_survives_non_dict_usage(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
@@ -233,6 +256,45 @@ class CorruptStateResilienceTest(unittest.TestCase):
         self.assertEqual(cs._cache_age({"timestamp": "bad"}), float("inf"))
         self.assertEqual(cs._cache_age([]), float("inf"))
         self.assertLess(cs._cache_age({"timestamp": __import__("time").time()}), 5)
+
+    def test_cache_age_of_out_of_range_timestamp_is_infinite(self):
+        """float() raises OverflowError, not ValueError, for an int beyond the
+        float range; and an infinite timestamp gives an age of -inf, which
+        reads as fresh forever. Both are as unusable as "bad"."""
+        for ts in (10 ** 400, -10 ** 400, float("inf"), float("-inf"),
+                   float("nan"), "1e999", "inf", "nan"):
+            with self.subTest(timestamp=ts):
+                self.assertEqual(cs._cache_age({"timestamp": ts}), float("inf"))
+
+    def test_cache_readers_treat_an_unparseable_file_as_a_miss(self):
+        """read_cache and _read_stale_cache run on every repaint but caught
+        JSON syntax errors and OSError only. Not UTF-8 (UnicodeDecodeError),
+        nested past the parser's depth (RecursionError), or an int past the
+        int/str digit limit (a plain ValueError on Python 3.11+ and the
+        3.8.14 / 3.9.14 / 3.10.7 security releases) raised instead."""
+        import tempfile
+        usage = b'"usage": {"five_hour": {"utilization": 1.0}}'
+        try:
+            int("9" * 5000)
+            digit_limit = False  # an interpreter from before CVE-2020-10735
+        except ValueError:
+            digit_limit = True
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.json"
+            for label, raw in (
+                    ("not utf-8", b'{"line": "\xff\xfe", ' + usage + b"}"),
+                    ("nested too deep", b"[" * 100000 + b"]" * 100000),
+                    ("int past the digit limit",
+                     b'{"timestamp": 1' + b"0" * 5000 + b", " + usage + b"}")):
+                with self.subTest(cache=label):
+                    p.write_bytes(raw)
+                    self.assertIsNone(cs.read_cache(p, 60))
+                    stale = cs._read_stale_cache(p)
+                    if label == "int past the digit limit" and not digit_limit:
+                        # It parses there; _cache_age then reads it as stale.
+                        self.assertIsInstance(stale, dict)
+                    else:
+                        self.assertIsNone(stale)
 
 
 class CsiGrammarTest(unittest.TestCase):

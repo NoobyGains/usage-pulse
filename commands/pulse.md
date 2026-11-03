@@ -67,7 +67,7 @@ Save the path as SCRIPT_PATH. If no PY was found, use `python` (Windows) or `pyt
 | `config`, `settings` | `--config`, then summarise |
 | `help` | `--help`, show the output |
 
-Valid parts: session, weekly, context, timer, weekly_timer, session_bar, weekly_bar, context_bar, cost, model, branch, heartbeat, activity, update, claude_update, opus, sonnet, fable, plan, extra, effort, fast_mode, thinking, agent, worktree, pomodoro, context_warning, staleness, lines, cumulative_cost, weekly_cost, cache, cache_warm, spend_limit, repo, session_name, providers, subagents, team, budget, pr, burn_rate, sessions, last_tool, sparkline, runway, status_message, streak, pace, git_drift, files_changed
+Valid parts: session, weekly, context, timer, weekly_timer, session_bar, weekly_bar, context_bar, cost, model, branch, heartbeat, update, claude_update, opus, sonnet, fable, plan, extra, effort, fast_mode, thinking, agent, worktree, pomodoro, context_warning, staleness, lines, cumulative_cost, weekly_cost, cache, cache_warm, spend_limit, repo, session_name, providers, subagents, team, budget, pr, burn_rate, sessions, last_tool, sparkline, runway, status_message, streak, pace, git_drift, files_changed
 
 If `--show` answers "Unknown part", the installed version predates that widget: suggest `/pulse update`.
 

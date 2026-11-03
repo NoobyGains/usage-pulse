@@ -13,6 +13,21 @@ Ideas, not promises:
 - Live Codex limits through its app-server instead of the last session file.
 - A `skills/` layout for the plugin.
 
+## [3.6.2] - 2026-11-03
+
+### Fixed
+
+- **The status line no longer vanishes on slow networks or networks that drop IPv6.** Claude Code cancels a status-line script when the next refresh fires, and usage-pulse ran its network checks before it printed the bar. On a network that advertises IPv6 but drops it, every address waited out its own timeout, so one check could take over 30 seconds: each run was cancelled, nothing was cached, and the bar never drew. The bar is now printed from cache first and at most one optional network check runs per redraw. Each fetch, DNS lookup included, has a hard ceiling of 1.5 seconds, and IPv6 and IPv4 addresses are tried alternately (RFC 8305) so a dead family costs one short attempt. An attempt is recorded before it starts, so a cancelled run is not retried straight away.
+- A rate-limit reply (HTTP 429) from the usage API always records its backoff, and `Retry-After` is read as plain seconds, capped at 6 hours.
+- A damaged cache file (unreadable bytes, timestamps such as Infinity or NaN, very deep or very long JSON) counts as a cache miss instead of crashing the redraw or looking fresh forever.
+- A damaged `exchange_rate.json` can no longer blank the bar or print a nonsense cost. A rate too big for a float used to raise an uncaught error on every redraw, and NaN, Infinity, zero, negative or non-numeric rates were used as they were (showing `£nan` or a negative cost). Such a rate, from the cache or from the rate service, is now ignored: the bar fetches a fresh rate or uses the built-in one. A damaged or future timestamp no longer keeps an old rate "fresh" forever.
+- HTTP error responses are closed, and the OAuth token is only ever sent over https.
+- `tests/test_rate_limit_backoff.py` no longer writes to your real `~/.claude/settings.json` when you run it.
+
+### Removed
+
+- **The `activity` widget (`⚡ Active`).** Its tool-call count was only updated when the next tool ran and never aged on screen, so after any burst of calls it stayed lit for up to five minutes, which in a working session meant nearly always. The heartbeat spinner already shows live tool activity. A saved `activity` setting is dropped the next time your config loads, and `--show activity` now reports an unknown part.
+
 ## [3.6.1] - 2026-11-02
 
 ### Fixed

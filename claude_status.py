@@ -1093,11 +1093,10 @@ def _migrate_config_from_cache():
             pass
 
 
-def _detect_default_currency():
-    """Auto-detect currency symbol from system locale/timezone."""
+def _locale_country():
+    """Two-letter country of the machine's locale ("DK" for da_DK), or ""."""
     import locale as _locale
 
-    # Try locale-based detection
     country = ""
     try:
         # getdefaultlocale deprecated in 3.13 but still works on Windows
@@ -1113,6 +1112,17 @@ def _detect_default_currency():
                 country = loc.split("_")[-1].upper()
         except (ValueError, AttributeError):
             pass
+    return country
+
+
+def _detect_default_currency():
+    """Auto-detect currency symbol from system locale/timezone.
+
+    "kr" is the symbol of three currencies, so only Sweden gets it (it prices
+    as SEK). Denmark and Norway get their ISO code, which names the currency
+    unambiguously and which _get_exchange_rate understands.
+    """
+    country = _locale_country()
 
     _COUNTRY_CURRENCY = {
         "GB": "\u00a3", "UK": "\u00a3",
@@ -1121,7 +1131,7 @@ def _detect_default_currency():
         "BE": "\u20ac", "AT": "\u20ac", "IE": "\u20ac", "FI": "\u20ac", "PT": "\u20ac", "GR": "\u20ac",
         "JP": "\u00a5",
         "CA": "C$", "AU": "A$", "NZ": "NZ$",
-        "CH": "Fr", "SE": "kr", "NO": "kr", "DK": "kr",
+        "CH": "Fr", "SE": "kr", "NO": "NOK", "DK": "DKK",
         "IN": "\u20b9", "KR": "\u20a9", "BR": "R$", "ZA": "R",
         "PL": "z\u0142", "CZ": "K\u010d", "TR": "\u20ba", "IL": "\u20aa",
         "SG": "S$", "HK": "HK$", "MX": "$",
@@ -4680,14 +4690,12 @@ def _weekly_date(resets_at, clock="12h"):
     hour = local_dt.hour
     if clock == "24h":
         time_str = f"{hour:02d}:{local_dt.minute:02d}"
-    elif hour == 0:
-        time_str = "12am"
-    elif hour < 12:
-        time_str = f"{hour}am"
-    elif hour == 12:
-        time_str = "12pm"
     else:
-        time_str = f"{hour - 12}pm"
+        # Weekly resets fall on the hour in UTC, which is :30 or :45 local in
+        # half-hour zones (India, Nepal, Newfoundland...). Keep the compact
+        # "5pm" for an exact hour and spell the minutes out otherwise.
+        minutes = f":{local_dt.minute:02d}" if local_dt.minute else ""
+        time_str = f"{hour % 12 or 12}{minutes}{'am' if hour < 12 else 'pm'}"
     return f"{local_dt.strftime('%a')} {time_str}"
 
 
@@ -4879,8 +4887,35 @@ _CURRENCY_TO_CODE = {
     "C$": "CAD", "A$": "AUD", "NZ$": "NZD", "S$": "SGD", "HK$": "HKD",
     "R$": "BRL", "kr": "SEK", "Fr": "CHF", "\u20b9": "INR", "\u20a9": "KRW",
     "R": "ZAR", "z\u0142": "PLN", "K\u010d": "CZK", "\u20ba": "TRY",
-    "\u20b4": "UAH", "\u20b1": "PHP", "RM": "MYR", "\u20aa": "ILS",
+    "\u20b1": "PHP", "RM": "MYR", "\u20aa": "ILS",
+    # No hryvnia sign: the rate service (frankfurter) does not list UAH, so
+    # there is no rate to convert with. Left unmapped, amounts stay in dollars.
 }
+
+# ISO codes name a currency without the ambiguity of a shared symbol ("kr" is
+# the Swedish, Danish and Norwegian krone), so ``--currency DKK`` works. These
+# are the codes frankfurter's /v1/currencies lists: all of them can be priced.
+_ISO_CURRENCY_CODES = frozenset(
+    "AUD BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN "
+    "MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR".split()
+)
+# Which krone a bare "kr" means when the machine's country says so. Configs
+# saved before Denmark and Norway got their own codes still hold "kr".
+_KRONE_BY_COUNTRY = {"DK": "DKK", "NO": "NOK"}
+
+
+def _currency_code(currency_symbol):
+    """ISO code for a configured currency symbol or code; "" when there is none."""
+    if not isinstance(currency_symbol, str):
+        return ""
+    if currency_symbol == "kr":
+        return _KRONE_BY_COUNTRY.get(_locale_country(), "SEK")
+    code = _CURRENCY_TO_CODE.get(currency_symbol, "")
+    if not code:
+        iso = currency_symbol.strip().upper()
+        if iso in _ISO_CURRENCY_CODES:
+            code = iso
+    return code
 
 
 _exchange_rate_mem = {}  # in-memory cache: {code: (rate, timestamp)}
@@ -4905,7 +4940,7 @@ def _usable_rate(value):
 
 def _get_exchange_rate(currency_symbol):
     """Get USD→target exchange rate. Cached for 24h. Returns (rate, code) or (1.0, 'USD')."""
-    code = _CURRENCY_TO_CODE.get(currency_symbol, "")
+    code = _currency_code(currency_symbol)
     if not code or code == "USD":
         return 1.0, "USD"
 
@@ -4958,7 +4993,11 @@ def _get_exchange_rate(currency_symbol):
             pass
 
     # Fallback: the last real rate if there ever was one, else the hardcoded one
-    fallback = stale_rate if stale_rate is not None else _FALLBACK_RATES.get(code, 1.0)
+    fallback = stale_rate if stale_rate is not None else _FALLBACK_RATES.get(code)
+    if fallback is None:
+        # No rate of any kind: show the amount as the dollars it still is,
+        # rather than under this currency's name at a rate of 1.0.
+        return 1.0, "USD"
     _exchange_rate_mem[code] = (fallback, now)
     return fallback, code
 
@@ -5224,65 +5263,233 @@ _WEEKLY_COST_WINDOW = 7 * 86400
 _weekly_cost_mem = {"ts": 0, "data": {}}
 
 
-def _get_cached_weekly_cost():
-    """Rolling 7-day API-equivalent cost, with the same two-tier cache as the
-    cumulative figure: in-memory for the hot path, then a 5-minute disk cache
-    so a full transcript scan runs at most twice per refresh window.
+# Reading every transcript takes seconds (tens of seconds on a big store), and
+# Claude Code cancels a status line script the moment the next update fires,
+# so a scan on the render path never finishes: the figure is only saved once
+# the scan returns, nothing records that one began, and every repaint starts
+# it over. The render path therefore never scans. It draws the last saved
+# figure, however old, and when that is out of date it starts ONE detached
+# process (_cost_refresh_worker) that scans and saves it. A claim file,
+# created with O_EXCL before the process starts, keeps every other repaint and
+# every other window from starting a second scan.
+_COST_CACHE_VERSION = 2  # bumped when the scan's sums change; older files are not drawn
+_COST_SCAN_LOCK_TTL = 300  # seconds a claim holds off a new scan (also the retry delay after a failure)
+_CACHE_WRITE_1H_MULTIPLIER = 2.0  # 1-hour cache writes bill at 2x the input price
+
+# Run by the detached process: load this file by path and call the worker.
+_COST_WORKER_BOOT = (
+    "import importlib.util, sys\n"
+    "spec = importlib.util.spec_from_file_location('usage_pulse_cost_worker', sys.argv[1])\n"
+    "mod = importlib.util.module_from_spec(spec)\n"
+    "sys.modules[spec.name] = mod\n"
+    "spec.loader.exec_module(mod)\n"
+    "mod._cost_refresh_worker(sys.argv[2])\n"
+)
+
+
+def _cost_kind(kind):
+    """(cache file name, in-memory cache, TTL, window in seconds) for *kind*."""
+    if kind == "weekly":
+        return ("weekly_cost_cache.json", _weekly_cost_mem,
+                _WEEKLY_COST_CACHE_TTL, _WEEKLY_COST_WINDOW)
+    if kind == "cumulative":
+        return ("cumulative_cost_cache.json", _cumulative_cost_mem,
+                _CUMULATIVE_COST_CACHE_TTL, None)
+    return None
+
+
+def _read_cost_cache(path):
+    """A saved cost figure as (timestamp, data), or None.
+
+    None covers a missing or damaged file and one written by an older scan
+    (before responses were counted once, its totals were about double): better
+    a blank for the seconds a refresh takes than a wrong figure.
     """
-    now = time.time()
-
-    if now - _weekly_cost_mem["ts"] < _WEEKLY_COST_CACHE_TTL:
-        return _weekly_cost_mem["data"]
-
-    cache_path = get_account_state_dir() / "weekly_cost_cache.json"
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if now - cached.get("timestamp", 0) < _WEEKLY_COST_CACHE_TTL:
-            _weekly_cost_mem["ts"] = now
-            _weekly_cost_mem["data"] = cached.get("data", {})
-            return _weekly_cost_mem["data"]
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(saved, dict) or saved.get("v") != _COST_CACHE_VERSION:
+        return None
+    stamp = _cache_seconds(saved.get("timestamp"))
+    data = saved.get("data")
+    if stamp is None or not isinstance(data, dict):
+        return None
+    return stamp, data
 
-    data = _scan_session_costs(since_ts=now - _WEEKLY_COST_WINDOW)
-    _weekly_cost_mem["ts"] = now
-    _weekly_cost_mem["data"] = data
+
+def _claim_cost_scan(kind, now):
+    """Take the right to scan for *kind*. False means someone else holds it.
+
+    The claim is a file created with O_EXCL, so only one process wins. It is
+    taken BEFORE any work starts: a scan that is cut short, or that crashes,
+    leaves the claim behind and nothing retries for _COST_SCAN_LOCK_TTL. A
+    claim older than that is stale and is replaced; two processes racing to
+    replace it can at worst both scan once, which is harmless.
+    """
+    path = get_account_state_dir() / ("cost_scan_%s.lock" % kind)
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue  # released while we looked: try to take it
+            if 0 <= age < _COST_SCAN_LOCK_TTL:
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False  # no claim, no scan: the figure just stays as it was
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass  # the file exists, which is all the claim needs
+        return True
+    return False
+
+
+def _release_cost_scan(kind):
     try:
-        _atomic_json_write(cache_path, {"timestamp": now, "data": data}, indent=None)
+        (get_account_state_dir() / ("cost_scan_%s.lock" % kind)).unlink()
     except OSError:
         pass
-    return data
 
 
-def _get_cached_cumulative_cost():
-    """Return cumulative cost data with in-memory + 5-minute disk cache."""
+def _spawn_cost_worker(kind):
+    """Start the detached process that refreshes *kind*. True if it started.
+
+    It must outlive this status line process, which exits as soon as it has
+    printed (or is cancelled): its own session on POSIX, and on Windows no
+    console, a new process group and, where the job allows it, outside the
+    job object Claude Code may have put this process in.
+    """
+    if not sys.executable:
+        return False
+    # -I: no cwd or user site on sys.path, no PYTHON* variables.
+    argv = [sys.executable, "-I", "-c", _COST_WORKER_BOOT,
+            str(Path(__file__).resolve()), kind]
+    options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+               "stderr": subprocess.DEVNULL, "close_fds": True}
+    try:
+        if sys.platform == "win32":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            try:
+                subprocess.Popen(argv, creationflags=flags | breakaway, **options)
+            except OSError:
+                # The job forbids breakaway: start without it.
+                subprocess.Popen(argv, creationflags=flags, **options)
+        else:
+            subprocess.Popen(argv, start_new_session=True, **options)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _request_cost_refresh(kind, now):
+    """Have *kind*'s figure refreshed in the background, at most one at a time."""
+    try:
+        if not _claim_cost_scan(kind, now):
+            return False
+        # A claim whose process never started is kept, not released: it is the
+        # backoff that stops every repaint from trying again.
+        return _spawn_cost_worker(kind)
+    except Exception:
+        return False
+
+
+def _cost_refresh_worker(kind):
+    """Entry point of the detached process: scan, save the figure, free the claim.
+
+    A failed scan keeps its claim, so a broken store is retried after
+    _COST_SCAN_LOCK_TTL instead of by a new process on every repaint.
+    """
+    spec = _cost_kind(kind)
+    if spec is None:
+        return
+    name, _mem, _ttl, window = spec
+    try:
+        since = time.time() - window if window else None
+        data = _scan_session_costs(since_ts=since)
+        _atomic_json_write(
+            get_account_state_dir() / name,
+            {"v": _COST_CACHE_VERSION, "timestamp": time.time(), "data": data},
+            indent=None,
+        )
+    except Exception:
+        return
+    _release_cost_scan(kind)
+
+
+def _get_cached_cost(kind):
+    """The saved figure for *kind*, never scanning transcripts itself.
+
+    Fresh figures come from memory or disk. A stale one is still returned (an
+    old total beats a missing one) while a background refresh is requested; with
+    nothing saved yet the result is empty and the widget stays hidden until the
+    first refresh lands.
+    """
+    name, mem, ttl, _window = _cost_kind(kind)
     now = time.time()
 
     # In-memory cache (avoids disk I/O on hot path)
-    if now - _cumulative_cost_mem["ts"] < _CUMULATIVE_COST_CACHE_TTL:
-        return _cumulative_cost_mem["data"]
+    if now - mem["ts"] < ttl:
+        return mem["data"]
 
-    # Disk cache
-    cache_path = get_account_state_dir() / "cumulative_cost_cache.json"
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if now - cached.get("timestamp", 0) < _CUMULATIVE_COST_CACHE_TTL:
-            _cumulative_cost_mem["ts"] = now
-            _cumulative_cost_mem["data"] = cached.get("data", {})
-            return _cumulative_cost_mem["data"]
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    saved = _read_cost_cache(get_account_state_dir() / name)
+    if saved is not None:
+        stamp, data = saved
+        if 0 <= now - stamp < ttl:
+            mem["ts"] = now
+            mem["data"] = data
+            return data
+    _request_cost_refresh(kind, now)
+    return saved[1] if saved is not None else {}
 
-    data = _scan_session_costs()
-    _cumulative_cost_mem["ts"] = now
-    _cumulative_cost_mem["data"] = data
+
+def _get_cached_weekly_cost():
+    """Rolling 7-day API-equivalent cost: the last saved figure (see above)."""
+    return _get_cached_cost("weekly")
+
+
+def _get_cached_cumulative_cost():
+    """All-time API-equivalent cost: the last saved figure (see above)."""
+    return _get_cached_cost("cumulative")
+
+
+def _token_count(value):
+    """A token count from untrusted JSON as a non-negative int (0 if unusable)."""
     try:
-        _atomic_json_write(cache_path, {"timestamp": now, "data": data}, indent=None)
-    except OSError:
-        pass
-    return data
+        count = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return count if count > 0 else 0
+
+
+def _split_cache_writes(usage):
+    """(5-minute, 1-hour) cache-write tokens of one response's usage.
+
+    ``cache_creation_input_tokens`` is the total; ``cache_creation`` splits it
+    by cache lifetime. Without the split (older transcripts, other providers)
+    everything is a 5-minute write, the cheaper rate.
+    """
+    total = _token_count(usage.get("cache_creation_input_tokens"))
+    detail = usage.get("cache_creation")
+    one_hour = five = 0
+    if isinstance(detail, dict):
+        one_hour = _token_count(detail.get("ephemeral_1h_input_tokens"))
+        five = _token_count(detail.get("ephemeral_5m_input_tokens"))
+    if total and one_hour > total:
+        one_hour = total  # a part cannot exceed the whole
+    return max(total - one_hour, five), one_hour
 
 
 def _parse_transcript_ts(value):
@@ -5335,6 +5542,32 @@ def _scan_session_costs(since_ts=None):
             "session_count": 0,
             "first_seen": None,
         }
+
+    seen: dict = {}  # (message id, request id) -> the record counted for it
+
+    def tally(record, sign):
+        """Add (sign=1) or take back (sign=-1) one response's figures."""
+        nonlocal total_cost_usd, total_tokens
+        model_id, cost, inp, out, cr, cw5, cw1 = record
+        m = models.get(model_id)
+        if m is None:
+            m = models[model_id] = {
+                "cost_usd": 0.0,
+                "total_tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        tokens = inp + out + cr + cw5 + cw1
+        m["cost_usd"] += sign * cost
+        m["input"] += sign * inp
+        m["output"] += sign * out
+        m["cache_read"] += sign * cr
+        m["cache_write"] += sign * (cw5 + cw1)
+        m["total_tokens"] += sign * tokens
+        total_cost_usd += sign * cost
+        total_tokens += sign * tokens
 
     try:
         jsonl_files = projects_dir.rglob("*.jsonl")
@@ -5419,36 +5652,44 @@ def _scan_session_costs(since_ts=None):
                         inp = int(usage.get("input_tokens") or 0)
                         out = int(usage.get("output_tokens") or 0)
                         cr = int(usage.get("cache_read_input_tokens") or 0)
-                        cw = int(usage.get("cache_creation_input_tokens") or 0)
+                        # Cache writes bill at 1.25x input for the 5-minute
+                        # cache and 2x for the 1-hour one (which Claude Code
+                        # uses on subscriber plans).
+                        cw5, cw1 = _split_cache_writes(usage)
                         # Haiku 5.5 steps up above 100K prompt tokens, priced
                         # per request (no-op for every other model).
-                        pricing = _pricing_for(model_id, entry_date, inp + cr + cw) or pricing
+                        pricing = _pricing_for(
+                            model_id, entry_date, inp + cr + cw5 + cw1) or pricing
 
                         cost = (
                             inp * pricing["input"]
                             + out * pricing["output"]
                             + cr * pricing["cache_read"]
-                            + cw * pricing["cache_write"]
+                            + cw5 * pricing["cache_write"]
+                            + cw1 * pricing.get("cache_write_1h",
+                                                pricing["input"] * _CACHE_WRITE_1H_MULTIPLIER)
                         ) / 1_000_000
+                        record = (model_id, cost, inp, out, cr, cw5, cw1)
 
-                        if model_id not in models:
-                            models[model_id] = {
-                                "cost_usd": 0.0,
-                                "total_tokens": 0,
-                                "input": 0,
-                                "output": 0,
-                                "cache_read": 0,
-                                "cache_write": 0,
-                            }
-                        m = models[model_id]
-                        m["cost_usd"] += cost
-                        m["input"] += inp
-                        m["output"] += out
-                        m["cache_read"] += cr
-                        m["cache_write"] += cw
-                        m["total_tokens"] += inp + out + cr + cw
-                        total_cost_usd += cost
-                        total_tokens += inp + out + cr + cw
+                        # Claude Code writes one line per content block
+                        # (thinking, text, tool_use) of a response, each
+                        # repeating the response's id and usage, and a resumed
+                        # session copies earlier lines into a new file. Count
+                        # each response once; if a repeat reports more output
+                        # than the one kept, the fuller report replaces it.
+                        message_id = msg.get("id")
+                        if isinstance(message_id, str) and message_id:
+                            request_id = entry.get("requestId")
+                            key = (message_id, request_id if isinstance(request_id, str) else "")
+                            kept = seen.get(key)
+                            if kept is not None:
+                                if out > kept[3]:
+                                    tally(kept, -1)
+                                    tally(record, 1)
+                                    seen[key] = record
+                                continue
+                            seen[key] = record
+                        tally(record, 1)
                     except (AttributeError, KeyError, TypeError, ValueError):
                         continue
         except (OSError, PermissionError):

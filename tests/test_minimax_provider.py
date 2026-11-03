@@ -22,8 +22,10 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claude_status as cs  # noqa: E402
+from provider_fixtures import FakeMmx, ProviderSandbox, mmx_quota  # noqa: E402
 
 
 MINIMAX_ENV = {
@@ -91,6 +93,15 @@ class QuotaParserTest(unittest.TestCase):
 
 
 class StdinGateTest(unittest.TestCase):
+    def setUp(self):
+        # The quota now goes through the shared 120 s provider cache, which
+        # lives in the state dir: keep it (and HOME) in a throwaway sandbox.
+        self.sb = ProviderSandbox(self)
+        # And never start a real mmx on a machine that has one installed.
+        p = mock.patch.object(cs.shutil, "which", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_inactive_without_minimax_env(self):
         # No MiniMax env → block is inert, Anthropic values pass through.
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -123,22 +134,18 @@ class StdinGateTest(unittest.TestCase):
         self.assertIsInstance(res, dict)
 
     def test_quota_subprocess_populates_rate_limits(self):
-        quota = {"model_remains": [{
-            "current_interval_status": 1,
-            "current_interval_remaining_percent": 20.0,
-            "current_weekly_remaining_percent": 80.0,
-            "end_time": 1_900_000_000_000,
-            "weekly_end_time": 1_900_500_000_000,
-        }]}
-        fake = mock.Mock(returncode=0, stdout=json.dumps(quota))
-        with mock.patch.dict("os.environ", MINIMAX_ENV, clear=True), \
-                mock.patch.object(cs.subprocess, "run", return_value=fake):
+        # mmx_quota(): 20 % of the 5-hour and 80 % of the weekly window left.
+        fake = FakeMmx(mmx_quota(left5=20.0, leftw=80.0))
+        with mock.patch.dict("os.environ", MINIMAX_ENV), \
+                mock.patch.object(cs.shutil, "which", return_value="/bin/mmx"), \
+                mock.patch.object(cs.subprocess, "run", fake):
             res = cs._parse_stdin_context(_stdin(10, 10))
         self.assertAlmostEqual(res["_rate_limits"]["five_hour"]["utilization"], 80.0)
         self.assertAlmostEqual(res["_rate_limits"]["seven_day"]["utilization"], 20.0)
 
     def test_missing_mmx_binary_is_silent(self):
-        with mock.patch.dict("os.environ", MINIMAX_ENV, clear=True), \
+        with mock.patch.dict("os.environ", MINIMAX_ENV), \
+                mock.patch.object(cs.shutil, "which", return_value="/bin/mmx"), \
                 mock.patch.object(cs.subprocess, "run", side_effect=FileNotFoundError):
             res = cs._parse_stdin_context(_stdin(10, 10))  # must not raise
         self.assertNotIn("_rate_limits", res)
@@ -147,26 +154,25 @@ class StdinGateTest(unittest.TestCase):
         """PR #50: npm installs mmx as a .cmd shim on Windows, which
         subprocess.run will not auto-resolve (it only finds .exe). The call
         must go through shutil.which like _GIT_PATH / _CLAUDE_PATH."""
-        fake = mock.Mock(returncode=1, stdout="")
-        with mock.patch.dict("os.environ", MINIMAX_ENV, clear=True), \
+        fake = FakeMmx(rc=1)
+        with mock.patch.dict("os.environ", MINIMAX_ENV), \
                 mock.patch.object(cs.shutil, "which",
                                   return_value=r"C:\fake\mmx.CMD") as which, \
-                mock.patch.object(cs.subprocess, "run",
-                                  return_value=fake) as run:
+                mock.patch.object(cs.subprocess, "run", fake):
             cs._parse_stdin_context(_stdin(10, 10))
         which.assert_any_call("mmx")
-        self.assertEqual(run.call_args.args[0][0], r"C:\fake\mmx.CMD")
+        self.assertEqual(fake.calls[0][0][0], r"C:\fake\mmx.CMD")
 
-    def test_mmx_lookup_falls_back_to_bare_name(self):
-        """No mmx on PATH: keep the bare name so the FileNotFoundError
-        fallback path stays exactly as before."""
-        fake = mock.Mock(returncode=1, stdout="")
-        with mock.patch.dict("os.environ", MINIMAX_ENV, clear=True), \
+    def test_no_mmx_on_path_starts_no_process(self):
+        """No mmx on PATH: nothing is started at all (it used to spawn the bare
+        name on every repaint just to catch the FileNotFoundError)."""
+        fake = FakeMmx(rc=1)
+        with mock.patch.dict("os.environ", MINIMAX_ENV), \
                 mock.patch.object(cs.shutil, "which", return_value=None), \
-                mock.patch.object(cs.subprocess, "run",
-                                  return_value=fake) as run:
-            cs._parse_stdin_context(_stdin(10, 10))
-        self.assertEqual(run.call_args.args[0][0], "mmx")
+                mock.patch.object(cs.subprocess, "run", fake):
+            res = cs._parse_stdin_context(_stdin(10, 10))
+        self.assertEqual(fake.calls, [])
+        self.assertNotIn("_rate_limits", res)
 
 
 if __name__ == "__main__":

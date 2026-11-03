@@ -23,6 +23,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import claude_status as cs  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from terminal_fixtures import host_terminal_width  # noqa: E402
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 LAYOUTS = ("standard", "compact", "minimal", "percent-first")
 
@@ -241,6 +244,9 @@ class PersistenceThroughMainTest(unittest.TestCase):
         cfg_dir.mkdir()
         for target, value in (("get_state_dir", lambda: self.state),
                               ("_claude_config_dir", lambda: cfg_dir),
+                              # main() fits the line to the terminal it finds; pin
+                              # "no terminal" so the contributor's window cannot cut it.
+                              ("_detect_terminal_width", lambda: None),
                               ("check_for_update", lambda: False),
                               ("check_claude_code_update", lambda: False),
                               ("get_credentials", lambda: ("token", "Max 20x")),
@@ -310,6 +316,23 @@ class PersistenceThroughMainTest(unittest.TestCase):
         line = self._repaint({"cost": {"total_cost_usd": 0.5}})
         for text in ("refactor auth", "o/r", "♨ 92%", "spend $12.40/$50 wk"):
             self.assertIn(text, line)
+
+    def test_badges_draw_whatever_width_the_hosts_terminal_has(self):
+        """main() fits the line to the terminal it finds; the fake stdout has
+        no fileno, so a 140-column window used to drop the last badge."""
+        now = time.time()
+        full = self._full(
+            session_name="refactor auth",
+            workspace={"current_dir": ".", "repo": {"host": "github.com", "owner": "o", "name": "r"}},
+            prompt_cache={"warm": True, "hit_ratio": 0.92, "expires_at": now + 180},
+            rate_limits={"spend_limit": {"used_percentage": 25, "resets_at": now + 86400,
+                                         "used_usd": 12.4, "limit_usd": 50, "period": "weekly"}})
+        for columns in (80, 140):
+            with self.subTest(columns=columns):
+                with host_terminal_width(columns):
+                    line = self._repaint(full)
+                for text in ("refactor auth", "o/r", "♨ 92%", "spend $12.40/$50 wk"):
+                    self.assertIn(text, line, "fitted to a %d-column host terminal" % columns)
 
     def test_a_full_payload_without_the_fields_clears_the_badges(self):
         now = time.time()

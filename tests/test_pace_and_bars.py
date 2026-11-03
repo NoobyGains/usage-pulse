@@ -28,6 +28,7 @@ LAYOUTS = ("standard", "compact", "minimal", "percent-first")
 FILL, EMPTY = cs.BAR_STYLES["classic"]
 # Every widget off (the bars themselves stay on); each test switches on what it needs.
 QUIET = {k: k.endswith("_bar") for k in cs.DEFAULT_SHOW}
+_REAL_FETCH_USAGE = cs.fetch_usage   # before any sandbox() replaces it
 
 
 def _iso(seconds_ahead):
@@ -42,15 +43,32 @@ def usage(session=27, weekly=73, session_left=3 * 3600, weekly_left=3 * 86400, *
     return u
 
 
+class _UsageApiReached(BaseException):
+    """A BaseException, so the ``except Exception`` around the call in
+    ``--config`` cannot swallow it and let the test pass quietly."""
+
+
+def _no_usage_api(*args, **kwargs):
+    raise _UsageApiReached("a test reached the real usage API")
+
+
 @contextmanager
 def sandbox():
-    """State and config under a temp dir; the width cache reset."""
+    """State and config under a temp dir; the width cache reset.
+
+    Also keeps the contributor's login out of the run: with CLAUDE_CONFIG_DIR
+    redirected there is no .credentials.json, but get_credentials() would still
+    find the macOS Keychain entry or CLAUDE_CODE_OAUTH_TOKEN, and ``--config``
+    would send that token to the usage API. So no credentials are found, and the
+    API call itself raises if anything reaches it anyway."""
     with tempfile.TemporaryDirectory() as td:
         env = {"CLAUDE_CONFIG_DIR": td, "LOCALAPPDATA": td, "XDG_CACHE_HOME": td,
                "XDG_CONFIG_HOME": td, "HOME": td}
         with mock.patch.dict(os.environ, env), \
                 mock.patch.object(cs, "get_config_path", return_value=Path(td) / "config.json"), \
-                mock.patch.object(cs, "_cached_terminal_width", None):
+                mock.patch.object(cs, "_cached_terminal_width", None), \
+                mock.patch.object(cs, "get_credentials", return_value=(None, None)), \
+                mock.patch.object(cs, "fetch_usage", _no_usage_api):
             yield Path(td)
 
 
@@ -277,6 +295,54 @@ class WidthDetectionTest(unittest.TestCase):
                 mock.patch.object(sys, "stdout", io.StringIO()):
             result = cs._detect_terminal_width_uncached()
         self.assertTrue(result is None or isinstance(result, int), result)
+
+
+class SandboxIsolationTest(unittest.TestCase):
+    """sandbox() keeps a test off the contributor's token and off the network.
+
+    It redirects CLAUDE_CONFIG_DIR, so no .credentials.json is found, but
+    get_credentials() then falls back to the macOS Keychain and to
+    CLAUDE_CODE_OAUTH_TOKEN. ``--config`` goes on to call fetch_usage(token) for
+    its Extra Credits line, i.e. a real request to the usage API that spends
+    the contributor's own rate limit.
+    """
+
+    def _usage_calls_made_by_config(self):
+        calls = []
+
+        def recorder(token, *args, **kwargs):
+            calls.append(token)
+            return {}
+
+        with sandbox():
+            # Installed inside the sandbox, so this replaces whatever sandbox()
+            # put there: it records a call that nothing in sandbox() stopped.
+            with mock.patch.object(cs, "fetch_usage", recorder), \
+                    mock.patch.object(cs, "get_local_commit", return_value=None), \
+                    mock.patch.object(cs, "_CLAUDE_PATH", None):
+                run_main("--config")
+        return calls
+
+    def test_a_token_in_the_environment_is_never_sent_to_the_usage_api(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "FAKE-ENV-TOKEN"}):
+            self.assertEqual(self._usage_calls_made_by_config(), [])
+
+    def test_a_credential_store_hit_is_never_sent_to_the_usage_api(self):
+        # What the macOS Keychain read hands back on a logged-in Mac.
+        stored = ({"claudeAiOauth": {"accessToken": "FAKE-KEYCHAIN-TOKEN"}}, "keychain")
+        with mock.patch.object(cs, "_read_credential_data", return_value=stored):
+            self.assertEqual(self._usage_calls_made_by_config(), [])
+
+    def test_the_usage_api_trips_loudly_if_anything_reaches_it(self):
+        """A path that bypasses get_credentials must not pass silently: the
+        stand-in raises something ``except Exception`` cannot swallow."""
+        with sandbox():
+            # Checked first, so this test itself never calls the real function.
+            self.assertIsNot(cs.fetch_usage, _REAL_FETCH_USAGE,
+                             "sandbox() leaves the real usage-API call in place")
+            with self.assertRaises(BaseException) as raised:
+                cs.fetch_usage("any-token")
+        self.assertNotIsInstance(raised.exception, Exception)
 
 
 if __name__ == "__main__":

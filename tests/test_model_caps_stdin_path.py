@@ -38,6 +38,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import claude_status as cs  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from terminal_fixtures import host_terminal_width  # noqa: E402
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 FABLE_PAYLOAD = {
@@ -73,6 +76,9 @@ class ModelCapsStdinPath(unittest.TestCase):
         for target, value in (("get_state_dir", lambda: state),
                               ("_claude_config_dir", lambda: cfg_dir),
                               ("get_config_path", lambda: user_config),
+                              # main() fits the line to the terminal it finds; pin
+                              # "no terminal" so the contributor's window cannot cut it.
+                              ("_detect_terminal_width", lambda: None),
                               ("check_for_update", lambda: False),
                               ("check_claude_code_update", lambda: False)):
             patcher = mock.patch.object(cs, target, value)
@@ -146,6 +152,20 @@ class ModelCapsStdinPath(unittest.TestCase):
         cached = json.loads(self.cache.read_text())
         self.assertIsNotNone(cached["usage"].get("seven_day_fable"))
         self.assertTrue(cached.get("model_caps_fetched_at"))
+
+    def test_cap_renders_whatever_width_the_hosts_terminal_has(self):
+        """main() fits the line to the terminal it finds; the fake stdout has
+        no fileno, so an ordinary 80-column window used to cut the Fable bar."""
+        cs.fetch_usage = lambda token, timeout=10: cs._normalize_usage(dict(FABLE_PAYLOAD))
+        self._show()
+
+        for columns in (80, 160):
+            with self.subTest(columns=columns):
+                self.cache.unlink(missing_ok=True)
+                with host_terminal_width(columns):
+                    line = self._repaint()
+                self.assertIn("81%", line,
+                              "the line was fitted to a %d-column host terminal" % columns)
 
     def test_expired_ttl_refetches(self):
         def fetch(token, timeout=10):

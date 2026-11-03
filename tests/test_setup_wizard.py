@@ -83,7 +83,13 @@ class _Sandbox(unittest.TestCase):
             p = mock.patch.object(sys, name, obj)
             p.start()
             self.addCleanup(p.stop)
-        os.environ.pop("CLAUDE_PULSE_NONINTERACTIVE", None)
+        # cmd_setup goes unattended on either name. Clear both for this test and
+        # hand the contributor's own values back afterwards.
+        env_patch = mock.patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for name in ("USAGE_PULSE_NONINTERACTIVE", "CLAUDE_PULSE_NONINTERACTIVE"):
+            os.environ.pop(name, None)
         cs._settings_backed_up.clear()
         self.addCleanup(cs._settings_backed_up.clear)
 
@@ -532,6 +538,44 @@ class WizardChoicesTest(_WithProviders):
         self.assertIn("Show: cache", self.out.text())
 
 
+NONINTERACTIVE_NAMES = ("USAGE_PULSE_NONINTERACTIVE", "CLAUDE_PULSE_NONINTERACTIVE")
+
+
+class AmbientNoninteractiveEnvTest(_WithProviders):
+    """A contributor (or a CI job) may export the documented
+    USAGE_PULSE_NONINTERACTIVE=1; cmd_setup treats either name as "unattended",
+    so every interactive-wizard test would silently take the unattended path
+    unless the sandbox clears both names, and hands them back afterwards."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {name: "1" for name in NONINTERACTIVE_NAMES})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def test_the_sandbox_clears_every_name_that_forces_unattended_setup(self):
+        for name in NONINTERACTIVE_NAMES:
+            self.assertNotIn(name, os.environ)
+
+    def test_the_wizard_still_runs_interactively(self):
+        self.assertEqual(self.run_wizard(["esc"]), 0)
+        self.assertIn("Nothing changed.", self.out.text())
+        self.assertFalse(self.settings.exists(), "the unattended path ran and wrote settings.json")
+
+    def test_the_ambient_values_come_back_after_a_test(self):
+        class _Probe(_Sandbox):
+            def runTest(self):
+                pass
+
+        for name in NONINTERACTIVE_NAMES:
+            os.environ[name] = "1"
+        result = unittest.TestResult()
+        _Probe().run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        for name in NONINTERACTIVE_NAMES:
+            self.assertEqual(os.environ.get(name), "1", "%s was dropped for later tests" % name)
+
+
 class WizardWithoutProvidersTest(_Sandbox):
     """A build without the providers functions skips that screen."""
 
@@ -581,6 +625,13 @@ class NonInteractiveTest(_WithProviders):
     def test_env_var_forces_defaults(self):
         with mock.patch.dict(os.environ, {"CLAUDE_PULSE_NONINTERACTIVE": "1"}), self._no_keys():
             self.assertEqual(cs.cmd_setup(["--setup"]), 0)
+
+    def test_documented_env_var_forces_defaults(self):
+        """USAGE_PULSE_NONINTERACTIVE=1 is the name the README gives."""
+        with mock.patch.dict(os.environ, {"USAGE_PULSE_NONINTERACTIVE": "1"}), self._no_keys():
+            self.assertEqual(cs.cmd_setup(["--setup"]), 0)
+        self.assertTrue(self.settings.exists(), "the unattended defaults were not applied")
+        self.assertNotIn("Nothing changed.", self.out.text())
 
     def test_rerun_does_not_re_enable(self):
         with self._no_keys():

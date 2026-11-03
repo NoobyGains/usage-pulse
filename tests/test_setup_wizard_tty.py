@@ -27,6 +27,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "claude_status.py"
@@ -152,8 +153,8 @@ class _Wizard:
             "COLUMNS": "100", "LINES": "40",
             "PYTHONIOENCODING": "utf-8",
         })
-        for key in ("CLAUDE_PULSE_NONINTERACTIVE", "MSYSTEM", "TERM_PROGRAM",
-                    "HOMEDRIVE", "HOMEPATH"):
+        for key in ("USAGE_PULSE_NONINTERACTIVE", "CLAUDE_PULSE_NONINTERACTIVE",
+                    "MSYSTEM", "TERM_PROGRAM", "HOMEDRIVE", "HOMEPATH"):
             env.pop(key, None)
         argv = [sys.executable, str(SCRIPT), "--setup"]
         self.pty = (_ConPty if WIN else _PosixPty)(argv, str(self.root), env)
@@ -226,6 +227,40 @@ class _Wizard:
     def config_file(self):
         hits = [p for p in self.root.rglob("config.json") if p.parent.name == "claude-status"]
         return hits[0] if hits else None
+
+
+class _RecordingPty:
+    """Stands in for the pseudo terminal: remembers the environment it was
+    given and ends immediately, so no child process is started."""
+    started_with = []
+
+    def __init__(self, argv, cwd, env):
+        _RecordingPty.started_with.append(env)
+
+    def read(self):
+        raise EOFError
+
+    def close(self):
+        pass
+
+
+class WizardChildEnvironmentTest(unittest.TestCase):
+    """Runs without a pseudo terminal: only the environment handed to the child."""
+
+    def test_the_child_never_inherits_a_name_that_forces_unattended_setup(self):
+        """cmd_setup treats USAGE_PULSE_NONINTERACTIVE (the README name) and the
+        older CLAUDE_PULSE_NONINTERACTIVE alike. A child that inherits either
+        runs unattended, and every screen the test waits for never appears."""
+        names = ("USAGE_PULSE_NONINTERACTIVE", "CLAUDE_PULSE_NONINTERACTIVE")
+        _RecordingPty.started_with = []
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {name: "1" for name in names}), \
+                mock.patch.object(sys.modules[__name__], "_ConPty" if WIN else "_PosixPty",
+                                  _RecordingPty):
+            _Wizard(root)
+        self.assertEqual(len(_RecordingPty.started_with), 1)
+        for name in names:
+            self.assertNotIn(name, _RecordingPty.started_with[0])
 
 
 @unittest.skipUnless(HAVE_PTY, SKIP_REASON)

@@ -818,26 +818,18 @@ def rainbow_colorize(text, color_all=True, shimmer=True, config=None):
 
     while i < len(text):
         if text[i] == "\033":
-            j = i
-            while j < len(text) and j - i < 25 and text[j] != "m":
-                j += 1
-            if j >= len(text) or text[j] != "m":
-                result.append(text[i])
-                i += 1
-                visible_idx += 1
-                continue
-            seq = text[i : j + 1]
+            # Step over the whole escape sequence: a CSI colour code, or an
+            # OSC 8 hyperlink (which ends in BEL, not a letter, and whose URL
+            # can contain an "m" that looked like the end of a colour code).
+            j = _skip_escape(text, i)
+            seq = text[i:j]
+            i = j
             if color_all:
-                i = j + 1
                 continue
-            else:
-                if seq == "\033[0m":
-                    has_existing_color = False
-                else:
-                    has_existing_color = True
-                result.append(seq)
-                i = j + 1
-                continue
+            if seq.startswith("\033[") and seq.endswith("m"):
+                has_existing_color = seq not in ("\033[0m", "\033[m")
+            result.append(seq)
+            continue
 
         if not color_all and has_existing_color:
             result.append(text[i])
@@ -7839,36 +7831,51 @@ def _format_spend_amount(usd, currency, rate, code):
     return f"{symbol}{value:.2f}"
 
 
-def _shrink_bar_width(bw, config, show, usage, stdin_ctx):
-    """Narrow *bw* so every bar section fits the width budget (--bar-size auto).
+# (terminal width, row budget, bar width) of the last --bar-size auto fit. The
+# provider rows are drawn after the main line in the same run and follow its
+# bars; it is only trusted for the same width and budget.
+_SHRINK_MEMO = None
+
+
+def _shrink_bar_width(bw, config, show, usage, stdin_ctx, plan="", cache_age=None):
+    """Narrow *bw* so every row of the line fits the width budget (--bar-size auto).
+
+    The non-bar width is measured, not estimated: the line is drawn at two
+    named bar sizes and the difference gives the number of bars on each row, so
+    whatever else is on it (cost, lines, model, effort, branch, the stale label,
+    a plan name) is counted at its real width. Bars never go below two
+    characters; if the line is still too wide then, the fit drops whole widgets
+    with a marker.
 
     _detect_terminal_width tries the COLUMNS Claude Code passes, real TTYs,
     /dev/tty, then /proc on Linux. When all fail the width is unknown and the
     bars keep their size: the host clips at its own edge.
     """
+    global _SHRINK_MEMO
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
+        max_visible = _width_budget(config)
+        if not max_visible:
             return bw
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        effective_width = (term_width * max_width_pct) // 100
-        # Count the bar sections that will actually draw a bar (session,
-        # weekly, extra, context) so the width budget is split correctly.
-        num_bars = sum(1 for k in ("session", "weekly")
-                       if show.get(k, True) and show.get(f"{k}_bar", True))
-        extra = usage.get("extra_usage")
-        if extra and extra.get("is_enabled") and not config.get("extra_hidden", False):
-            num_bars += 1
-        if stdin_ctx and show.get("context", True) and show.get("context_bar", True):
-            num_bars += 1
-        # Per-bar overhead: label + space + space + pct + timer ≈ 18 chars
-        # Separators between sections: " | " = 3 chars each
-        # Trailing fixed items (model name, update/plan indicators) ≈ 15 chars
-        overhead = num_bars * 18 + max(num_bars - 1, 0) * 3 + 15
-        max_bar_width = max(2, (effective_width - overhead) // max(num_bars, 1))
-        return min(bw, max_bar_width)
+        small, medium = BAR_SIZES["small"], BAR_SIZES["small-medium"]
+        probes = []
+        for size in ("small", "small-medium"):
+            # A named size never shrinks, so the probe cannot recurse. Animation
+            # is off so the probe does not touch the saved animation state.
+            probe = dict(config, bar_size=size, animate="off")
+            probes.append(build_status_line(usage, plan, probe, stdin_ctx,
+                                            cache_age).split("\n"))
+        best = bw
+        if len(probes[0]) == len(probes[1]):
+            for row_small, row_medium in zip(*probes):
+                width_small = _visible_len(row_small)
+                bars = (_visible_len(row_medium) - width_small) // (medium - small)
+                if bars <= 0:
+                    continue
+                fixed = width_small - bars * small
+                best = min(best, (max_visible - fixed) // bars)
+        result = max(2, min(bw, best))
+        _SHRINK_MEMO = (_detect_terminal_width(), max_visible, result)
+        return result
     except Exception:
         return bw  # if width detection fails, keep the configured size
 
@@ -7910,7 +7917,7 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
     # on a window too narrow for the line, the line is truncated (--max-width)
     # or wrapped (--wrap auto) instead, so "large" always means large.
     if fit_bars:
-        bw = _shrink_bar_width(bw, config, show, usage, stdin_ctx)
+        bw = _shrink_bar_width(bw, config, show, usage, stdin_ctx, plan, cache_age)
 
     # list of ((priority, widget_id), text) tuples — sorted before joining.
     # The key carries the widget id so the two-line splitter can tell which
@@ -8464,13 +8471,17 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
 
     # Sort widgets by priority, then join
     parts.sort(key=lambda x: x[0])
-    line = _join_parts(parts, config)
 
-    # Staleness indicator
+    # Staleness indicator. It qualifies the numbers, so it sits right after the
+    # first (highest-priority) widget rather than at the end of the line, where
+    # a line that is too wide cuts it off first and old figures look current.
+    staleness_str = ""
     if show.get("staleness", True) and cache_age is not None:
         staleness_str = _format_staleness(cache_age)
-        if staleness_str:
-            line += staleness_str
+    if staleness_str and parts:
+        parts[0] = (parts[0][0], parts[0][1] + staleness_str)
+        staleness_str = ""
+    line = _join_parts(parts, config) + staleness_str
 
     # Animation: on = rainbow always moving, off = static theme colours
     if use_rainbow:
@@ -8588,126 +8599,258 @@ def _osc8(url, label):
     return f"{OSC8_START}{url}\a{label}{OSC8_END}"
 
 
-def _visible_len(text):
-    """Return the number of visible (non-ANSI-escape) characters in *text*."""
-    count = 0
-    i = 0
-    while i < len(text):
+try:
+    import unicodedata as _unicodedata
+except ImportError:  # pragma: no cover - a stripped-down Python
+    _unicodedata = None
+
+
+def _cell_width(ch):
+    """Terminal columns one character occupies: 0, 1 or 2.
+
+    Combining marks, format characters and the emoji selector / joiner take no
+    column of their own; East Asian wide and fullwidth characters (CJK, most
+    emoji such as the lightning bolt, flame and cup this script prints) take
+    two. Counting code points instead made a CJK name overflow its row by half
+    and over-counted every zero-width character.
+    """
+    cp = ord(ch)
+    if cp < 0xAD or _unicodedata is None:
+        return 1
+    if cp in (0xFE0F, 0x200D):
+        return 0
+    if _unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if _unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _scan(text):
+    """Yield ``(start, end, width, is_escape)`` for each escape sequence and
+    each visible character of *text*. Escape sequences have width 0."""
+    i, n = 0, len(text)
+    while i < n:
         if text[i] == "\033":
-            i = _skip_escape(text, i)
+            j = _skip_escape(text, i)
+            yield i, j, 0, True
+            i = j
+        else:
+            yield i, i + 1, _cell_width(text[i]), False
+            i += 1
+
+
+def _visible_len(text):
+    """Return the width in terminal columns of *text*, ignoring ANSI escapes."""
+    return sum(w for _s, _e, w, esc in _scan(text) if not esc)
+
+
+_ELLIPSIS = "\u2026"  # horizontal ellipsis
+_SEPARATOR = " | "
+# --wrap auto packs as many rows as the line needs, up to this many. The last
+# allowed row drops whole widgets with a trailing marker if it still overflows.
+WRAP_MAX_ROWS = 4
+
+
+def _width_budget(config):
+    """Columns one row may use: the terminal width times ``max_width``.
+
+    Returns None when the width is unknown; Claude Code always passes COLUMNS
+    and any other host clips at its own edge, so the line is then left alone.
+    """
+    term_width = _detect_terminal_width()
+    if not term_width:
+        return None
+    max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
+    if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
+        max_width_pct = DEFAULT_MAX_WIDTH_PCT
+    return (term_width * max_width_pct) // 100
+
+
+def _clip_cells(text, width, force=False):
+    """Cut *text* to *width* columns, ending in a dim ellipsis when it cut.
+
+    Never splits a wide character, closes a hyperlink it cut through (or the
+    terminal treats every following line as part of the link target) and
+    resets colour before the marker. Text that already fits comes back
+    unchanged unless *force* asks for the marker regardless.
+    """
+    if width <= 0:
+        return ""
+    if not force and _visible_len(text) <= width:
+        return text
+    keep, used, cut, in_link = width - 1, 0, len(text), False
+    for start, end, w, esc in _scan(text):
+        if esc:
+            if text.startswith(OSC8_START, start):
+                in_link = text[start:end] != OSC8_END
             continue
-        count += 1
-        i += 1
-    return count
+        if used + w > keep:
+            cut = start
+            break
+        used += w
+    return (text[:cut] + (OSC8_END if in_link else "") + RESET
+            + DIM + _ELLIPSIS + RESET)
 
 
-def _truncate_line(line, config):
-    """Clip visible characters to effective terminal width.
+def _segment_spans(line, sep=_SEPARATOR):
+    """Split *line* into widgets at its visible ``" | "`` separators.
+
+    Returns ``(start, end, width, prefix)`` per widget: raw offsets into
+    *line*, its width in columns, and the colour codes in force where it starts
+    (so a widget moved to a new row keeps its colour). Splitting on the
+    visible text rather than the raw string is what lets rainbow colouring,
+    which wraps every character (separators too) in its own escape codes, wrap
+    and truncate like any other theme.
+    """
+    chars, states, active = [], [], ""
+    for start, end, width, esc in _scan(line):
+        if esc:
+            seq = line[start:end]
+            if seq.startswith("\033[") and seq.endswith("m"):
+                if seq in ("\033[0m", "\033[m"):
+                    active = ""
+                elif len(active) > 512:
+                    active = seq
+                else:
+                    active += seq
+            continue
+        chars.append((start, end, line[start], width))
+        states.append(active)
+    text = "".join(c[2] for c in chars)
+    spans, first, seg_start, prefix = [], 0, 0, ""
+    pos = text.find(sep)
+    while pos != -1:
+        spans.append((seg_start, chars[pos][0],
+                      sum(c[3] for c in chars[first:pos]), prefix))
+        last = pos + len(sep) - 1
+        seg_start, prefix, first = chars[last][1], states[last], pos + len(sep)
+        pos = text.find(sep, first)
+    spans.append((seg_start, len(line), sum(c[3] for c in chars[first:]), prefix))
+    return spans
+
+
+def _spans_width(spans):
+    return sum(s[2] for s in spans) + len(_SEPARATOR) * (len(spans) - 1)
+
+
+def _fit_row(row, max_visible, suffix=""):
+    """Fit one row, plus a reserved *suffix* (the update badges), into
+    *max_visible* columns.
+
+    The suffix keeps its width: widgets are what give way. Whole widgets are
+    dropped from the tail (the lowest priority, since widgets are sorted by it)
+    and a dim ellipsis marks the cut; a slice of a bar or word is shown only
+    when even the first widget is wider than the row.
+    """
+    sfx = _visible_len(suffix)
+    budget = max_visible - sfx
+    if budget < 1:
+        return _clip_cells(row + suffix, max_visible)
+    if _visible_len(row) <= budget:
+        return row + suffix
+    spans = _segment_spans(row)
+    marker = 1 + len(_ELLIPSIS)                       # a space and the ellipsis
+    for keep in range(len(spans) - 1, 0, -1):
+        if _spans_width(spans[:keep]) + marker <= budget:
+            return (row[:spans[keep - 1][1]] + RESET + " " + DIM + _ELLIPSIS
+                    + RESET + suffix)
+    return _clip_cells(row[:spans[0][1]], budget, force=len(spans) > 1) + suffix
+
+
+def _truncate_line(line, config, suffix=""):
+    """Fit one row to the effective terminal width, marking what was dropped.
 
     Applied as the very last step before output so the line never spills
     into Claude Code's side notification area or wraps to the next line.
-    When the width is unknown the line is left alone: Claude Code always
-    passes COLUMNS, and any other host clips at its own edge.
+    *suffix* is appended after fitting and keeps its width (update badges).
+    When the width is unknown the line is left alone.
     """
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
-            return line
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        max_visible = (term_width * max_width_pct) // 100
-        visible_count = 0
-        cut = None
-        i = 0
-        in_link = False
-        cut_in_link = False
-        while i < len(line):
-            if line[i] == "\033":
-                nxt = _skip_escape(line, i)
-                # Track hyperlink nesting so a cut inside one can be closed.
-                if line.startswith(OSC8_START, i):
-                    in_link = line[i:nxt] != OSC8_END
-                i = nxt
-                continue
-            visible_count += 1
-            if visible_count > max_visible:
-                cut = i
-                cut_in_link = in_link
-                break
-            i += 1
-        if cut is not None:
-            # Close a hyperlink we cut through, or the terminal treats every
-            # following line as part of the link target.
-            line = line[:cut] + (OSC8_END if cut_in_link else "") + RESET
+        max_visible = _width_budget(config)
+        if max_visible is None:
+            return line + suffix
+        return _fit_row(line, max_visible, suffix)
     except Exception:
-        pass
-    return line
+        return line + suffix
 
 
-def _wrap_line(line, config):
+def _wrap_line(line, config, suffix=""):
     """Wrap at ' | ' separators when the line would overflow the terminal.
 
-    Returns one or two lines joined by newline.  If the line fits, it is
-    returned unchanged (no trailing newline added).  When wrapping is needed,
-    segments are distributed across two lines so that each stays within the
-    effective terminal width. An unknown width leaves the line alone.
+    If the line fits, it is returned unchanged. Otherwise whole widgets are
+    packed greedily into as many rows as needed, up to WRAP_MAX_ROWS; only the
+    last allowed row can still overflow, and it drops widgets with a trailing
+    marker. *suffix* (update badges) stays on the last row with its width
+    reserved. An unknown width leaves the line alone.
     """
     try:
-        term_width = _detect_terminal_width()
-        if not term_width:
-            return line
-        max_width_pct = config.get("max_width", DEFAULT_MAX_WIDTH_PCT)
-        if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
-            max_width_pct = DEFAULT_MAX_WIDTH_PCT
-        max_visible = (term_width * max_width_pct) // 100
+        max_visible = _width_budget(config)
+        if max_visible is None:
+            return line + suffix
+        sfx = _visible_len(suffix)
+        if _visible_len(line) + sfx <= max_visible:
+            return line + suffix
 
-        if _visible_len(line) <= max_visible:
-            return line
+        spans = _segment_spans(line)
+        if len(spans) < 2:
+            return _truncate_line(line, config, suffix)
 
-        # Split on the rendered separator
-        segments = line.split(" | ")
-        if len(segments) < 2:
-            return _truncate_line(line, config)
-
-        # Greedily fill line 1, then put the rest on line 2
-        line1_parts = [segments[0]]
-        rest = segments[1:]
-        for seg in rest:
-            candidate = " | ".join(line1_parts + [seg])
-            if _visible_len(candidate) <= max_visible:
-                line1_parts.append(seg)
+        rows, cur, cur_w = [], [], 0
+        for n, span in enumerate(spans):
+            width = span[2] + (sfx if n == len(spans) - 1 else 0)
+            if not cur:
+                cur, cur_w = [span], width
+            elif (cur_w + len(_SEPARATOR) + width > max_visible
+                    and len(rows) < WRAP_MAX_ROWS - 1):
+                rows.append(cur)
+                cur, cur_w = [span], width
             else:
-                break
-        used = len(line1_parts)
-        line2_parts = segments[used:]
+                cur.append(span)
+                cur_w += len(_SEPARATOR) + width
+        rows.append(cur)
 
-        if not line2_parts:
-            return _truncate_line(line, config)
+        def text(group):
+            return group[0][3] + line[group[0][0]:group[-1][1]]
 
-        row1 = " | ".join(line1_parts)
-        row2 = " | ".join(line2_parts)
-        # Truncate each row individually as a safety net
-        row1 = _truncate_line(row1, config)
-        row2 = _truncate_line(row2, config)
-        return row1 + RESET + "\n" + row2
+        out = [_fit_row(text(g), max_visible) + RESET for g in rows[:-1]]
+        out.append(_fit_row(text(rows[-1]), max_visible, suffix))
+        return "\n".join(out)
     except Exception:
-        return _truncate_line(line, config)
+        return _truncate_line(line, config, suffix)
 
 
-def _fit_line(line, config):
+def _fit_line(line, config, suffix=""):
     """Apply wrap or truncate depending on the user's --wrap setting.
 
     The line may already be two rows when ``line1_widgets`` / ``line2_widgets``
     are configured. Each row is fitted independently — measuring the joined
     string would count the newline as a visible column and truncate the rows
-    against a shared budget they don't actually share.
+    against a shared budget they don't actually share. *suffix* goes after the
+    last row.
     """
     if "\n" in line:
-        return "\n".join(_fit_line(row, config) for row in line.split("\n"))
+        rows = line.split("\n")
+        last = len(rows) - 1
+        return "\n".join(_fit_line(row, config, suffix if n == last else "")
+                         for n, row in enumerate(rows))
     if config.get("wrap") == "auto":
-        return _wrap_line(line, config)
-    return _truncate_line(line, config)
+        return _wrap_line(line, config, suffix)
+    return _truncate_line(line, config, suffix)
+
+
+def _finish_line(line, config, stdin_ctx=None):
+    """Add the update badges and provider rows to *line*, then fit every row.
+
+    The badges used to be appended before fitting, so a line that was too wide
+    lost them first and an update went unseen. They are now reserved width on
+    the last main row, and widgets give way instead. Provider rows follow the
+    main rows and are fitted on their own.
+    """
+    badges = append_claude_update_indicator(
+        append_update_indicator("", config), config, stdin_ctx)
+    main_rows = line.count("\n") + 1
+    rows = _append_provider_rows(line, config).split("\n")
+    fitted = _fit_line("\n".join(rows[:main_rows]), config, suffix=badges)
+    return "\n".join([fitted] + [_fit_line(row, config) for row in rows[main_rows:]])
 
 
 # ---------------------------------------------------------------------------
@@ -9367,12 +9510,16 @@ def _provider_bar_width(config, label_width):
         if not (isinstance(max_width_pct, int) and 20 <= max_width_pct <= 100):
             max_width_pct = DEFAULT_MAX_WIDTH_PCT
         effective = (term_width * max_width_pct) // 100
-        show = config.get("show", DEFAULT_SHOW)
-        # Same estimate build_status_line makes for the main line (session,
-        # weekly and the context bar a live session always has).
-        main_bars = sum(1 for k in ("session", "weekly", "context") if show.get(k, True)) or 1
-        main_overhead = main_bars * 18 + max(main_bars - 1, 0) * 3 + 15
-        main_max = max(2, (effective - main_overhead) // main_bars)
+        memo = _SHRINK_MEMO
+        if memo and memo[0] == term_width and memo[1] == effective:
+            # The main line was just fitted at this width: follow its bars.
+            main_max = memo[2]
+        else:
+            show = config.get("show", DEFAULT_SHOW)
+            # No measured main line in this run (a preview, say): estimate.
+            main_bars = sum(1 for k in ("session", "weekly", "context") if show.get(k, True)) or 1
+            main_overhead = main_bars * 18 + max(main_bars - 1, 0) * 3 + 15
+            main_max = max(2, (effective - main_overhead) // main_bars)
         row_max = max(2, (effective - (label_width + 2 * 18 + 3)) // 2)
         bw = max(2, min(bw, main_max, row_max))
     except Exception:
@@ -9655,18 +9802,11 @@ def _render_subagent_row(task, config, columns=None):
 
 
 def _clip_visible(text, width):
-    """Clip to *width* visible columns, keeping escapes intact and resetting."""
-    count = 0
-    i = 0
-    while i < len(text):
-        if text[i] == "":
-            i = _skip_escape(text, i)
-            continue
-        count += 1
-        if count > width:
-            return text[:i] + RESET
-        i += 1
-    return text
+    """Clip to *width* terminal columns, ending in a dim ellipsis when it cut.
+
+    Keeps escapes intact, resets colour and never splits a wide character.
+    """
+    return _clip_cells(text, width)
 
 
 def cmd_subagent_status_line():
@@ -13314,9 +13454,7 @@ def main():
                     model_caps_attempted_at=_caps_attempted)
         _seed_active_provider_cache(usage_from_stdin, config)
 
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
+        line = _finish_line(line, config, stdin_ctx)
         sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
         return
 
@@ -13335,9 +13473,7 @@ def main():
             line = cached.get("line", "")
         if not isinstance(line, str) or not line.strip():
             line = _SAFE_FALLBACK_LINE   # never a blank bar
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
+        line = _finish_line(line, config, stdin_ctx)
         sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
         return
 
@@ -13384,9 +13520,7 @@ def main():
             line = ""
         if not line:
             line = "Usage unavailable \u2014 retrying shortly"
-        line = append_update_indicator(line, config)
-        line = append_claude_update_indicator(line, config, stdin_ctx)
-        line = _fit_line(_append_provider_rows(line, config), config)
+        line = _finish_line(line, config, stdin_ctx)
         sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
         return
 
@@ -13500,9 +13634,7 @@ def main():
     else:
         # Cache error lines so we don't hammer the API on every refresh
         write_cache(cache_path, line)
-    line = append_update_indicator(line, config)
-    line = append_claude_update_indicator(line, config, stdin_ctx)
-    line = _fit_line(_append_provider_rows(line, config), config)
+    line = _finish_line(line, config, stdin_ctx)
     sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8"))
 
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 
+import base64
 import hashlib
 import json
 import math
@@ -4066,6 +4067,122 @@ def refresh_and_retry(plan):
     return token_data["access_token"], plan
 
 
+# ---------------------------------------------------------------------------
+# Plan name from the OAuth profile
+# ---------------------------------------------------------------------------
+# The credentials file carries only the rate-limit tier ("default_claude_max_20x")
+# and the names the plans are sold under have moved on from it: an Ultra
+# account reads "Max 20x" from the tier. The profile's
+# ``organization.plan_display_name`` is the current name. It is the only field
+# read from that reply; the e-mail and account name beside it are discarded.
+_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+_PLAN_LABEL_TTL = 86400       # re-check once a day
+_PLAN_LABEL_RETRY = 3600      # after a failed or empty attempt
+_PLAN_LABEL_TIMEOUT = 5       # seconds; the call is also bounded by _NET_FETCH_BUDGET
+
+
+def _epoch_or_zero(value):
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) else 0.0
+
+
+def fetch_plan_label(token, timeout=_PLAN_LABEL_TIMEOUT):
+    """``organization.plan_display_name`` from the OAuth profile, or None."""
+    with _authorized_request(_PROFILE_URL, token,
+                             headers={"anthropic-beta": "oauth-2025-04-20",
+                                      "Accept": "application/json"},
+                             timeout=timeout) as resp:
+        data = json.loads(resp.read(50_000))
+    org = data.get("organization") if isinstance(data, dict) else None
+    name = org.get("plan_display_name") if isinstance(org, dict) else None
+    return _clean_provider_label(name) if isinstance(name, str) else None
+
+
+def _plan_shown(config):
+    """True when the plan name is drawn: the ``plan`` widget, or provider tiers."""
+    show = config.get("show", DEFAULT_SHOW) if isinstance(config, dict) else DEFAULT_SHOW
+    return bool(isinstance(show, dict) and show.get("plan", False))
+
+
+def _plan_label_path():
+    return get_account_state_dir() / "plan_label.json"
+
+
+def _read_plan_label():
+    """``{"label", "fetched_at", "attempted_at"}`` for this account, or ``{}``."""
+    try:
+        data, _ = _read_small_json(_plan_label_path(), limit=4_000)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _display_plan(plan, config):
+    """The plan name to draw: the profile's name when known, else ``plan``."""
+    if not _plan_shown(config):
+        return plan
+    label = _read_plan_label().get("label")
+    return label if isinstance(label, str) and label else plan
+
+
+def _refresh_plan_label(config, blocked_until=None, token=None, now=None):
+    """Ask the profile for the plan name when due; returns the label or None.
+
+    Due means: the plan is drawn, the last successful fetch is over a day
+    old, the last attempt over an hour old, and no 429 backoff
+    (``blocked_until``) is running. The attempt is stamped before the request
+    (Claude Code may cancel the repaint), the request takes its turn with the
+    other optional network checks, and it has a hard wall-clock ceiling.
+    ``token`` saves a second credentials read when the caller holds one.
+    Never raises.
+    """
+    now = time.time() if now is None else now
+    if not _plan_shown(config):
+        return None
+    state = _read_plan_label()
+    label = state.get("label") if isinstance(state.get("label"), str) else None
+    if now - _epoch_or_zero(state.get("fetched_at")) < _PLAN_LABEL_TTL:
+        return label
+    if now - _epoch_or_zero(state.get("attempted_at")) < _PLAN_LABEL_RETRY:
+        return label
+    if blocked_until and now < _epoch_or_zero(blocked_until):
+        return label
+    try:
+        if token is None:
+            token, _ = get_credentials()
+    except Exception:
+        token = None
+    if not token:
+        return label
+    if not _begin_net_attempt("plan_label", backoff=_PLAN_LABEL_RETRY):
+        return label
+    state = dict(state)
+    state["attempted_at"] = now
+    try:
+        _atomic_json_write(_plan_label_path(), state)
+    except Exception:
+        _end_net_attempt("plan_label")
+        return label          # unsaved attempt: never risk one fetch per repaint
+    try:
+        fresh = _call_bounded(lambda tok=token: fetch_plan_label(tok), _NET_FETCH_BUDGET)
+    except BaseException:
+        fresh = None
+    finally:
+        token = None
+        _end_net_attempt("plan_label")
+    if fresh:
+        state.update({"label": fresh, "fetched_at": now})
+        try:
+            _atomic_json_write(_plan_label_path(), state)
+        except Exception:
+            pass
+        return fresh
+    return label
+
+
 def _normalize_usage(usage):
     """Fold model-scoped weekly caps out of ``limits[]`` into top-level keys.
 
@@ -4551,7 +4668,7 @@ def _read_provider_cache(pid):
 
 
 _PROVIDER_CACHE_FIELDS = (
-    "timestamp", "usage", "src", "plan", "last_attempt",
+    "timestamp", "usage", "src", "plan", "plan_label", "plan_label_at", "last_attempt",
     "rate_limited_until", "rate_limit_fails", "auth_failed_until", "error_until",
 )
 
@@ -4863,10 +4980,25 @@ def _refresh_claude_provider(entry, config, now=None, budget=None):
             usage = _call_bounded(
                 lambda tok=token: fetch_usage(tok, timeout=_PROVIDER_TIMEOUT),
                 _PROVIDER_FETCH_BUDGET)
-            token = None
-            _end_net_attempt(net_key)
             fresh = {"timestamp": time.time(), "usage": _clean_provider_usage(usage),
                      "plan": plan or cache.get("plan"), "last_attempt": now}
+            # The plan's sold name, once a day while the token is in hand and
+            # only when tiers are drawn; a failed look-up waits an hour.
+            label_at = _num("plan_label_at")
+            if isinstance(cache.get("plan_label"), str) and cache.get("plan_label"):
+                fresh["plan_label"], fresh["plan_label_at"] = cache["plan_label"], label_at
+            if _plan_shown(config) and now - label_at >= _PLAN_LABEL_TTL:
+                try:
+                    label = _call_bounded(lambda tok=token: fetch_plan_label(tok),
+                                          _PROVIDER_FETCH_BUDGET)
+                except BaseException:
+                    label = None
+                if label:
+                    fresh["plan_label"], fresh["plan_label_at"] = label, now
+                else:
+                    fresh["plan_label_at"] = now - _PLAN_LABEL_TTL + _PLAN_LABEL_RETRY
+            token = None
+            _end_net_attempt(net_key)
             _write_provider_cache(pid, fresh)
             return fresh
         except urllib.error.HTTPError as exc:
@@ -4916,8 +5048,14 @@ def _seed_active_provider_cache(usage, config, now=None):
             prev_ts = 0.0
         if prev.get("usage") == merged and now - prev_ts < 60:
             return  # unchanged and recent: skip the write
-        data = {k: prev[k] for k in ("plan", "rate_limited_until", "rate_limit_fails")
+        data = {k: prev[k] for k in ("plan", "plan_label", "plan_label_at",
+                                     "rate_limited_until", "rate_limit_fails")
                 if k in prev}
+        # This window knows its own plan's sold name; the other window's row
+        # for this account should say the same.
+        own = _read_plan_label().get("label")
+        if isinstance(own, str) and own:
+            data["plan_label"] = own
         data.update({"timestamp": now, "usage": merged, "src": "stdin"})
         _write_provider_cache(pid, data)
     except Exception:
@@ -5066,11 +5204,15 @@ def _codex_rate_limits_from_tail(path, now=None):
         usage = _codex_usage_from_rate_limits(rl, now)
         if not usage:
             continue
-        plan = rl.get("plan_type")
-        tier = _clean_provider_label(str(plan).replace("_", " ").title()) \
-            if isinstance(plan, str) else None
-        return usage, tier
+        return usage, _codex_tier_label(rl.get("plan_type"))
     return None
+
+
+def _codex_tier_label(plan):
+    """``"plus"`` -> ``"Plus"``; None for anything that is not a string."""
+    if not isinstance(plan, str):
+        return None
+    return _clean_provider_label(plan.replace("_", " ").title())
 
 
 def _read_codex_quota(codex_home, cached=None, now=None):
@@ -5111,6 +5253,188 @@ def _read_codex_quota(codex_home, cached=None, now=None):
             return {"usage": usage, "data_ts": f_mtime, "tier": tier,
                     "src": src, "changed": True}
     return {"usage": {}, "data_ts": None, "tier": None, "src": src, "changed": True}
+
+
+# --- Codex (ChatGPT usage API) ----------------------------------------------
+# The Codex CLI signs in with a ChatGPT login and asks chatgpt.com for its
+# rate limits. The same request from here sees the whole pool, which is shared
+# with the web app and every other machine on the account, so it is the first
+# choice and the local rollout files are the fallback. The CLI's token goes to
+# chatgpt.com only (its own allowlist and redirect guard, separate from the
+# Anthropic one), is never refreshed (OpenAI rotates the refresh token: a
+# refresh here would sign the CLI out) and is never written to any cache.
+_CODEX_TOKEN_DOMAINS = frozenset({"chatgpt.com"})
+_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+class _CodexNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib would forward the bearer header."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, "Codex usage redirect blocked", headers, fp)
+
+
+_codex_opener = urllib.request.build_opener(_CodexNoRedirectHandler)
+
+
+def _read_codex_token(codex_home, now=None):
+    """``(access_token, account_id, plan_type)`` from ``<codex_home>/auth.json``.
+
+    All None when the file is missing, the login is an API key (no
+    ``tokens``) or the token's JWT ``exp`` is within 60 s: the Codex CLI
+    renews its token on its next use, this never does. ``plan_type`` is the
+    token's ``chatgpt_plan_type`` claim ("plus"), None when absent.
+    """
+    now = time.time() if now is None else now
+    try:
+        data, _ = _read_small_json(Path(codex_home) / "auth.json", limit=64_000)
+    except (OSError, ValueError, TypeError):
+        return None, None, None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    if not isinstance(token, str) or not token:
+        return None, None, None
+    plan = None
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        if float(claims["exp"]) <= now + 60:
+            return None, None, None
+        auth = claims.get("https://api.openai.com/auth")
+        if isinstance(auth, dict) and isinstance(auth.get("chatgpt_plan_type"), str):
+            plan = auth["chatgpt_plan_type"]
+    except (IndexError, KeyError, TypeError, ValueError, AttributeError):
+        pass  # not a JWT, or no expiry in it: let the server judge the token
+    account = tokens.get("account_id")
+    return token, (account if isinstance(account, str) else None), plan
+
+
+def _fetch_codex_usage(token, account_id, now=None):
+    """GET the usage endpoint the Codex CLI uses; returns ``(usage, tier)``.
+
+    ``rate_limit.primary_window`` / ``secondary_window`` carry ``used_percent``,
+    ``limit_window_seconds`` and ``reset_at`` (epoch seconds, with
+    ``reset_after_seconds`` as the fallback); ``plan_type`` names the plan.
+    Raises on HTTP errors and on any other payload shape.
+    """
+    now = time.time() if now is None else now
+    if urlparse(_CODEX_USAGE_URL).hostname not in _CODEX_TOKEN_DOMAINS:
+        raise ValueError("Codex token request blocked")
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+            "User-Agent": f"usage-pulse/{VERSION}"}
+    if account_id:
+        hdrs["ChatGPT-Account-Id"] = account_id
+    req = urllib.request.Request(_CODEX_USAGE_URL, headers=hdrs)
+    with _codex_opener.open(req, timeout=_PROVIDER_TIMEOUT) as resp:
+        data = json.loads(resp.read(256_000))
+    rl = data.get("rate_limit") if isinstance(data, dict) else None
+    if not isinstance(rl, dict):
+        raise ValueError("unexpected Codex usage payload")
+    snapshot = {}
+    for src, dst in (("primary_window", "primary"), ("secondary_window", "secondary")):
+        w = rl.get(src)
+        if not isinstance(w, dict):
+            continue
+        secs = w.get("limit_window_seconds")
+        minutes = secs / 60 if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None
+        reset = w.get("reset_at")
+        after = w.get("reset_after_seconds")
+        if reset is None and isinstance(after, (int, float)) and not isinstance(after, bool):
+            reset = now + after
+        snapshot[dst] = {"used_percent": w.get("used_percent"),
+                         "window_minutes": minutes, "resets_at": reset}
+    return _codex_usage_from_rate_limits(snapshot, now), _codex_tier_label(data.get("plan_type"))
+
+
+def _refresh_codex_api(entry, config, now=None, budget=None):
+    """The ``<id>:api`` cache for a Codex row, refreshed when due.
+
+    Same gates as ``_refresh_claude_provider``: the data is older than
+    ``providers_refresh_seconds``; no 429 / auth / error backoff is running;
+    the last *attempt* is over 60 s old; a usable token is on disk; and
+    ``budget`` (one network call per repaint, shared with the Claude rows)
+    still allows it. The attempt is stamped before the request. Returns the
+    cache, which may be empty.
+    """
+    now = time.time() if now is None else now
+    pid = entry["id"] + ":api"
+    cache = _read_provider_cache(pid) or {}
+
+    def _num(key):
+        try:
+            return float(cache.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if now - _num("timestamp") < _provider_refresh_seconds(config):
+        return cache
+    if now < _num("rate_limited_until") or now < _num("auth_failed_until") \
+            or now < _num("error_until"):
+        return cache
+    if now - _num("last_attempt") < _PROVIDER_RETRY:
+        return cache
+    if budget is not None and budget[0] <= 0:
+        return cache
+    loc = _provider_location(entry)
+    token, account, jwt_plan = _read_codex_token(loc, now) if loc else (None, None, None)
+    if not token:
+        return cache
+    lock = _acquire_provider_lock(pid)
+    if lock is None:
+        return cache            # another window is fetching this row now
+    try:
+        cache = _read_provider_cache(pid) or cache
+        if now - _num("timestamp") < _provider_refresh_seconds(config) \
+                or now - _num("last_attempt") < _PROVIDER_RETRY:
+            return cache
+        # One network call per repaint, taking turns with the other optional
+        # checks; waiting is not failing, so nothing is stamped.
+        net_key = "provider:%s" % pid
+        if not _begin_net_attempt(net_key, backoff=_PROVIDER_RETRY):
+            return cache
+        if budget is not None:
+            budget[0] -= 1
+        cache = dict(cache)
+        cache["last_attempt"] = now
+        if not _write_provider_cache(pid, cache):
+            _end_net_attempt(net_key)
+            return cache        # unsaved attempt: never risk one fetch per repaint
+        try:
+            usage, tier = _call_bounded(
+                lambda tok=token: _fetch_codex_usage(tok, account, now),
+                _PROVIDER_FETCH_BUDGET)
+            token = None
+            _end_net_attempt(net_key)
+            if not usage:
+                raise ValueError("no Codex windows in the payload")
+            fresh = {"timestamp": time.time(), "usage": usage, "last_attempt": now,
+                     "plan": tier or _codex_tier_label(jwt_plan) or cache.get("plan")}
+            _write_provider_cache(pid, fresh)
+            return fresh
+        except urllib.error.HTTPError as exc:
+            _end_net_attempt(net_key)
+            code = getattr(exc, "code", None)
+            if code == 429:
+                try:
+                    retry_after = float(exc.headers.get("retry-after") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    retry_after = 0.0
+                delay, fails = _rate_limit_backoff(cache.get("rate_limit_fails"))
+                cache["rate_limited_until"] = now + max(delay, retry_after)
+                cache["rate_limit_fails"] = fails
+            elif code in (401, 403):
+                # Expired or revoked: the Codex CLI renews it on its next use.
+                cache["auth_failed_until"] = now + _PROVIDER_AUTH_BACKOFF
+            else:
+                cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
+        except BaseException:
+            _end_net_attempt(net_key)
+            cache["error_until"] = now + _PROVIDER_ERROR_BACKOFF
+        token = None
+        _write_provider_cache(pid, cache)
+        return cache
+    finally:
+        _release_provider_lock(lock)
 
 
 # --- MiniMax (mmx CLI) ------------------------------------------------------
@@ -5315,7 +5639,8 @@ def _collect_provider_rows(config, now=None):
             loc = _provider_location(entry)
             if ptype == "claude":
                 c = _refresh_claude_provider(entry, config, now, budget)
-                usage, data_ts, tier = c.get("usage"), c.get("timestamp"), c.get("plan")
+                usage, data_ts = c.get("usage"), c.get("timestamp")
+                tier = c.get("plan_label") or c.get("plan")
             elif ptype == "codex":
                 cached = _read_provider_cache(entry["id"])
                 r = _read_codex_quota(loc, cached, now)
@@ -5325,6 +5650,22 @@ def _collect_provider_rows(config, now=None):
                         _write_provider_cache(entry["id"], {
                             "timestamp": data_ts, "usage": usage,
                             "src": r["src"], "plan": tier})
+                # The API sees the whole shared pool, so its numbers win while
+                # fresh, or whenever they are newer than the rollout's. An old
+                # rollout only says this machine has been quiet.
+                try:
+                    api = _refresh_codex_api(entry, config, now, budget)
+                except Exception:
+                    api = {}
+                api_usage = _clean_provider_usage(api.get("usage"), now)
+                try:
+                    api_ts = float(api.get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    api_ts = 0.0
+                if api_usage and (now - api_ts < _PROVIDER_STALE_AFTER
+                                  or api_ts >= float(data_ts or 0)):
+                    usage, data_ts = api_usage, api_ts
+                    tier = api.get("plan") or tier
             elif ptype == "gemini":
                 r = _read_gemini_quota(loc, entry.get("bucket", "gemini"), now) if loc else None
                 if r:
@@ -5343,9 +5684,11 @@ def _collect_provider_rows(config, now=None):
             data_ts = float(data_ts) if data_ts is not None else None
         except (TypeError, ValueError):
             data_ts = None
-        # Only polled sources go stale. agy / Codex / custom files are
-        # rewritten on every use, so an old file means "no use since" — true.
-        stale = bool(ptype in ("claude", "minimax") and usage and data_ts
+        # Polled sources go stale, Codex among them: its pool is shared with
+        # the web app and other machines, so an old number here is not "no use
+        # since". agy / custom files are rewritten on every use, so for them an
+        # old file means exactly that.
+        stale = bool(ptype in ("claude", "minimax", "codex") and usage and data_ts
                      and now - data_ts > _PROVIDER_STALE_AFTER)
         rows.append({"entry": entry, "label": _provider_row_label(entry),
                      "usage": usage, "data_ts": data_ts, "stale": stale,
@@ -5559,7 +5902,6 @@ def _calc_pace_pct(resets_at_str, window_seconds):
 # share of its time that has passed: five points either way is noise on a
 # 5-hour window; twenty points is a full hour of budget there (about 1.4 days
 # on the weekly window), the point where it runs dry well before it resets.
-# Idea from @marcelosanchez's fork.
 PACE_STYLES = ("arrows", "percent")
 DEFAULT_PACE_STYLE = "arrows"
 PACE_ON_TRACK_PTS = 5
@@ -7520,8 +7862,8 @@ def _update_session_state(usage, stdin_ctx, config=None):
         if session_id is None:
             return
         sessions_dir = _get_sessions_dir()
-        five = usage.get("five_hour", {}) if usage else {}
-        seven = usage.get("seven_day", {}) if usage else {}
+        five = (usage.get("five_hour") if usage else None) or {}
+        seven = (usage.get("seven_day") if usage else None) or {}
         state = {
             "pid": session_id,
             "session_pct": five.get("utilization") or 0,
@@ -7995,7 +8337,10 @@ def build_status_line(usage, plan, config=None, stdin_ctx=None, cache_age=None):
                 if reset_str and (runway_str or spark_str or burn_str):
                     reset_str = f" \u00b7{reset}"
                 parts.append((_s, f"{label} {bar_before}{pct:.0f}%{burn_str}{pace_str}{spark_str}{runway_str}{reset_str}"))
-        else:
+        elif not usage.get("seven_day"):
+            # No data at all yet: draw the empty placeholder. A weekly window
+            # without a 5-hour one means the account has no 5-hour limit (the
+            # API sends ``five_hour: null``), and a 0% bar would claim it has.
             _s = _pri("session")
             bar = make_bar(0, theme, plain=bar_plain, width=bw, bar_style=bstyle)
             bar_before, bar_after = _bar_fields("session", bar)
@@ -9554,9 +9899,10 @@ def _render_provider_row(label, usage, config, label_width, bar_width, stale=Fal
     bstyle = config.get("bar_style", DEFAULT_BAR_STYLE)
     layout = config.get("layout", DEFAULT_LAYOUT)
     show = config.get("show", DEFAULT_SHOW)
+    pace_style = config.get("pace_style", DEFAULT_PACE_STYLE)
     usage = usage or {}
 
-    def _window(key):
+    def _window(key, window_seconds):
         w = usage.get(key)
         if not w or w.get("utilization") is None:
             bar = make_bar(0, theme, plain=True, width=bar_width, bar_style=bstyle)
@@ -9565,11 +9911,15 @@ def _render_provider_row(label, usage, config, label_width, bar_width, stale=Fal
         bar = make_bar(pct, theme, plain=use_rainbow and not stale, width=bar_width,
                        bar_style=bstyle, flash_color=DIM if stale else None, config=config)
         pct_txt = f"{DIM}~{pct:.0f}%{RESET}" if stale else f"{pct:.0f}%"
+        # The main line's pace arrow, on live data only: a stale row's clock
+        # has moved on while its number has not.
+        if show.get("pace") and not stale:
+            pct_txt += _format_pace(pct, _calc_pace_pct(w.get("resets_at"), window_seconds), pace_style)
         return bar, pct_txt, w.get("resets_at")
 
     head = label.ljust(label_width)
     if show.get("session", True):
-        bar, pct_txt, resets = _window("five_hour")
+        bar, pct_txt, resets = _window("five_hour", 18000)
         reset = format_reset_time(resets) if resets and show.get("timer", True) else None
         reset_str = f" {reset}" if reset else ""
         if layout == "compact":
@@ -9583,7 +9933,7 @@ def _render_provider_row(label, usage, config, label_width, bar_width, stale=Fal
 
     tail = ""
     if show.get("weekly", True):
-        bar, pct_txt, resets = _window("seven_day")
+        bar, pct_txt, resets = _window("seven_day", 604800)
         wr_str = ""
         if resets and show.get("weekly_timer", True):
             wt_fmt = config.get("weekly_timer_format", DEFAULT_WEEKLY_TIMER_FORMAT)
@@ -11925,7 +12275,8 @@ def detect_providers(config=None):
     * Claude: ``~/.claude``, ``~/.claude-*`` and ``$CLAUDE_CONFIG_DIR``, kept
       only when ``.credentials.json`` holds a token (on macOS a dir that has
       only a Keychain login is listed as ``keychain-only``, disabled).
-    * Codex: ``$CODEX_HOME`` or ``~/.codex`` with a rollout file.
+    * Codex: ``$CODEX_HOME`` or ``~/.codex`` with a rollout file or a ChatGPT
+      login in ``auth.json``.
     * Gemini: ``~/.gemini/antigravity-cli*/statusline_last_live.json``.
     * MiniMax: the ``mmx`` CLI on PATH (always ``enabled: False`` unless the
       user enabled it: it spawns a process).
@@ -12010,18 +12361,22 @@ def detect_providers(config=None):
     try:
         codex = _codex_home(configured.get("codex"))
         files = _find_codex_rollouts(codex, 1)
-        if files:
-            st = files[0].stat()
+        # A fresh ``codex login`` has no rollout yet, but the usage API answers.
+        token, _, jwt_plan = _read_codex_token(codex, now)
+        has_login = bool(token)
+        token = None
+        if files or has_login:
+            mtime = files[0].stat().st_mtime if files else None
             found_rl = None
             try:
-                found_rl = _codex_rate_limits_from_tail(files[0], now)
+                found_rl = _codex_rate_limits_from_tail(files[0], now) if files else None
             except OSError:
                 pass
             _add({"id": "codex", "type": "codex", "label": "Codex", "path": _tilde(codex),
                   "active": False, "enabled": True,
-                  "tier": found_rl[1] if found_rl else None,
-                  "age_seconds": _age_seconds(st.st_mtime, now),
-                  "note": "ok" if found_rl else "no rate limits in newest rollout yet"})
+                  "tier": (found_rl[1] if found_rl else None) or _codex_tier_label(jwt_plan),
+                  "age_seconds": _age_seconds(mtime, now),
+                  "note": "ok" if (found_rl or has_login) else "no rate limits in newest rollout yet"})
     except Exception:
         pass
 
@@ -13468,10 +13823,16 @@ def main():
         if not plan_from_cache and not _gateway_run:
             _, plan_from_cache = get_credentials()
             plan_from_cache = plan_from_cache or ""
+        # The name the plan is sold under, from the profile at most once a day
+        # and only while the plan is drawn. The tier-derived name stays the
+        # fallback, and what the cache records.
+        if not _gateway_run:
+            _refresh_plan_label(config, (_stale or {}).get("rate_limited_until"))
+        shown_plan = _display_plan(plan_from_cache, config)
 
         # Guarded: a value in a file the renderer cannot draw must not leave a
         # blank bar. The side effects below still run, so the damage heals.
-        line = _guarded_status_line(usage_from_stdin, plan_from_cache, config, stdin_ctx, 0)
+        line = _guarded_status_line(usage_from_stdin, shown_plan, config, stdin_ctx, 0)
         _update_session_state(usage_from_stdin, stdin_ctx, config)
         _append_history(usage_from_stdin)
         if stdin_ctx.get("context_pct") is not None:
@@ -13495,8 +13856,8 @@ def main():
         # reads as +inf (the red stale label) instead of raising here.
         cache_age = _cache_age(cached)
         if "usage" in cached:
-            line = _guarded_status_line(cached["usage"], cached.get("plan", ""), config,
-                                        stdin_ctx, cache_age,
+            line = _guarded_status_line(cached["usage"], _display_plan(cached.get("plan", ""), config),
+                                        config, stdin_ctx, cache_age,
                                         fallback=cached.get("line", ""))
             _update_session_state(cached["usage"], stdin_ctx, config)
         else:
@@ -13556,7 +13917,8 @@ def main():
 
     try:
         usage = fetch_usage(token)
-        line = build_status_line(usage, plan, config, stdin_ctx, cache_age=0)
+        _refresh_plan_label(config, token=token)
+        line = build_status_line(usage, _display_plan(plan, config), config, stdin_ctx, cache_age=0)
     except urllib.error.HTTPError as e:
         usage = None
         if e.code == 401:

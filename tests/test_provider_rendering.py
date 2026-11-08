@@ -68,6 +68,43 @@ class RenderingTest(unittest.TestCase):
         self.assertIn("Weekly", plain(rows[2]))
         self.assertTrue(plain(rows[3]).startswith("Codex"))
 
+    def test_pace_arrows_follow_the_main_line(self):
+        # Off by default: no arrow on any row.
+        for r in self._main_line().split("\n")[1:]:
+            for glyph in "↑↓⇈⇊→":
+                self.assertNotIn(glyph, plain(r))
+            self.assertNotRegex(plain(r), r"% \(")
+        config = dict(self.config, show=dict(self.config["show"], pace=True))
+        rows = [plain(r) for r in self._main_line(config).split("\n")]
+        # claude:b: 3% used with 50 min of the 5-hour window left (⇊), 63% of
+        # the week used with 3.5 days left (↑).
+        sunny = rows[1]
+        self.assertTrue(sunny.startswith("Claude (Sunny)"), sunny)
+        head, tail = sunny.split(" | ")
+        self.assertIn("3% ⇊", head)
+        self.assertIn("63% ↑", tail)
+        # Codex: 29% with an hour of five left, 5% of the week with 3 days left.
+        self.assertIn("29% ⇊", rows[3])
+        self.assertIn("5% ⇊", rows[3])
+        # The rows still share the separator column with the main line.
+        self.assertEqual(len({r.index(" | ") for r in rows}), 1, rows)
+        # --pace-style percent shows the elapsed share instead.
+        rows = [plain(r) for r in self._main_line(dict(config, pace_style="percent")).split("\n")]
+        self.assertRegex(rows[1], r"3% \(8[2-4]%\)")
+
+    def test_no_pace_arrow_on_a_stale_row(self):
+        now = time.time()
+        cs._write_provider_cache("claude:b", {
+            "timestamp": now - 3600,
+            "usage": {"five_hour": {"utilization": 3.0, "resets_at": iso_z(3000)},
+                      "seven_day": {"utilization": 63.0, "resets_at": iso_z(300000)}}})
+        config = dict(self.config, show=dict(self.config["show"], pace=True))
+        rows = [plain(r) for r in self._main_line(config).split("\n")]
+        self.assertIn("~3%", rows[1])
+        for glyph in "↑↓⇈⇊→":
+            self.assertNotIn(glyph, rows[1], rows[1])
+        self.assertIn("29% ⇊", rows[3])   # the live Codex row keeps its arrow
+
     def test_main_label_needs_rows(self):
         config = dict(self.config, providers=[])
         line = cs.build_status_line(self._usage(), "", config, {})

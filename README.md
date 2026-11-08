@@ -178,7 +178,7 @@ Providers add one row per *other* subscription under the main line. `--detect-pr
 | What | Id | Where it is read from |
 |---|---|---|
 | Other Claude Code accounts | `claude:default`, `claude:<suffix>` (for example `claude:b` for `~/.claude-b`) | Every `~/.claude*` folder that holds a `.credentials.json` |
-| Codex CLI | `codex` | Session files under `~/.codex` |
+| Codex CLI | `codex` | ChatGPT's usage API with the Codex CLI's own login (`~/.codex/auth.json`); the session files under `~/.codex` when that is not possible |
 | Google Antigravity (Gemini) | `gemini`, `gemini:<suffix>` | `statusline_last_live.json` under `~/.gemini/antigravity-cli*` |
 | MiniMax | `minimax` | The `mmx` CLI on your PATH. Never switched on automatically |
 | Anything else | `file:<name>` | A JSON file that any tool can write |
@@ -194,7 +194,8 @@ The sub-commands are `list`, `detect`, `enable`, `disable`, `label`, `remove` an
 
 - Rows use the main line's theme, bar style and size. With `providers_label_main` on (the default) the main line's `Session` label becomes `Claude (<label>) 5h` so everything lines up.
 - **Another Claude account** uses that account's own token, read from its `.credentials.json`. It is never refreshed, stored or logged. At most one usage-API call per account every `providers_refresh_seconds` (300 by default, 60 at the lowest), never more than one a minute, with back-off on 429 and a 15-minute pause on 401 or 403. Each window also saves its own account's numbers from stdin, so with both windows open no API call is made at all.
-- **Codex and Gemini** rows are read from local files only: the last values seen, never a network call.
+- **Codex** asks `chatgpt.com/backend-api/wham/usage`, the endpoint the Codex CLI itself uses, with the login in `~/.codex/auth.json`: at most one call every `providers_refresh_seconds`, never more than one a minute, with the same back-off as the Claude rows. Codex limits are shared with ChatGPT on the web and with every other machine on the account, so the local session files alone fall behind whenever Codex is used elsewhere; they remain the fallback when the token has expired or the call fails. The token is never refreshed, stored or logged; the Codex CLI renews it on its next use.
+- **Gemini** rows are read from local files only: the last values seen, never a network call.
 - **MiniMax** runs `mmx` to read its quota, which is why it is never on by default, and it is hidden while the window itself runs on MiniMax.
 - A row whose data is more than 30 minutes old is drawn dim with a `~` in front of the number, such as `~29%`.
 
@@ -280,7 +281,7 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `update` | on | `↑ Pulse Update` when a new Usage Pulse release exists |
 | `claude_update` | on | `↑ Claude Update` when a newer Claude Code is out on your release channel (`latest`, or `stable` if your `autoUpdatesChannel` says so); `↻ Restart Claude` when that version is already installed and only a restart applies it |
 | `opus`, `sonnet`, `fable` | off | Per-model weekly cap bars. These call the usage API, see [below](#per-model-weekly-caps) |
-| `plan` | off | Your plan name |
+| `plan` | off | Your plan as it is sold (`Ultra`, `Max`, `Pro`), read from your profile once a day; the credentials file's tier (`Max 20x`) is the fallback |
 | `extra` | off | Extra-usage (bonus) credits, in your currency. Appears by itself if you have any (`--extra-display`), refreshes with the per-model caps, and shows `(stale)` or `(3d ago)` when the figure is old |
 | `thinking` | off | `think` or `no-think` |
 | `cache` | off | Share of input served from the prompt cache |
@@ -294,7 +295,7 @@ Switch any of them with `--show` and `--hide`, or tick them in the wizard. Most 
 | `runway` | off | Estimated time until the window is full |
 | `sparkline` | off | A small chart of recent session usage |
 | `status_message` | off | Replaces the `Session` label with a short message such as `Cruising` |
-| `pace` | off | `↑` or `↓` after the percentage: usage ahead of or behind the window's clock, doubled when it is well off the pace, `→` when on track (`--pace-style`) |
+| `pace` | off | `↑` or `↓` after the percentage: usage ahead of or behind the window's clock, doubled when it is well off the pace, `→` when on track (`--pace-style`). Provider rows get the same arrows |
 | `streak` | off | Days in a row you have used Claude Code (`--streak-style`) |
 | `sessions` | off | `+2 sessions` when other windows are open |
 | `git_drift` | off | Commits behind and ahead of upstream |
@@ -414,7 +415,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 This is the output of `python claude_status.py --help`:
 
 ```
-usage-pulse 3.7.0 — usage status line for Claude Code
+usage-pulse 3.8.0 — usage status line for Claude Code
 
 Usage: python claude_status.py [flag [args]]
 With no flag and JSON on stdin (how Claude Code runs it) it prints the status line.
@@ -514,8 +515,9 @@ Inside Claude Code: /pulse (or /pulse setup) does all of this by asking you.
 │  files that the next repaint reads            │
 ├───────────────────────────────────────────────┤
 │  Provider rows (optional)                     │
-│  Local files for Codex, Gemini, JSON files;   │
-│  one cached usage call per other Claude acct  │
+│  Local files for Gemini and JSON files; one   │
+│  cached usage call per other Claude account   │
+│  and for Codex (chatgpt.com)                  │
 ├───────────────────────────────────────────────┤
 │  Cache layer                                  │
 │  Exchange rates (24h) · update checks (1h)    │
@@ -530,9 +532,9 @@ Claude Code sends `rate_limits` on stdin, so the main bars need no OAuth call an
 <summary><b>Security</b></summary>
 
 - **No API calls for the main usage bars.** They come straight from Claude Code's stdin.
-- **Tokens only go to Anthropic.** OAuth tokens are sent only to `api.anthropic.com` (usage) and `platform.claude.com` (renewing your own expired token, kept in memory and never written back). A hardcoded allowlist enforces this, and redirects to any other host are blocked.
+- **Each token goes to its own service only.** Claude OAuth tokens are sent only to `api.anthropic.com` (usage) and `platform.claude.com` (renewing your own expired token, kept in memory and never written back). The Codex CLI's token, only while the Codex row is on, goes to `chatgpt.com` alone and is never refreshed. Hardcoded allowlists enforce both, and redirects to any other host are blocked.
 - **Other accounts' tokens are read, never changed.** For a provider row the token is read from that account's `.credentials.json` and is never refreshed, stored or logged. Refreshing it would rotate the refresh token and sign that account out.
-- **No e-mail addresses or account names are read.** Labels come from your config or from the folder name.
+- **Only the plan's name is read from your profile.** With the `plan` widget or provider tiers on, the OAuth profile is asked once a day for `organization.plan_display_name`; the e-mail and account name in that reply are discarded, never stored. Labels come from your config or from the folder name.
 - **Settings are backed up** before Usage Pulse first writes `settings.json`, and `--install-hooks` refuses to replace a file that is not valid JSON.
 - All file writes are atomic with 0o600 permissions, every piece of external data (provider labels and files included) is stripped of ANSI escapes, hyperlink targets are limited to `http(s)` without control characters, no subprocess uses `shell=True`, and the exchange-rate API (frankfurter.dev) is read-only, unauthenticated and cached for 24 hours.
 
@@ -553,7 +555,7 @@ Claude Code sends `rate_limits` on stdin, so the main bars need no OAuth call an
 | Setup says `settings.json` is invalid | Fix the JSON it names and run setup again. Nothing was changed |
 | Replaced my old status line by mistake | Setup prints the old command. Earlier copies of `settings.json` are in `settings-backups/` in the state folder |
 | A provider row is missing | `--providers list` shows what is configured and `--detect-providers` what exists. Check that the `providers` widget is on |
-| A Claude or MiniMax row shows `~29%` with dim bars | The data is more than 30 minutes old. Use that account once, or wait for the next refresh |
+| A Claude, Codex or MiniMax row shows `~29%` with dim bars | The data is more than 30 minutes old. Use that account once, or wait for the next refresh. For Codex it usually means the login has expired: run any `codex` command |
 | A provider row shows `--` | The source could not be read yet: no token, a missing file, or no rate-limit data in the newest Codex session |
 | "Rate limited" message | The main bars read stdin, so they keep working. API-backed parts back off before retrying |
 | `--update` says it cannot reach GitHub | Both the GitHub API and `git ls-remote` failed. Check the network; the unauthenticated API alone is not needed since 3.4.1 |
@@ -571,7 +573,7 @@ Claude Code sends `rate_limits` on stdin, so the main bars need no OAuth call an
 
 ## Thanks
 
-Per-model weekly caps came from [@thedanielmay](https://github.com/thedanielmay) in PR #53, the pace arrows started in [@marcelosanchez](https://github.com/marcelosanchez)'s fork and the per-bar toggles in [@lucachitayat](https://github.com/lucachitayat)'s, and the project has picked up more ideas from its forks and issue reporters along the way. Bug reports and pull requests are welcome; the test suite (`python -m unittest discover -s tests`) runs in about a minute, and `python tests/test_readme_claims.py` keeps this page honest. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
+Per-model weekly caps came from [@thedanielmay](https://github.com/thedanielmay) in PR #53, the per-bar toggles started in [@lucachitayat](https://github.com/lucachitayat)'s fork, and the project has picked up more ideas from its forks and issue reporters along the way. Bug reports and pull requests are welcome; the test suite (`python -m unittest discover -s tests`) runs in about a minute, and `python tests/test_readme_claims.py` keeps this page honest. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 If Usage Pulse earns its place under your prompt, star the repo, tell someone who lives in Claude Code, or buy me a coffee.
 

@@ -251,6 +251,7 @@ class StalenessAndBadgesTest(unittest.TestCase):
         with mock.patch.object(cs, "_detect_terminal_width", return_value=columns), \
                 mock.patch.object(cs, "check_for_update", lambda: True), \
                 mock.patch.object(cs, "check_claude_code_update", lambda v=None: True), \
+                mock.patch.object(cs, "_claude_update_text", lambda running=None: cs._CLAUDE_UPDATE_TEXT), \
                 mock.patch.object(cs, "_append_provider_rows", add):
             return cs._finish_line(line, config if config is not None else {"max_width": 100})
 

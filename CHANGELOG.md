@@ -10,8 +10,19 @@ Ideas, not promises:
 - A detached background refresh for other Claude accounts, so a repaint never waits on the network.
 - Native Kimi and GLM rows, once their usage endpoints are confirmed.
 - Reading `~/.claude/tasks/<team>/` so the team widget can show task subjects.
-- Live Codex limits through its app-server instead of the last session file.
 - A `skills/` layout for the plugin.
+
+## [3.8.0] - 2026-11-08
+
+### Added
+
+- **The Codex row reads the live pool.** With a ChatGPT login in `~/.codex/auth.json`, the row asks `chatgpt.com/backend-api/wham/usage`, the endpoint the Codex CLI itself uses, at most once every `providers_refresh_seconds` and never more than once a minute, with the same 429 / 401 / error back-off as the other Claude accounts. Codex limits are shared with ChatGPT on the web and with every other machine on the account, so the session files alone fell behind whenever Codex was used elsewhere; they remain the fallback when the token has expired or the call fails. The token is sent to `chatgpt.com` only, with every redirect refused, and is never refreshed, stored or logged. `--detect-providers` finds a fresh `codex login` before its first session file exists, and a Codex row older than 30 minutes is drawn stale like the Claude rows.
+- **Pace arrows on provider rows.** With the `pace` widget on, every provider row's window gets the same arrow (or elapsed share with `--pace-style percent`) as the main line. Stale rows show none.
+
+### Fixed
+
+- **The plan is named as it is sold.** The credentials file only carries the rate-limit tier, so an Ultra account read `Max 20x`. With the `plan` widget or provider tiers on, the name now comes from the OAuth profile's `plan_display_name` (`Ultra`, `Max`, `Pro`), asked once a day with the attempt stamped first and a hard time ceiling; the tier stays the fallback, and nothing else in that reply is read.
+- **An account without a 5-hour window gets no 0% session bar.** The usage API reports `five_hour: null` for such accounts. The bar now shows the weekly window alone instead of a 0% session placeholder, and the session-state writer treats the window as absent instead of raising, as the history and heatmap writers have since 3.7.0.
 
 ## [3.7.0] - 2026-11-03
 
@@ -81,7 +92,7 @@ Ideas, not promises:
 
 ### Added
 
-- **Pace arrows.** With the `pace` widget on, each window shows an arrow after its percentage instead of a bare number: `↑` when usage is ahead of the window's clock, `↓` when it is behind, doubled (`⇈` in red, `⇊` in green) once the gap passes twenty points, and a dim `→` when it is on track. `--pace-style percent` brings back the elapsed-time percentage. The idea started in [@marcelosanchez](https://github.com/marcelosanchez)'s fork.
+- **Pace arrows.** With the `pace` widget on, each window shows an arrow after its percentage instead of a bare number: `↑` when usage is ahead of the window's clock, `↓` when it is behind, doubled (`⇈` in red, `⇊` in green) once the gap passes twenty points, and a dim `→` when it is on track. `--pace-style percent` brings back the elapsed-time percentage.
 - **Bars you can switch off one at a time.** `--hide session_bar`, `weekly_bar` or `context_bar` keeps that window's percentage and timer and drops the bar itself, for a narrower line. The idea started in [@lucachitayat](https://github.com/lucachitayat)'s fork.
 - `--bar-size auto`, the shrink-to-fit behaviour described below, for anyone who wants bars that narrow with the window.
 

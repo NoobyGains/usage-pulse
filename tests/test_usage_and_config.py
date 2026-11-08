@@ -364,6 +364,38 @@ class ScanPricesEntriesByTheirOwnDateTest(unittest.TestCase):
         self.assertAlmostEqual(result["models"]["claude-sonnet-5"]["cost_usd"], 2.0)
 
 
+class NullSessionWindowTest(unittest.TestCase):
+    """An account without a 5-hour window gets ``five_hour: null`` from the
+    usage API. The state writers that run after the render must not raise on
+    it (they did, and the bar went blank), and the bar must not draw a 0%
+    session limit the account does not have."""
+
+    WEEKLY_ONLY = {"five_hour": None, "seven_day": {"utilization": 10, "resets_at": None}}
+
+    def test_state_writers_accept_a_null_window(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td,                 mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "XDG_CACHE_HOME": td,
+                                             "CLAUDE_CONFIG_DIR": td}):
+            cs._append_history(dict(self.WEEKLY_ONLY))
+            cs._update_heatmap(dict(self.WEEKLY_ONLY))
+            cs._update_session_state(dict(self.WEEKLY_ONLY), {"model_name": "Opus"})
+            samples = cs._read_history()
+            sessions = cs._get_active_sessions()
+        self.assertEqual((samples[-1]["s"], samples[-1]["w"]), (0, 10))
+        self.assertTrue(sessions is not None)
+
+    def test_only_a_weekly_window_draws_no_session_placeholder(self):
+        cfg = {"show": {"session": True, "weekly": True}}
+        line = cs.build_status_line(dict(self.WEEKLY_ONLY), "Max 20x", cfg)
+        self.assertNotIn("Session", line)
+        self.assertIn("Weekly", line)
+        self.assertIn("10%", line)
+        # No data at all: the empty placeholder stays, as before.
+        self.assertIn("Session", cs.build_status_line({}, "", cfg))
+        # Both windows null: still the placeholder, never an exception.
+        self.assertIn("Session", cs.build_status_line({"five_hour": None, "seven_day": None}, "", cfg))
+
+
 class StaleCacheShapeTest(unittest.TestCase):
     """_read_stale_cache feeds the 429 fallback; raising there prints nothing."""
 

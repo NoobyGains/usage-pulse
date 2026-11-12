@@ -180,6 +180,7 @@ Providers add one row per *other* subscription under the main line. `--detect-pr
 | Other Claude Code accounts | `claude:default`, `claude:<suffix>` (for example `claude:b` for `~/.claude-b`) | Every `~/.claude*` folder that holds a `.credentials.json` |
 | Codex CLI | `codex` | ChatGPT's usage API with the Codex CLI's own login (`~/.codex/auth.json`); the session files under `~/.codex` when that is not possible |
 | Google Antigravity (Gemini) | `gemini`, `gemini:<suffix>` | `statusline_last_live.json` under `~/.gemini/antigravity-cli*` |
+| GitHub Copilot CLI | `copilot` | Copilot CLI's own record of the signed-in account, a local file. No token, no network call |
 | MiniMax | `minimax` | The `mmx` CLI on your PATH. Never switched on automatically |
 | Anything else | `file:<name>` | A JSON file that any tool can write |
 
@@ -196,6 +197,7 @@ The sub-commands are `list`, `detect`, `enable`, `disable`, `label`, `remove` an
 - **Another Claude account** uses that account's own token, read from its `.credentials.json`. It is never refreshed, stored or logged. At most one usage-API call per account every `providers_refresh_seconds` (300 by default, 60 at the lowest), never more than one a minute, with back-off on 429 and a 15-minute pause on 401 or 403. Each window also saves its own account's numbers from stdin, so with both windows open no API call is made at all.
 - **Codex** asks `chatgpt.com/backend-api/wham/usage`, the endpoint the Codex CLI itself uses, with the login in `~/.codex/auth.json`: at most one call every `providers_refresh_seconds`, never more than one a minute, with the same back-off as the Claude rows. Codex limits are shared with ChatGPT on the web and with every other machine on the account, so the local session files alone fall behind whenever Codex is used elsewhere; they remain the fallback when the token has expired or the call fails. The token is never refreshed, stored or logged; the Codex CLI renews it on its next use.
 - **Gemini** rows are read from local files only: the last values seen, never a network call.
+- **Copilot** has a monthly plan budget instead of 5-hour and weekly windows, so its row is one `Plan` bar with what is used, the allowance, what is left and the reset date: `Copilot Plan ━━━───── 23% | 69/300 req · 231 left · R:1 Dec`. It is read from the record Copilot CLI keeps on disk, so it is as fresh as Copilot's last start; older than a day it is drawn dim. See [Inside GitHub Copilot CLI](#inside-github-copilot-cli) for what each kind of account shows.
 - **MiniMax** runs `mmx` to read its quota, which is why it is never on by default, and it is hidden while the window itself runs on MiniMax.
 - A row whose data is more than 30 minutes old is drawn dim with a `~` in front of the number, such as `~29%`.
 
@@ -226,6 +228,32 @@ CLAUDE_CONFIG_DIR=~/.claude-work python3 ~/.usage-pulse/claude_status.py --setup
 State that belongs to one account (usage cache, stdin context, history, sessions, heatmap, cost caches) lives in `<state folder>/accounts/<name>-<hash>/`, so two windows on two accounts never overwrite each other. `config.json` stays shared.
 
 </details>
+
+## Inside GitHub Copilot CLI
+
+The same bar can be Copilot CLI's status line too, with your theme, bar style and layout:
+
+```bash
+python3 ~/.usage-pulse/claude_status.py --install-copilot      # --uninstall-copilot takes it out again
+```
+
+```
+Plan ━━━───────── 23% 69/300 req · 231 left · R:1 Dec Pro | Session 3 req | Context ━━━━━─────── 42% | GPT-5.4 · medium | main
+```
+
+It writes one `statusLine` entry into Copilot CLI's `settings.json` (`~/.copilot`, or `$COPILOT_HOME`), keeps every other setting and a backup, and touches nothing of Claude Code's. Restart Copilot CLI to see it.
+
+| Account | What the `Plan` segment shows |
+|---|---|
+| Pro, Pro+, Max, Business or Enterprise with a budget | The bar, then used / allowance, what is left, any extra usage, the reset date and the plan name. Counted in AI credits (`AIC`), or in premium requests (`req`) on the legacy billing platform |
+| Enterprise or Business seat with no budget of its own | `Plan no limit` |
+| Copilot Free | Its monthly chat allowance (`0/200 chat · 200 left`): Free has no premium allowance |
+| Signed in without a Copilot licence | `no licence` |
+
+- `Session` is what this session has cost so far, in the unit the account is billed in.
+- Context, model, branch and lines changed come from what Copilot CLI pipes in. Widgets that only mean something in Claude Code (the 5-hour and weekly windows, cost in dollars, hooks, agents, streaks) are left out.
+- The plan figures come from the record Copilot CLI itself keeps on disk for the signed-in account. No token is read and nothing is sent anywhere, so they change when Copilot refreshes that record, not after every prompt. Copilot's own Session and Weekly rate-limit bars (`/usage`) are not in that record or in what it pipes in, so they are not shown.
+- Business and Enterprise figures follow the record's documented shape and Copilot CLI's own test data; they have not been checked against a live licensed seat yet. Reports welcome.
 
 ## Themes, animation and layout
 
@@ -415,7 +443,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 This is the output of `python claude_status.py --help`:
 
 ```
-usage-pulse 3.8.0 — usage status line for Claude Code
+usage-pulse 3.9.0 — usage status line for Claude Code
 
 Usage: python claude_status.py [flag [args]]
 With no flag and JSON on stdin (how Claude Code runs it) it prints the status line.
@@ -426,6 +454,8 @@ Setup
   --update                            Update a git install to the latest release
   --uninstall                         Remove the status line, hooks and /pulse from Claude Code's settings
   --help                              Show this list (also -h)
+  --install-copilot                   Use this bar as GitHub Copilot CLI's status line (writes ~/.copilot/settings.json)
+  --uninstall-copilot                 Remove the bar from GitHub Copilot CLI's settings
 
 Look
   --theme <name>                      Set the colour theme (see --themes)
@@ -470,7 +500,7 @@ Widgets
   --focus <start [min]|stop|status>   Focus (pomodoro) timer
 
 Providers
-  --detect-providers [--json]         Find other Claude accounts, Codex, Gemini and MiniMax on this machine
+  --detect-providers [--json]         Find other Claude accounts, Codex, Gemini, Copilot and MiniMax on this machine
   --providers <list|detect|enable|disable|label|remove|add-file> [...]
                                       Manage the extra status rows: --providers help lists the sub-commands
 
@@ -485,6 +515,7 @@ Info
   --debug-stdin                       Save and parse the JSON Claude Code pipes in
 
 Internal
+  --host copilot                      Status line for GitHub Copilot CLI (run by Copilot CLI)
   --subagent-status-line              Agent-panel rows (run by Claude Code)
   --hook-refresh [tool]               PostToolUse hook
   --hook-subagent-start               SubagentStart hook

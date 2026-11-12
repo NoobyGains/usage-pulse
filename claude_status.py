@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.8.0"
+VERSION = "3.9.0"
 
 import base64
 import hashlib
@@ -4347,10 +4347,10 @@ def _parse_minimax_quota(mmx_json):
 # Nothing in this block can raise into the status line; every source degrades
 # to "no data".
 
-PROVIDER_TYPES = ("claude", "codex", "gemini", "minimax", "file")
+PROVIDER_TYPES = ("claude", "codex", "gemini", "minimax", "file", "copilot")
 PROVIDER_DEFAULT_LABELS = {
     "claude": "Claude", "codex": "Codex", "gemini": "Gemini",
-    "minimax": "MiniMax", "file": "Custom",
+    "minimax": "MiniMax", "file": "Custom", "copilot": "Copilot",
 }
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9:_-]{0,31}$")
 _PROVIDER_LABEL_MAX = 24
@@ -4445,7 +4445,7 @@ def _normalize_providers(raw):
             if "id" in item:
                 pid = _normalize_provider_id(item.get("id"))
             else:
-                pid = ptype if ptype in ("codex", "gemini", "minimax") else None
+                pid = ptype if ptype in ("codex", "gemini", "minimax", "copilot") else None
             if not pid or pid in seen:
                 continue
             entry = {"id": pid, "type": ptype,
@@ -4532,6 +4532,8 @@ def _provider_location(entry):
     if ptype == "gemini":
         name = "antigravity-cli" + (f"-{suffix}" if suffix else "")
         return Path.home() / ".gemini" / name
+    if ptype == "copilot":
+        return _copilot_cache_path()
     return None
 
 
@@ -5635,6 +5637,7 @@ def _collect_provider_rows(config, now=None):
     for entry in _provider_row_entries(config):
         ptype = entry["type"]
         usage, data_ts, tier = None, None, None
+        copilot = None
         try:
             loc = _provider_location(entry)
             if ptype == "claude":
@@ -5677,8 +5680,12 @@ def _collect_provider_rows(config, now=None):
                 r = _read_file_quota(loc, now) if loc else None
                 if r:
                     usage, data_ts = r["usage"], r["data_ts"]
+            elif ptype == "copilot":
+                r = _read_copilot_quota(loc, now)
+                if r:
+                    copilot, data_ts, tier = r["info"], r["data_ts"], r["tier"]
         except Exception:
-            usage, data_ts, tier = None, None, None
+            usage, data_ts, tier, copilot = None, None, None, None
         usage = _clean_provider_usage(usage, now)
         try:
             data_ts = float(data_ts) if data_ts is not None else None
@@ -5690,10 +5697,477 @@ def _collect_provider_rows(config, now=None):
         # old file means exactly that.
         stale = bool(ptype in ("claude", "minimax", "codex") and usage and data_ts
                      and now - data_ts > _PROVIDER_STALE_AFTER)
-        rows.append({"entry": entry, "label": _provider_row_label(entry),
-                     "usage": usage, "data_ts": data_ts, "stale": stale,
-                     "tier": _clean_provider_label(tier) if isinstance(tier, str) else None})
+        row = {"entry": entry, "label": _provider_row_label(entry),
+               "usage": usage, "data_ts": data_ts, "stale": stale,
+               "tier": _clean_provider_label(tier) if isinstance(tier, str) else None}
+        if ptype == "copilot":
+            # Copilot's record is rewritten only while Copilot CLI runs, and
+            # its budget is shared with the IDEs: an old one is a guess.
+            row["copilot"] = copilot
+            row["stale"] = bool(copilot and data_ts and now - data_ts > _COPILOT_STALE_AFTER)
+        rows.append(row)
     return rows
+
+
+# --- GitHub Copilot CLI -----------------------------------------------------
+# Copilot CLI keeps the last account record it fetched (plan, licence state
+# and the plan budget) in a small JSON file. Everything here reads that file
+# and Copilot's own config.json: no token is read and no request is made, so
+# the numbers are as fresh as Copilot's last look. Nothing in this block can
+# raise into the status line.
+
+_COPILOT_CACHE_FILE = "copilot-user-cache.json"
+_COPILOT_BUDGET_SNAPSHOT = "premium_interactions"
+_COPILOT_STALE_AFTER = 86400
+_COPILOT_PLAN_NAMES = {"business": "Business", "enterprise": "Enterprise"}
+# Widgets drawn inside Copilot CLI: the ones fed by the session payload or by
+# git in the working folder. Everything else describes a Claude Code session.
+_COPILOT_HOST_PARTS = (
+    "context", "context_bar", "context_warning", "model", "branch", "worktree",
+    "lines", "repo", "session_name", "git_drift", "files_changed", "agent",
+)
+
+
+def _copilot_home():
+    """Copilot CLI's config dir: ``$COPILOT_HOME`` or ``~/.copilot``."""
+    env = os.environ.get("COPILOT_HOME", "").strip()
+    return Path(os.path.expanduser(env)) if env else Path.home() / ".copilot"
+
+
+def _copilot_cache_candidates():
+    """Where Copilot CLI may keep its account record, most specific first.
+
+    It honours ``COPILOT_CACHE_HOME``, then ``%LOCALAPPDATA%`` on Windows and
+    ``$XDG_CACHE_HOME`` elsewhere; the rest are the platform defaults.
+    """
+    out = []
+    env = os.environ.get("COPILOT_CACHE_HOME", "").strip()
+    if env:
+        base = Path(os.path.expanduser(env))
+        out += [base / _COPILOT_CACHE_FILE, base / "copilot" / _COPILOT_CACHE_FILE]
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        if local:
+            out.append(Path(local) / "copilot" / _COPILOT_CACHE_FILE)
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        if xdg:
+            out.append(Path(os.path.expanduser(xdg)) / "copilot" / _COPILOT_CACHE_FILE)
+        if sys.platform == "darwin":
+            out.append(Path.home() / "Library" / "Caches" / "copilot" / _COPILOT_CACHE_FILE)
+        out.append(Path.home() / ".cache" / "copilot" / _COPILOT_CACHE_FILE)
+    out.append(_copilot_home() / _COPILOT_CACHE_FILE)
+    return out
+
+
+def _copilot_cache_path():
+    """The account record file: the first candidate that exists, else the first."""
+    candidates = _copilot_cache_candidates()
+    for p in candidates:
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    return candidates[0]
+
+
+def _read_copilot_json(path, limit=_PROVIDER_FILE_MAX):
+    """Read one of Copilot CLI's own JSON files: ``(data, stat)``.
+
+    Copilot starts the files it manages with ``//`` comment lines ("Managed
+    automatically."), which JSON does not allow, so whole-line comments are
+    dropped when the plain parse fails. A JSON string cannot span lines, so a
+    line that begins with ``//`` is never data. data is None when oversized.
+    """
+    st = os.stat(path)
+    if st.st_size > limit:
+        return None, st
+    with open(path, "r", encoding="utf-8-sig") as f:
+        text = f.read()
+    try:
+        return json.loads(text), st
+    except ValueError:
+        kept = [ln for ln in text.splitlines() if not ln.lstrip().startswith("//")]
+        return json.loads("\n".join(kept)), st
+
+
+def _copilot_active_login(home=None):
+    """The account Copilot CLI is signed in as (lower-cased), or None.
+
+    ``config.json`` names it under ``lastLoggedInUser``. Only the login is
+    read; it picks the matching record and is never printed.
+    """
+    try:
+        data, _ = _read_copilot_json(Path(home or _copilot_home()) / "config.json")
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    user = data.get("lastLoggedInUser")
+    if isinstance(user, dict) and isinstance(user.get("login"), str):
+        return user["login"].strip().lower() or None
+    return None
+
+
+def _copilot_number(value):
+    """A finite float, or None for anything else (booleans included)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _copilot_plan_label(resp):
+    """'Free', 'Business', 'Enterprise', ... from the record, or None."""
+    sku = str(resp.get("access_type_sku") or "").lower()
+    plan = str(resp.get("copilot_plan") or "").lower()
+    if "free" in sku:
+        return "Free"
+    if plan in _COPILOT_PLAN_NAMES:
+        return _COPILOT_PLAN_NAMES[plan]
+    if "edu" in sku or "student" in sku:
+        return "Student"
+    if "max" in sku:
+        return "Max"
+    if "plus" in sku:
+        return "Pro+"
+    if "pro" in sku:
+        return "Pro"
+    return _clean_provider_label(plan.replace("_", " ").title()) if plan else None
+
+
+def _copilot_info(resp, data_ts=None, now=None):
+    """Normalise one Copilot account record. Never raises.
+
+    Returns None for something that is not a record, else::
+
+        {"state": "ok" | "no_licence",     # signed in without a Copilot seat
+         "plan": "Business" | None,
+         "unit": "AIC" | "req",            # AI credits, or premium requests
+         "unlimited": bool,                # no budget of its own (no bar)
+         "window": {"utilization", "resets_at"} | None,
+         "used": float | None, "limit": float | None,
+         "overage": float, "overage_ok": bool, "data_ts": float | None}
+
+    The plan budget is the ``premium_interactions`` snapshot on both billing
+    platforms; ``token_based_billing`` says which unit it counts. Copilot
+    Free has none, so its ``chat`` allowance is drawn instead (unit "chat").
+    """
+    if not isinstance(resp, dict):
+        return None
+    info = {"state": "ok", "plan": None, "unit": "req", "unlimited": False,
+            "window": None, "used": None, "limit": None,
+            "overage": 0.0, "overage_ok": False, "data_ts": data_ts}
+    try:
+        snaps = resp.get("quota_snapshots")
+        sku = str(resp.get("access_type_sku") or "").lower()
+        if sku == "no_access" or (resp.get("chat_enabled") is False
+                                  and not isinstance(snaps, dict)):
+            info["state"] = "no_licence"
+            return info
+        info["plan"] = _copilot_plan_label(resp)
+        snap = snaps.get(_COPILOT_BUDGET_SNAPSHOT) if isinstance(snaps, dict) else None
+        tbb = resp.get("token_based_billing") is True or (
+            isinstance(snap, dict) and snap.get("token_based_billing") is True)
+        info["unit"] = "AIC" if tbb else "req"
+        if not (isinstance(snap, dict) and (
+                snap.get("unlimited") is True
+                or (_copilot_number(snap.get("entitlement")) or 0) > 0)):
+            # Copilot Free has no premium allowance at all (entitlement 0);
+            # its monthly allowance is the "chat" snapshot, named as such.
+            chat = snaps.get("chat") if isinstance(snaps, dict) else None
+            if (isinstance(chat, dict) and chat.get("unlimited") is not True
+                    and (_copilot_number(chat.get("entitlement")) or 0) > 0):
+                snap = chat
+                info["unit"] = "chat"
+        if not isinstance(snap, dict):
+            return info
+        info["overage"] = max(0.0, _copilot_number(snap.get("overage_count")) or 0.0)
+        info["overage_ok"] = snap.get("overage_permitted") is True
+        limit = _copilot_number(snap.get("entitlement"))
+        if snap.get("unlimited") is True:
+            info["unlimited"] = True
+            return info
+        if limit is None or limit <= 0:
+            return info
+        remaining = _copilot_number(snap.get("remaining"))
+        if remaining is None:
+            remaining = _copilot_number(snap.get("quota_remaining"))
+        pct_left = _copilot_number(snap.get("percent_remaining"))
+        if pct_left is None:
+            if remaining is None:
+                return info
+            pct_left = remaining / limit * 100.0
+        pct_used = max(0.0, min(100.0, 100.0 - pct_left))
+        used = limit - remaining if remaining is not None else limit * pct_used / 100.0
+        reset = None
+        for cand in (resp.get("quota_reset_date_utc"), resp.get("quota_reset_date"),
+                     snap.get("quota_reset_at")):
+            if _parse_reset(cand) is not None:
+                reset = cand
+                break
+        window = _provider_window(pct_used, reset, now)
+        if window is None:
+            return info
+        if reset is not None and window.get("resets_at") is None:
+            # The budget rolled over since Copilot wrote the record.
+            used, info["overage"] = 0.0, 0.0
+        info["window"] = window
+        info["limit"] = limit
+        info["used"] = max(0.0, min(limit, used))
+    except Exception:
+        pass
+    return info
+
+
+def _read_copilot_quota(path=None, now=None, login=None):
+    """Read Copilot CLI's account record for one login.
+
+    ``path`` is the record file (default: ``_copilot_cache_path()``). ``login``
+    picks the account; the default is the one Copilot CLI is signed in as,
+    and with neither known the most recently fetched record. Another
+    account's numbers are never shown in place of a missing one. Returns
+    ``{"info", "data_ts", "tier"}`` or None when there is nothing usable.
+    """
+    try:
+        p = Path(os.path.expanduser(str(path))) if path else _copilot_cache_path()
+        data, st = _read_copilot_json(p)
+        records = data.get("copilotUserCache") if isinstance(data, dict) else None
+        if not isinstance(records, dict):
+            return None
+        want = (login.strip().lower() if isinstance(login, str) else "") \
+            or _copilot_active_login()
+        best, best_ts = None, -1.0
+        for rec in records.values():
+            resp = rec.get("response") if isinstance(rec, dict) else None
+            if not isinstance(resp, dict):
+                continue
+            if want and str(resp.get("login") or "").strip().lower() != want:
+                continue
+            try:
+                dt = _parse_reset(rec.get("retrievedAt"))
+                ts = dt.timestamp() if dt else 0.0
+            except (OverflowError, OSError, ValueError):
+                ts = 0.0
+            if ts > best_ts:
+                best, best_ts = resp, ts
+        if best is None:
+            return None
+        data_ts = best_ts if best_ts > 0 else st.st_mtime
+        info = _copilot_info(best, data_ts, now)
+        if info is None:
+            return None
+        return {"info": info, "data_ts": data_ts, "tier": info.get("plan")}
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        return None
+
+
+def _copilot_amount(value):
+    """1380 -> '1,380', 12.5 -> '12.5', 0.46 -> '0.46'."""
+    value = float(value)
+    if value >= 100 or value.is_integer():
+        return f"{value:,.0f}"
+    return f"{value:.1f}" if value >= 10 else f"{value:.2f}"
+
+
+def _copilot_reset_text(resets_at):
+    """A countdown inside the last day ('14h 22m'), else the date ('1 Dec')."""
+    dt = _parse_reset(resets_at)
+    if dt is None:
+        return None
+    try:
+        seconds = int(dt.timestamp() - time.time())
+        if seconds <= 0:
+            return None
+        if seconds < 86400:
+            return _weekly_countdown(seconds)
+        local = dt.astimezone()
+        return f"{local.day} {local.strftime('%b')}"
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _copilot_plan_parts(info, config, bar_width, stale=False, always_plan=False):
+    """``(head, tail)`` for a Copilot account, without its label.
+
+    head is the plan budget ("Plan ━━━━ 23%"), tail the amounts used and left
+    and the reset ("1,380/6,000 AIC · 4,620 left · R:1 Dec"). An account with
+    no budget of its own reads
+    "no limit", one signed in without a seat "no licence", and a missing
+    record ``--``. The plan name follows the ``plan`` widget, except where it
+    is the only thing to say (or ``always_plan``, inside Copilot CLI itself).
+    """
+    theme_name = config.get("theme", "default")
+    use_rainbow = theme_name == "rainbow" or config.get("animate", "off") in (True, "rainbow")
+    theme = THEMES["default"] if theme_name == "rainbow" else get_theme_colours(theme_name)
+    bstyle = config.get("bar_style", DEFAULT_BAR_STYLE)
+    layout = config.get("layout", DEFAULT_LAYOUT)
+    show = config.get("show", DEFAULT_SHOW)
+    word = {"compact": "P ", "minimal": "", "percent-first": ""}.get(layout, "Plan ")
+    if not isinstance(info, dict):
+        return f"{word}{DIM}--{RESET}", ""
+    if info.get("state") == "no_licence":
+        return f"{DIM}no licence{RESET}", ""
+    plan = info.get("plan")
+    tier = f"{DIM}{plan}{RESET}" if plan else ""
+    window = info.get("window")
+    if not isinstance(window, dict) or window.get("utilization") is None:
+        text = "no limit" if info.get("unlimited") else "--"
+        return f"{word}{DIM}{text}{RESET}", tier
+    pct = window.get("utilization") or 0
+    bar = make_bar(pct, theme, plain=use_rainbow and not stale, width=bar_width,
+                   bar_style=bstyle, flash_color=DIM if stale else None, config=config)
+    pct_txt = f"{DIM}~{pct:.0f}%{RESET}" if stale else f"{pct:.0f}%"
+    head = f"{pct_txt} {bar}" if layout == "percent-first" else f"{word}{bar} {pct_txt}"
+    bits = []
+    used, limit = info.get("used"), info.get("limit")
+    if used is not None and limit:
+        # Used, the allowance, and what is left of it: "69/300 req · 231 left".
+        bits.append(f"{_copilot_amount(used)}/{_copilot_amount(limit)} {info.get('unit') or 'req'}")
+        bits.append(f"{_copilot_amount(max(0.0, limit - used))} left")
+    if (info.get("overage") or 0) > 0:
+        bits.append(f"+{_copilot_amount(info['overage'])} extra")
+    if show.get("weekly_timer", True):
+        reset = _copilot_reset_text(window.get("resets_at"))
+        if reset:
+            prefix = _sanitize(str(config.get("weekly_timer_prefix", DEFAULT_WEEKLY_TIMER_PREFIX)))[:10]
+            bits.append(f"{prefix}{reset}")
+    tail = " · ".join(bits)
+    if tier and (always_plan or show.get("plan", False)):
+        tail = f"{tail} {tier}" if tail else tier
+    return head, tail
+
+
+def _render_copilot_row(label, info, config, label_width, bar_width, stale=False):
+    """``(head, tail)`` for a Copilot row under the main line."""
+    head, tail = _copilot_plan_parts(info, config, bar_width, stale)
+    return f"{label.ljust(label_width)} {head}", tail
+
+
+def _copilot_session_credits(payload):
+    """AI credits this Copilot session has used, from ``ai_used``; else None.
+
+    Copilot CLI 1.0.109 sends ``{"total_nano_aiu": N, "formatted": "0.46"}``,
+    the figure its own footer shows ("Session: N AIC used"); 10^9 nano AIU are
+    one credit. A bare number, a number in text, or another object holding
+    one are read too, should the shape change.
+    """
+    raw = payload.get("ai_used") if isinstance(payload, dict) else None
+    num = _copilot_number(raw)
+    if num is None and isinstance(raw, str):
+        m = re.search(r"\d+(?:\.\d+)?", raw.replace(",", ""))
+        num = _copilot_number(m.group(0)) if m else None
+    if num is None and isinstance(raw, dict):
+        for key in ("total_nano_aiu", "nano_aiu", "totalNanoAiu"):
+            nano = _copilot_number(raw.get(key))
+            if nano is not None:
+                num = nano / 1e9
+                break
+        if num is None:
+            for key in ("ai_credits", "credits", "aic", "total", "used", "value"):
+                num = _copilot_number(raw.get(key))
+                if num is not None:
+                    break
+    return num if num is not None and num >= 0 else None
+
+
+def _copilot_session_requests(payload):
+    """Premium requests this session has cost (legacy billing), or None."""
+    cost = payload.get("cost") if isinstance(payload, dict) else None
+    num = _copilot_number(cost.get("total_premium_requests")) if isinstance(cost, dict) else None
+    return num if num is not None and num >= 0 else None
+
+
+def _copilot_context(payload, stdin_ctx):
+    """Fill the context widget from Copilot's own context fields.
+
+    Copilot leaves ``used_percentage`` and ``context_window_size`` empty until
+    the first reply, and they need not match its model badge. The
+    ``current_context_*`` / ``displayed_context_limit`` fields are the ones
+    its badge and /context show, so they win when present.
+    """
+    ctx = payload.get("context_window") if isinstance(payload, dict) else None
+    if not isinstance(ctx, dict):
+        return
+    pct = _copilot_number(ctx.get("current_context_used_percentage"))
+    if pct is not None:
+        stdin_ctx["context_pct"] = max(0.0, min(100.0, pct))
+    used = _copilot_number(ctx.get("current_context_tokens"))
+    limit = _copilot_number(ctx.get("displayed_context_limit"))
+    if used is not None and limit is not None and limit > 0:
+        stdin_ctx["context_used"] = int(used)
+        stdin_ctx["context_limit"] = int(limit)
+
+
+def copilot_status_line(raw_stdin, config, now=None):
+    """The status line when GitHub Copilot CLI runs the script (--host copilot).
+
+    Copilot CLI pipes in nearly the same session JSON as Claude Code (model,
+    context window, working folder), so the session widgets come from the
+    ordinary renderer. What it does not send is the account's usage: the plan
+    budget is read from Copilot's own record on disk, for the account the
+    payload names (``username`` is usually null, so in practice the one
+    Copilot's config.json says is signed in). Never reads a Claude
+    credential, never calls a usage API and never touches Claude Code's
+    settings.
+    """
+    stdin_ctx = _parse_stdin_context(raw_stdin)
+    payload = {}
+    try:
+        parsed = json.loads(raw_stdin) if raw_stdin and raw_stdin.strip() else {}
+        if isinstance(parsed, dict):
+            payload = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+    except (ValueError, RecursionError):
+        pass
+    _copilot_context(payload, stdin_ctx)
+    cfg = dict(config)
+    user_show = config.get("show", DEFAULT_SHOW)
+    show = {key: False for key in DEFAULT_SHOW}
+    for key in _COPILOT_HOST_PARTS:
+        show[key] = bool(user_show.get(key, DEFAULT_SHOW.get(key, False)))
+    show["weekly_timer"] = bool(user_show.get("weekly_timer", True))
+    cfg["show"] = show
+    cfg["providers"] = []          # the rows under the bar belong to Claude Code
+
+    now = time.time() if now is None else now
+    info, stale = None, False
+    try:
+        login = payload.get("username")
+        quota = _read_copilot_quota(None, now, login=login if isinstance(login, str) else None)
+        if quota:
+            info = quota["info"]
+            stale = bool(quota["data_ts"] and now - quota["data_ts"] > _COPILOT_STALE_AFTER)
+    except Exception:
+        info = None
+    bar_width, _fit = _bar_width_setting(cfg)
+    head, tail = _copilot_plan_parts(info, cfg, bar_width, stale, always_plan=True)
+    parts = [f"{head} {tail}".strip()]
+    # What this session has cost, in the unit the account is billed in. An
+    # account without a seat cannot run anything, so it has nothing to count.
+    if not (isinstance(info, dict) and info.get("state") == "no_licence"):
+        requests = _copilot_session_requests(payload)
+        credits = _copilot_session_credits(payload)
+        if isinstance(info, dict) and info.get("unit") == "req" and requests is not None:
+            parts.append(f"Session {_copilot_amount(requests)} req")
+        elif credits is not None:
+            parts.append(f"Session {_copilot_amount(credits)} AIC")
+    front = " | ".join(parts)
+    theme_name = cfg.get("theme", "default")
+    animate_raw = cfg.get("animate", "off")
+    if theme_name == "rainbow" or animate_raw in (True, "rainbow"):
+        front = rainbow_colorize(front, color_all=False,
+                                 shimmer=animate_raw not in ("off", False, None), config=cfg)
+    else:
+        text_color = resolve_text_color(cfg)
+        if text_color:
+            front = apply_text_color(front, text_color)
+    rest = build_status_line({}, "", cfg, stdin_ctx, cache_age=None)
+    line = f"{front} | {rest}" if _strip_ansi(rest).strip() else front
+    return _fit_line(line, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -9973,8 +10447,11 @@ def _render_provider_rows(config, now=None, main_col=None):
         return [], None
     label_width = _provider_label_width(config, entries)
     bar_width = _provider_bar_width(config, label_width)
-    built = [_render_provider_row(r["label"], r["usage"], config, label_width, bar_width,
-                                  stale=r["stale"], tier=r.get("tier"))
+    built = [(_render_copilot_row(r["label"], r.get("copilot"), config, label_width,
+                                  bar_width, stale=r["stale"])
+              if r["entry"]["type"] == "copilot" else
+              _render_provider_row(r["label"], r["usage"], config, label_width, bar_width,
+                                   stale=r["stale"], tier=r.get("tier")))
              for r in rows]
     col = max(_visible_len(head) for head, _ in built)
     if main_col and main_col > col:
@@ -10606,6 +11083,150 @@ def _without_pulse_entries(entries):
         if entry is not None:
             kept.append(entry)
     return kept
+
+
+def _copilot_settings_path():
+    """Copilot CLI's user settings file."""
+    return _copilot_home() / "settings.json"
+
+
+def _copilot_status_command():
+    """The ``statusLine.command`` text for GitHub Copilot CLI.
+
+    Copilot CLI runs it through cmd.exe on Windows and ``sh`` elsewhere, so
+    plain double quotes (Windows) or shell quoting (elsewhere) is all it needs.
+    """
+    script = Path(__file__).resolve()
+    if sys.platform == "win32":
+        python_cmd = _windows_py_launcher()
+        if not python_cmd:
+            exe = sys.executable
+            if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+                exe = getattr(sys, "_base_executable", None) or exe
+            python_cmd = f'"{exe}"'
+        return f'{python_cmd} "{script}" --host copilot'
+    import shlex
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} --host copilot"
+
+
+def _load_copilot_settings(settings_path):
+    """``(settings, None)``, ``{}`` for a missing file, or ``(None, message)``.
+
+    Copilot CLI's whole configuration lives in this file, so one that cannot
+    be read as a JSON object is never written over.
+    """
+    if not settings_path.exists():
+        return {}, None
+    try:
+        with open(settings_path, "r", encoding="utf-8-sig") as f:
+            settings = json.load(f)
+    except ValueError:
+        return None, f"{settings_path} is not plain JSON. Fix it, then run this again."
+    except OSError as e:
+        return None, f"Cannot read {settings_path}: {e}"
+    if not isinstance(settings, dict):
+        return None, f"{settings_path} is not a JSON object. Fix it, then run this again."
+    return settings, None
+
+
+def _is_our_copilot_status_line(value):
+    return isinstance(value, dict) and "claude_status.py" in str(value.get("command", ""))
+
+
+def cmd_install_copilot():
+    """``--install-copilot``: make this script GitHub Copilot CLI's status line.
+
+    Writes ``statusLine`` into Copilot CLI's ``settings.json`` (``$COPILOT_HOME``
+    or ``~/.copilot``), keeping every other setting and a backup copy. Another
+    tool's status-line command is replaced, as ``--install`` does for Claude
+    Code. Nothing of Claude Code's is touched. Returns a process exit code.
+    """
+    settings_path = _copilot_settings_path()
+    if not settings_path.parent.is_dir():
+        print(f"Error: {settings_path.parent} was not found. Run GitHub Copilot CLI once, "
+              "then run this again.", file=sys.stderr)
+        return 1
+    settings, error = _load_copilot_settings(settings_path)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    command = _copilot_status_command()
+    existing = settings.get("statusLine")
+    status_line = existing if _is_our_copilot_status_line(existing) else {}
+    status_line["type"] = "command"
+    status_line["command"] = command
+    interval = _desired_refresh_interval(load_config())
+    if interval is not None:
+        status_line["refreshInterval"] = interval
+    else:
+        status_line.pop("refreshInterval", None)
+    settings["statusLine"] = status_line
+    # Copilot's /statusline picker can hide the custom line; installing means
+    # the user wants to see it.
+    footer = settings.get("footer")
+    reshown = isinstance(footer, dict) and footer.get("showCustom") is False
+    if reshown:
+        footer["showCustom"] = True
+    backup = _backup_settings(settings_path)
+    try:
+        _atomic_json_write(settings_path, settings)
+    except OSError as e:
+        print(f"Error: cannot write {settings_path}: {e}", file=sys.stderr)
+        return 1
+    utf8_print(f"Installed the status line for GitHub Copilot CLI in {settings_path}")
+    if backup:
+        utf8_print(f"Previous settings.json kept at {backup}")
+    utf8_print(f"Command: {command}")
+    if reshown:
+        utf8_print("Turned the custom status line back on (it was hidden in /statusline).")
+    if interval is not None:
+        utf8_print(f"Refresh: every {interval}s (plus Copilot CLI's own events)")
+    utf8_print("Restart Copilot CLI to see it. The plan budget comes from Copilot's own record;")
+    utf8_print("no token is read and nothing is sent anywhere.")
+    return 0
+
+
+def cmd_uninstall_copilot():
+    """``--uninstall-copilot``: take the status line out of Copilot CLI's settings.
+
+    Only a ``statusLine`` that runs this script is removed; another tool's is
+    left alone. Returns a process exit code.
+    """
+    settings_path = _copilot_settings_path()
+    settings, error = _load_copilot_settings(settings_path)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    if not _is_our_copilot_status_line(settings.get("statusLine")):
+        utf8_print("usage-pulse is not GitHub Copilot CLI's status line; nothing changed.")
+        return 0
+    del settings["statusLine"]
+    backup = _backup_settings(settings_path)
+    try:
+        _atomic_json_write(settings_path, settings)
+    except OSError as e:
+        print(f"Error: cannot write {settings_path}: {e}", file=sys.stderr)
+        return 1
+    utf8_print(f"Removed the status line from {settings_path}")
+    if backup:
+        utf8_print(f"Previous settings.json kept at {backup}")
+    return 0
+
+
+def _copilot_host_main():
+    """Entry point for ``--host copilot``: print the line, or nothing.
+
+    Copilot CLI warns about a status-line command that exits non-zero, so a
+    failure here ends as an empty line with exit code 0.
+    """
+    try:
+        raw = ""
+        if not sys.stdin.isatty():
+            raw = _read_stdin_text(1_000_000)
+        line = copilot_status_line(raw, load_config())
+        sys.stdout.buffer.write((line + RESET + "\n").encode("utf-8", "replace"))
+    except Exception:
+        pass
 
 
 def cmd_uninstall():
@@ -12406,6 +13027,28 @@ def detect_providers(config=None):
         except Exception:
             continue
 
+    # GitHub Copilot CLI: its own record of the signed-in account
+    try:
+        conf = configured.get("copilot") or {}
+        record = _provider_location({"type": "copilot", "path": conf.get("path")})
+        if record.is_file() and "copilot" not in used_ids:
+            r = _read_copilot_quota(record, now) or {}
+            info = r.get("info") or {}
+            licensed = bool(r) and info.get("state") != "no_licence"
+            if not r:
+                note = "no record for the signed-in account yet"
+            elif not licensed:
+                note = "signed in without a Copilot licence"
+            else:
+                note = "ok"
+            _add({"id": "copilot", "type": "copilot", "label": "Copilot",
+                  "path": _tilde(record), "active": False, "enabled": licensed,
+                  "tier": r.get("tier"),
+                  "age_seconds": _age_seconds(r.get("data_ts") or record.stat().st_mtime, now),
+                  "note": note})
+    except Exception:
+        pass
+
     # MiniMax
     try:
         if shutil.which("mmx"):
@@ -12437,7 +13080,9 @@ def _provider_entry_from_detected(item):
     entry = {"id": item["id"], "type": item["type"], "enabled": True}
     if item.get("label"):
         entry["label"] = item["label"]
-    if item.get("path"):
+    # A Copilot row finds its record afresh each time (Copilot can move it),
+    # so the detected path is for display only.
+    if item.get("path") and item["type"] != "copilot":
         entry["dir" if item["type"] == "claude" else "path"] = item["path"]
     return entry
 
@@ -12516,7 +13161,7 @@ def cmd_detect_providers(as_json=False):
         sys.stdout.write(json.dumps(items, indent=2) + "\n")
         return
     if not items:
-        utf8_print("No other subscriptions found (Claude accounts, Codex, Gemini/Antigravity, MiniMax).")
+        utf8_print("No other subscriptions found (Claude accounts, Codex, Gemini/Antigravity, Copilot, MiniMax).")
         return
     utf8_print(f"\n{BOLD}Subscriptions on this machine{RESET}\n")
     _print_provider_table(items)
@@ -12715,7 +13360,9 @@ CLI_FLAGS = [
     ("--budget", "<amount|off>", "Widgets", "Spend budget to match --max-budget-usd"),
     ("--limits", "[key=N,...]", "Widgets", "Subagent and web-search caps used as denominators"),
     ("--focus", "<start [min]|stop|status>", "Widgets", "Focus (pomodoro) timer"),
-    ("--detect-providers", "[--json]", "Providers", "Find other Claude accounts, Codex, Gemini and MiniMax on this machine"),
+    ("--install-copilot", "", "Setup", "Use this bar as GitHub Copilot CLI's status line (writes ~/.copilot/settings.json)"),
+    ("--uninstall-copilot", "", "Setup", "Remove the bar from GitHub Copilot CLI's settings"),
+    ("--detect-providers", "[--json]", "Providers", "Find other Claude accounts, Codex, Gemini, Copilot and MiniMax on this machine"),
     ("--providers", "<list|detect|enable|disable|label|remove|add-file> [...]", "Providers",
      "Manage the extra status rows: --providers help lists the sub-commands"),
     ("--install-hooks", "[--only heartbeat,agents,team]", "Hooks", "Install hooks (all three groups unless --only)"),
@@ -12723,6 +13370,7 @@ CLI_FLAGS = [
     ("--stats", "", "Info", "Usage statistics and streaks"),
     ("--heatmap", "", "Info", "Usage heatmap"),
     ("--debug-stdin", "", "Info", "Save and parse the JSON Claude Code pipes in"),
+    ("--host", "copilot", "Internal", "Status line for GitHub Copilot CLI (run by Copilot CLI)"),
     ("--subagent-status-line", "", "Internal", "Agent-panel rows (run by Claude Code)"),
     ("--hook-refresh", "[tool]", "Internal", "PostToolUse hook"),
     ("--hook-subagent-start", "", "Internal", "SubagentStart hook"),
@@ -12855,6 +13503,29 @@ def main():
 
     if "--uninstall" in args:
         code = cmd_uninstall()
+        if code:
+            sys.exit(code)
+        return
+
+    # GitHub Copilot CLI runs the script with --host copilot. Handled before
+    # anything that reads or repairs Claude Code's own settings.
+    if "--host" in args:
+        idx = args.index("--host")
+        host = args[idx + 1].strip().lower() if idx + 1 < len(args) else ""
+        if host != "copilot":
+            utf8_print(f"Unknown host: {_sanitize(host) or '(none)'}  (supported: copilot)")
+            sys.exit(2)
+        _copilot_host_main()
+        return
+
+    if "--install-copilot" in args:
+        code = cmd_install_copilot()
+        if code:
+            sys.exit(code)
+        return
+
+    if "--uninstall-copilot" in args:
+        code = cmd_uninstall_copilot()
         if code:
             sys.exit(code)
         return

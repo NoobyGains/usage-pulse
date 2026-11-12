@@ -1,7 +1,7 @@
 {
   "name": "usage-pulse",
   "description": "Usage Pulse: a live usage status bar for Claude Code. Session and weekly limits, your other accounts and tools on their own rows, cost, context, agents, 10 themes, zero API calls",
-  "version": "3.8.0",
+  "version": "3.9.0",
   "author": {
     "name": "PigeonDroid"
   },

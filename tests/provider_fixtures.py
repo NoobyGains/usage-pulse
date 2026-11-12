@@ -41,7 +41,8 @@ class ProviderSandbox:
         p = mock.patch.dict(os.environ, env)
         p.start()
         testcase.addCleanup(p.stop)
-        for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+        for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+                    "COPILOT_HOME", "COPILOT_CACHE_HOME"):
             os.environ.pop(var, None)
         p = mock.patch.object(cs, "get_state_dir", lambda: self.state)
         p.start()
@@ -103,6 +104,67 @@ class ProviderSandbox:
         if mtime is not None:
             os.utime(f, (mtime, mtime))
         return f
+
+
+def copilot_snapshot(entitlement=300, remaining=231, pct_left=77.0, unlimited=False,
+                     overage=0, overage_ok=False, tbb=None, **extra):
+    """One ``quota_snapshots`` entry as Copilot CLI caches it."""
+    snap = {"entitlement": entitlement, "remaining": remaining, "quota_remaining": remaining,
+            "percent_remaining": pct_left, "unlimited": unlimited, "overage_count": overage,
+            "overage_permitted": overage_ok, "quota_id": "premium_interactions",
+            "has_quota": True}
+    if tbb is not None:
+        snap["token_based_billing"] = tbb
+    snap.update(extra)
+    return {k: v for k, v in snap.items() if v is not None}
+
+
+def copilot_record(login, sku="monthly_subscriber", plan="individual", budget=None,
+                   tbb=None, retrieved=-60, reset="2999-01-01T00:00:00Z", **extra):
+    """One account entry of ``copilot-user-cache.json``."""
+    resp = {"login": login, "access_type_sku": sku, "copilot_plan": plan,
+            "chat_enabled": sku != "no_access"}
+    if budget is not None:
+        resp["quota_snapshots"] = {
+            "chat": copilot_snapshot(1, 1, 100, unlimited=True),
+            "premium_interactions": budget}
+        resp["quota_reset_date_utc"] = reset
+    if tbb is not None:
+        resp["token_based_billing"] = tbb
+    resp.update(extra)
+    return {"schemaVersion": 1, "retrievedAt": iso_z(retrieved), "response": resp}
+
+
+# Copilot CLI writes these comment lines at the top of the files it manages.
+COPILOT_CACHE_HEADER = ("// Disposable cache for Copilot user responses, safe to delete. "
+                        "Managed automatically.\n// User settings belong in settings.json.\n")
+COPILOT_CONFIG_HEADER = ("// User settings belong in settings.json.\n"
+                         "// This file is managed automatically.\n")
+
+
+def write_copilot(records, active=None, header=True):
+    """Write Copilot CLI's record file and config.json into the sandbox.
+
+    ``records`` is a list of ``copilot_record()``; ``active`` is the login
+    config.json names as signed in. Both files get the ``//`` comment lines
+    Copilot really writes (``header=False`` for plain JSON), pretty-printed as
+    it does. Returns the record file's path.
+    """
+    path = cs._copilot_cache_candidates()[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"copilotUserCache": {
+        f"v1:{i:064x}": rec for i, rec in enumerate(records)}}, indent=2)
+    path.write_text((COPILOT_CACHE_HEADER if header else "") + body, encoding="utf-8")
+    home = cs._copilot_home()
+    home.mkdir(parents=True, exist_ok=True)
+    if active is not None:
+        body = json.dumps({
+            "trustedFolders": ["/"],
+            "lastLoggedInUser": {"host": "https://github.com", "login": active},
+            "loggedInUsers": [{"host": "https://github.com", "login": active}]}, indent=2)
+        (home / "config.json").write_text(
+            (COPILOT_CONFIG_HEADER if header else "") + body, encoding="utf-8")
+    return path
 
 
 def codex_line(used5=29.0, usedw=5.0, limit_id="codex", reset5=None, resetw=None,

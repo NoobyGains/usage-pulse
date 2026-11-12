@@ -12,6 +12,13 @@ Ideas, not promises:
 - Reading `~/.claude/tasks/<team>/` so the team widget can show task subjects.
 - A `skills/` layout for the plugin.
 
+## [3.9.0] - 2026-11-12
+
+### Added
+
+- **The bar runs inside GitHub Copilot CLI.** `--install-copilot` writes one `statusLine` entry into Copilot CLI's `settings.json` (`~/.copilot` or `$COPILOT_HOME`), keeping every other setting and a backup; `--uninstall-copilot` takes it out. Copilot CLI then runs the script with `--host copilot`, and the line shows the plan budget, what the session has cost, context, model, branch and lines changed in your theme, bar style and layout. The plan budget reads `Plan ━━━── 23% 69/300 req · 231 left · R:1 Dec Pro`: used, the allowance, what is left, any extra usage and the reset date, in AI credits or, on the legacy billing platform, premium requests. A seat with no budget of its own reads `no limit`, Copilot Free shows its monthly chat allowance, and an account signed in without a licence says `no licence`. Everything comes from the record Copilot CLI keeps on disk for the signed-in account and from what it pipes in: no token is read, no request is made, and Claude Code's settings, hooks and caches are never touched on this path. Widgets that only describe a Claude Code session are left out.
+- **A Copilot row under the Claude Code bar.** `copilot` is a new provider type: `--detect-providers` finds Copilot CLI's record and `--providers enable copilot` adds a row with the same plan bar. A record older than a day is drawn dim, and an account without a licence is found but left off.
+
 ## [3.8.0] - 2026-11-08
 
 ### Added

@@ -53,6 +53,8 @@ Save the path as SCRIPT_PATH. If no PY was found, use `python` (Windows) or `pyt
 | `pace-style <arrows/percent>` | `--pace-style <value>` |
 | `caps`, `models`, `model caps` | Caps question (5.4), then `--show`/`--hide opus,sonnet,fable` |
 | `providers`, `accounts`, `detect` | Providers path (section 6) |
+| `copilot`, `copilot install` | `--install-copilot`: makes this bar GitHub Copilot CLI's status line too (writes only Copilot's `settings.json`, keeps a backup). Say Copilot CLI needs a restart. For a Copilot row under the Claude bar instead, use the Providers path |
+| `copilot remove`, `copilot uninstall` | `--uninstall-copilot` |
 | `providers label <id> <text>` | `--providers label <id> "<text>"` |
 | `providers enable <ids>` / `disable <ids>` | `--providers enable <ids>` / `--providers disable <ids>` |
 | `hooks` | Hooks question (5.2) |
@@ -148,14 +150,14 @@ Apply with one `--show a,b,c`. If Budget was picked, ask for the amount and run 
 
 ## 6. Providers path (other accounts and tools)
 
-Providers add one row each under the main line: another Claude account (a second `CLAUDE_CONFIG_DIR`), Codex, Gemini/Antigravity, MiniMax, or a JSON file you point at.
+Providers add one row each under the main line: another Claude account (a second `CLAUDE_CONFIG_DIR`), Codex, Gemini/Antigravity, GitHub Copilot, MiniMax, or a JSON file you point at.
 
 1. Run `PY "SCRIPT_PATH" --detect-providers --json`. It prints a JSON list of rows: `id`, `type`, `label`, `path`, `active`, `enabled`, `tier`, `age_seconds`, `note`. If the flag is unknown, the version is too old: suggest `/pulse update`.
-2. If the list is empty, say what was looked for: other `~/.claude*` account dirs, a Codex login or sessions in `~/.codex`, Antigravity's status file in `~/.gemini`, and the `mmx` CLI. Mention `--providers add-file <id> <path> [label]` for anything else that can write a `five_hour`/`seven_day` JSON file. Stop.
+2. If the list is empty, say what was looked for: other `~/.claude*` account dirs, a Codex login or sessions in `~/.codex`, Antigravity's status file in `~/.gemini`, Copilot CLI's account record, and the `mmx` CLI. Mention `--providers add-file <id> <path> [label]` for anything else that can write a `five_hour`/`seven_day` JSON file. Stop.
 3. Ask a multi-select of the found rows (at most 4 per page): label as the option, `type · path` as the description. Pre-select rows already `enabled`, plus new non-`active` ones except MiniMax. Mark the `active` row as "this account, already the main line".
 4. Run `--providers enable <ids>` for the newly picked and `--providers disable <ids>` for unpicked rows that were enabled.
 5. Offer renames: "Want different labels?" If yes, run `--providers label <id> "<text>"` for each (24 characters max).
-6. Explain: rows are read-only. The Codex row asks chatgpt.com with the Codex CLI's own login every few minutes, never refreshes it, and falls back to the local session files. Gemini rows read local files. Another Claude account's row asks api.anthropic.com with that account's own token, at most every few minutes, and never refreshes the token. MiniMax runs its `mmx` CLI, so it is only on when you pick it.
+6. Explain: rows are read-only. The Codex row asks chatgpt.com with the Codex CLI's own login every few minutes, never refreshes it, and falls back to the local session files. Gemini rows read local files. The Copilot row reads the record Copilot CLI keeps on disk (no token, no network) and shows the monthly plan budget: used, allowance and what is left. Another Claude account's row asks api.anthropic.com with that account's own token, at most every few minutes, and never refreshes the token. MiniMax runs its `mmx` CLI, so it is only on when you pick it.
 
 `--providers list` shows the current set.
 

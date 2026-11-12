@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/brand/hero.png" alt="Usage Pulse: the live usage status bar for Claude Code" width="800">
+  <img src="assets/brand/hero.png" alt="Usage Pulse: the live usage status bar for Claude Code and GitHub Copilot CLI" width="800">
 </p>
 
 <p align="center">
-  <strong>Every limit, cost and agent, live under your prompt. Plus every other AI subscription you pay for.</strong>
+  <strong>Every limit, cost and agent, live under your prompt in Claude Code and GitHub Copilot CLI. Plus every other AI subscription you pay for.</strong>
 </p>
 
 <p align="center">
@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
   <img src="https://img.shields.io/badge/dependencies-zero-22c55e?style=flat-square" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/Claude%20Code-2.1.80%2B-7C3AED?style=flat-square" alt="Claude Code 2.1.80+">
+  <img src="https://img.shields.io/badge/GitHub%20Copilot%20CLI-tested%20on%201.0.109-181717?style=flat-square&logo=githubcopilot&logoColor=white" alt="GitHub Copilot CLI, tested on 1.0.109">
   <img src="https://img.shields.io/badge/Windows%20%7C%20macOS%20%7C%20Linux-informational?style=flat-square&color=64748b" alt="Windows, macOS, Linux">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/NoobyGains/usage-pulse?style=flat-square&color=0ea5e9" alt="License"></a>
 </p>
@@ -20,6 +21,7 @@
   <a href="#install">Install</a> •
   <a href="#see-it-in-action">Demos</a> •
   <a href="#every-subscription-one-screen">Providers</a> •
+  <a href="#inside-github-copilot-cli">Copilot CLI</a> •
   <a href="#themes-animation-and-layout">Themes</a> •
   <a href="#widgets">Widgets</a> •
   <a href="#agents-and-teams">Agents</a> •
@@ -34,6 +36,13 @@
 > [!TIP]
 > One minute from zero to a live bar: `/plugin install usage-pulse --marketplace NoobyGains/usage-pulse`, then `/usage-pulse:setup`, then restart Claude Code.
 
+> [!NOTE]
+> **Works in GitHub Copilot CLI too (3.9.0).** One command puts the same bar, in your theme, in Copilot CLI's footer, with your plan budget: premium requests or AI credits used, the allowance, what is left and when it resets. It reads only what Copilot CLI already keeps on your machine: no token, no network call. Claude Code is not required. See [Inside GitHub Copilot CLI](#inside-github-copilot-cli).
+>
+> ```
+> Plan ━━━───────── 23% 69/300 req · 231 left · R:1 Dec Pro | Session 3 req | Context ━━━━━─────── 42% | GPT-5.4 · medium | main
+> ```
+
 ## Why Usage Pulse
 
 <table>
@@ -44,7 +53,7 @@
     </td>
     <td width="33%" valign="top">
       <h3>🧭 Every subscription on one screen</h3>
-      A second Claude account, Codex, Gemini / Antigravity, MiniMax or any JSON file gets its own row, found for you and drawn in the same theme.
+      A second Claude account, Codex, GitHub Copilot, Gemini / Antigravity, MiniMax or any JSON file gets its own row, found for you and drawn in the same theme.
     </td>
     <td width="33%" valign="top">
       <h3>💸 Costs you can compare</h3>
@@ -62,7 +71,7 @@
     </td>
     <td width="33%" valign="top">
       <h3>🪶 One file</h3>
-      A single Python script, zero dependencies, Python 3.8+, Windows, macOS and Linux. Installs in a minute, updates itself with <code>--update</code>.
+      A single Python script, zero dependencies, Python 3.8+, Windows, macOS and Linux. The same file drives Claude Code and GitHub Copilot CLI. Installs in a minute, updates itself with <code>--update</code>.
     </td>
   </tr>
 </table>
@@ -91,6 +100,16 @@ irm https://raw.githubusercontent.com/NoobyGains/usage-pulse/main/install.ps1 | 
 ```
 
 Both clone the repo to `~/.usage-pulse` and open the setup wizard. Then restart Claude Code.
+
+**GitHub Copilot CLI**
+
+With usage-pulse installed any of the ways above, add the bar to Copilot CLI's footer and restart Copilot CLI:
+
+```bash
+python3 ~/.usage-pulse/claude_status.py --install-copilot
+```
+
+Inside Claude Code, `/pulse copilot` does the same. If you only use Copilot CLI, the clone under "By hand" below followed by this command is all you need: nothing of Claude Code's is read or written. What each kind of account shows is under [Inside GitHub Copilot CLI](#inside-github-copilot-cli).
 
 <details>
 <summary><b>By hand, installer variables, and what the plugin's hook does</b></summary>
@@ -588,6 +607,9 @@ Claude Code sends `rate_limits` on stdin, so the main bars need no OAuth call an
 | A provider row is missing | `--providers list` shows what is configured and `--detect-providers` what exists. Check that the `providers` widget is on |
 | A Claude, Codex or MiniMax row shows `~29%` with dim bars | The data is more than 30 minutes old. Use that account once, or wait for the next refresh. For Codex it usually means the login has expired: run any `codex` command |
 | A provider row shows `--` | The source could not be read yet: no token, a missing file, or no rate-limit data in the newest Codex session |
+| No bar in GitHub Copilot CLI | Run `--install-copilot` and restart Copilot CLI. In Copilot's `/statusline` picker, check that `custom` is ticked |
+| Copilot's `Plan` shows `--` | Copilot CLI has not saved a record for the signed-in account yet. Start Copilot CLI once while signed in |
+| Copilot's `Plan` numbers look behind | They come from the record Copilot CLI keeps on disk, which it refreshes itself, not after every prompt. `Session` is live |
 | "Rate limited" message | The main bars read stdin, so they keep working. API-backed parts back off before retrying |
 | `--update` says it cannot reach GitHub | Both the GitHub API and `git ls-remote` failed. Check the network; the unauthenticated API alone is not needed since 3.4.1 |
 | The bars are two characters wide | `--bar-size auto` is on, or the version is older than 3.6.0, which shrank bars to fit the window. Set a named size with `--bar-size large`; in a narrow window, `--wrap auto` puts the rest of the line on extra rows |

@@ -217,6 +217,94 @@ class Claude55PricingTest(unittest.TestCase):
             self.assertEqual(cs._pricing_for("claude-haiku-5-5", prompt_tokens=junk)["input"], 0.10)
 
 
+class Claude52PricingTest(unittest.TestCase):
+    """Fable 5.2, Mythos 5.2 and Mythos 5.1 (issue #61). Without rows of their
+    own, the longest-prefix fallback priced them as Fable 5 / Mythos 5: $10 /
+    $50 with $1 cache hits. Rates per MTok from
+    https://platform.claude.com/docs/en/about-claude/pricing (read 2026-11-13).
+    """
+
+    # (input, output, cache hit, 5-minute cache write)
+    EXPECTED = {
+        "claude-fable-5-2": (8.0, 40.0, 0.20, 10.0),
+        "claude-mythos-5-2": (8.0, 40.0, 0.20, 10.0),
+        "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5),
+    }
+    DISPLAY = {
+        "claude-fable-5-2": "Fable 5.2",
+        "claude-mythos-5-2": "Mythos 5.2",
+        "claude-mythos-5-1": "Mythos 5.1",
+    }
+
+    def test_rates_match_the_pricing_page(self):
+        for model_id, (inp, out, cr, cw) in self.EXPECTED.items():
+            p = cs._pricing_for(model_id)
+            self.assertIsNotNone(p, model_id)
+            self.assertEqual(
+                (p["input"], p["output"], p["cache_read"], p["cache_write"]),
+                (inp, out, cr, cw), model_id)
+
+    def test_older_fable_and_mythos_rows_are_unchanged(self):
+        self.assertEqual(cs._pricing_for("claude-fable-5")["cache_read"], 1.0)
+        self.assertEqual(cs._pricing_for("claude-mythos-5")["cache_read"], 1.0)
+        self.assertEqual(cs._pricing_for("claude-fable-5-1")["input"], 10.0)
+
+    def test_names_and_context_windows(self):
+        for model_id, name in self.DISPLAY.items():
+            self.assertEqual(cs.API_PRICING_DISPLAY.get(model_id), name, model_id)
+            self.assertEqual(cs.MODEL_CONTEXT_WINDOWS.get(name), 1_000_000, name)
+        self.assertEqual(cs._model_short_name("claude-fable-5-2"), "Fable")
+        self.assertEqual(cs._model_short_name("claude-mythos-5-2"), "Mythos")
+        self.assertEqual(cs._model_short_name("claude-mythos-5-1"), "Mythos")
+
+    def _scan(self, entries):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sess = Path(td) / "projects" / "proj" / "session.jsonl"
+            sess.parent.mkdir(parents=True)
+            sess.write_text(
+                "\n".join(_json.dumps(e) for e in entries), encoding="utf-8"
+            )
+            with mock.patch.object(cs, "_claude_config_dir", lambda: Path(td)):
+                return cs._scan_session_costs()
+
+    @staticmethod
+    def _entry(model, n):
+        """One response with a million tokens of every kind, so each rate
+        shows up in the cost at face value."""
+        return {
+            "type": "assistant",
+            "timestamp": "2026-11-12T12:00:00Z",
+            "message": {"id": f"msg_{n}", "model": model, "usage": {
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+                "cache_read_input_tokens": 1_000_000,
+                "cache_creation_input_tokens": 2_000_000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 1_000_000,
+                                   "ephemeral_1h_input_tokens": 1_000_000},
+            }},
+        }
+
+    def test_transcript_lines_are_priced_at_their_own_rates(self):
+        """The issue's acceptance test: a claude-fable-5-2 line is priced at
+        $8 / $40 / $0.20 / $10, and the 1-hour write at 2x input ($16)."""
+        result = self._scan([self._entry(m, i) for i, m in enumerate(self.EXPECTED)])
+        for model_id, (inp, out, cr, cw) in self.EXPECTED.items():
+            self.assertIn(model_id, result["models"], model_id)
+            self.assertAlmostEqual(result["models"][model_id]["cost_usd"],
+                                   inp + out + cr + cw + 2 * inp, msg=model_id)
+        # Nothing fell through to the older family rows.
+        self.assertNotIn("claude-fable-5", result["models"])
+        self.assertNotIn("claude-mythos-5", result["models"])
+
+    def test_suffixed_id_resolves_to_the_52_row(self):
+        result = self._scan([self._entry("claude-fable-5-2-20261109", 0)])
+        self.assertEqual(list(result["models"]), ["claude-fable-5-2"])
+        self.assertAlmostEqual(result["models"]["claude-fable-5-2"]["cost_usd"],
+                               8 + 40 + 0.20 + 10 + 16)
+
+
 class TranscriptTimestampTest(unittest.TestCase):
     def test_z_suffix_parsed(self):
         """Claude Code writes Z-suffixed stamps; fromisoformat only accepted

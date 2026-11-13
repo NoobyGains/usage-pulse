@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code status line — reads usage data from Claude Code's stdin and displays real-time bars."""
 
-VERSION = "3.9.0"
+VERSION = "3.9.1"
 
 import base64
 import hashlib
@@ -135,8 +135,11 @@ PLAN_NAMES = {
 # Model id → short display name. Longest-prefix wins (see _model_short_name),
 # so "claude-opus-4-8" beats the bare "claude-opus-4" entry.
 MODEL_SHORT_NAMES = {
+    "claude-fable-5-2": "Fable",
     "claude-fable-5-1": "Fable",
     "claude-fable-5": "Fable",
+    "claude-mythos-5-2": "Mythos",
+    "claude-mythos-5-1": "Mythos",
     "claude-mythos-5": "Mythos",
     "claude-mythos-preview": "Mythos",
     "claude-opus-5-5": "Opus",
@@ -170,9 +173,12 @@ MODEL_CONTEXT_WINDOWS = {
     "Fable": 1_000_000,
     "Fable 5": 1_000_000,
     "Fable 5.1": 1_000_000,
+    "Fable 5.2": 1_000_000,
     "Mythos": 1_000_000,
     "Mythos Preview": 1_000_000,
     "Mythos 5": 1_000_000,
+    "Mythos 5.1": 1_000_000,
+    "Mythos 5.2": 1_000_000,
     "Opus": 1_000_000,
     "Opus 5": 1_000_000,
     "Opus 5.5": 1_000_000,
@@ -195,10 +201,15 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # API pricing per million tokens (USD).
 # https://platform.claude.com/docs/en/about-claude/pricing
 # Cache read is 0.1x input (0.05x for Opus 5.5 / Sonnet 5.5, 0.025x for
-# Fable 5.1); 5-minute cache write is 1.25x input.
+# Fable and Mythos 5.1 / 5.2); 5-minute cache write is 1.25x input.
+# Lookups fall back to the longest matching prefix, so a model missing here is
+# silently priced as its family's base row: give every new version its own.
 API_PRICING = {
+    "claude-fable-5-2": {"input": 8.0, "output": 40.0, "cache_read": 0.20, "cache_write": 10.0},
     "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
     "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    "claude-mythos-5-2": {"input": 8.0, "output": 40.0, "cache_read": 0.20, "cache_write": 10.0},
+    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
     "claude-mythos-5": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "claude-mythos-preview": {"input": 25.0, "output": 125.0, "cache_read": 2.5, "cache_write": 31.25},
     "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.20, "cache_write": 5.0},
@@ -228,8 +239,11 @@ API_PRICING = {
 }
 # Display names for pricing table
 API_PRICING_DISPLAY = {
+    "claude-fable-5-2": "Fable 5.2",
     "claude-fable-5-1": "Fable 5.1",
     "claude-fable-5": "Fable 5",
+    "claude-mythos-5-2": "Mythos 5.2",
+    "claude-mythos-5-1": "Mythos 5.1",
     "claude-mythos-5": "Mythos 5",
     "claude-mythos-preview": "Mythos Preview",
     "claude-opus-5-5": "Opus 5.5",
@@ -286,10 +300,11 @@ def _pricing_for(model_id, at=None, prompt_tokens=None):
     the long-context rates for models listed in ``API_PRICING_LONG_CONTEXT``
     (Haiku 5.5 above 100K). Left as None, the standard rates are returned.
 
-    Known limitation: fast mode bills Opus 5 / 4.8 at $10/$50 rather than
-    $5/$25, but transcripts do not record whether a request used it, so
-    historical scans price fast-mode turns at the standard rate and will
-    under-report them.
+    Known limitation: fast mode bills at a premium (Fable / Mythos 5.2 at
+    $16/$80 rather than $8/$40, Opus 5.5 at $8/$40, Opus 5 / 4.8 at $10/$50),
+    but transcripts do not record whether a request used it, so historical
+    scans price fast-mode turns at the standard rate and will under-report
+    them.
     """
     base = API_PRICING.get(model_id)
     if base is None:
@@ -7163,7 +7178,7 @@ _weekly_cost_mem = {"ts": 0, "data": {}}
 # process (_cost_refresh_worker) that scans and saves it. A claim file,
 # created with O_EXCL before the process starts, keeps every other repaint and
 # every other window from starting a second scan.
-_COST_CACHE_VERSION = 2  # bumped when the scan's sums change; older files are not drawn
+_COST_CACHE_VERSION = 3  # bumped when the scan's sums change; older files are not drawn (3: Fable/Mythos 5.2 and Mythos 5.1 rates)
 _COST_SCAN_LOCK_TTL = 300  # seconds a claim holds off a new scan (also the retry delay after a failure)
 # A claim taken by another window a moment after this one read the clock is
 # stamped slightly in this one's future. Up to this much counts as young; a

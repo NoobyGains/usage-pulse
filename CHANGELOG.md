@@ -12,6 +12,12 @@ Ideas, not promises:
 - Reading `~/.claude/tasks/<team>/` so the team widget can show task subjects.
 - A `skills/` layout for the plugin.
 
+## [3.9.1] - 2026-11-13
+
+### Fixed
+
+- **Fable 5.2, Mythos 5.2 and Mythos 5.1 are priced at their own rates** (#61). With no rows of their own they fell back to the Fable 5 / Mythos 5 price, $10 / $50 with $1 cache hits. A Fable 5.2 session therefore read a quarter too high on input, output and cache writes and five times too high on cache hits, which are most of a Claude Code session's tokens. They now cost $8 / $40 with $0.20 cache hits and $10 cache writes (Fable and Mythos 5.2) and $10 / $50 with $0.25 cache hits (Mythos 5.1), as on Anthropic's pricing page. The three models also get their display names and a 1M-token context window, which is used when Claude Code does not send the window size. Saved 7-day and all-time totals from earlier versions are not drawn; they are recounted at the new rates a few seconds after the first repaint.
+
 ## [3.9.0] - 2026-11-12
 
 ### Added

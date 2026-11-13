@@ -57,7 +57,7 @@
     </td>
     <td width="33%" valign="top">
       <h3>💸 Costs you can compare</h3>
-      API-equivalent spend per session in your currency, priced per model for Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5, with budget, 7-day and all-time views.
+      API-equivalent spend per session in your currency, priced per model for Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5, with budget, 7-day and all-time views.
     </td>
   </tr>
   <tr>
@@ -362,12 +362,12 @@ The `opus`, `sonnet` and `fable` bars show your weekly cap for each model, when 
 
 | Model | Per million tokens (in / out) |
 |---|---|
-| Fable 5.1 | $10 / $50 |
+| Fable 5.2 | $8 / $40 |
 | Opus 5.5 | $4 / $20 |
 | Sonnet 5.5 | $2 / $10 |
 | Haiku 5.5 | $0.10 / $0.50 up to 100K prompt tokens, $0.50 / $2.50 above |
 
-All four have a 1M-token context window. Costs are API-equivalent: a figure to compare sessions by, not your bill. `--currency £` converts from USD at a daily exchange rate; give a symbol or any ISO code the rate service lists, such as `--currency DKK`, `NOK` or `SEK` (shown as `DKK68.50`). A bare `kr` follows your machine's country: Danish kroner in Denmark, Norwegian in Norway, Swedish elsewhere. The 7-day and all-time cost widgets are worked out by a background process, so they appear a few seconds after you first switch them on. `--budget 25` draws a spend bar against the number you give Claude Code's `--max-budget-usd`, which the status line cannot read by itself.
+All four have a 1M-token context window. Mythos 5.2 costs the same as Fable 5.2, and older models (Fable 5.1, Mythos 5.1, Opus 5, Sonnet 5 and earlier) are priced at their own list rates too. Costs are API-equivalent: a figure to compare sessions by, not your bill. `--currency £` converts from USD at a daily exchange rate; give a symbol or any ISO code the rate service lists, such as `--currency DKK`, `NOK` or `SEK` (shown as `DKK68.50`). A bare `kr` follows your machine's country: Danish kroner in Denmark, Norwegian in Norway, Swedish elsewhere. The 7-day and all-time cost widgets are worked out by a background process, so they appear a few seconds after you first switch them on. `--budget 25` draws a spend bar against the number you give Claude Code's `--max-budget-usd`, which the status line cannot read by itself.
 
 ## Agents and teams
 
@@ -462,7 +462,7 @@ Agent teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, and task counts need 
 This is the output of `python claude_status.py --help`:
 
 ```
-usage-pulse 3.9.0 — usage status line for Claude Code
+usage-pulse 3.9.1 — usage status line for Claude Code
 
 Usage: python claude_status.py [flag [args]]
 With no flag and JSON on stdin (how Claude Code runs it) it prints the status line.
